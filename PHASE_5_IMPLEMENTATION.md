@@ -1,48 +1,41 @@
-# Phase 5: Transformer Layers & Inference Loop
+# Phase 5: Transformer Blocks & Full Inference
 
 ## Objective
-Implement the final logic layer required for text generation. This phase focuses on building the actual Llama transformer block (Attention, FFN, RMSNorm) using the completed compute graph dispatcher and the newly implemented BPE tokenizer.
+The goal is to finish the project by implementing the full autoregressive Llama model loop. This involves building the transformer blocks using the existing compute graph and implementing the logic to sample and feed tokens back into the model.
 
-## Core Components
+## Remaining Tasks
 
-### 1. Pure Zig Tokenizer (`src/tokenizer.zig`) - **CORE COMPLETED**
-- [x] GGUF BPE Vocabulary Loader.
-- [x] Greedy BPE Encoding with Merges.
-- [x] Token Decoding.
-- [x] Special Token Handling (BOS/EOS).
+### 1. Advanced Math Kernels (HLSL/GLSL)
+- [ ] **RoPE (Rotary Positional Embeddings)**: Crucial for Llama's context window.
+- [ ] **MatMul (Matrix Multiplication)**: Optimized BDA-based GEMM kernel for 16-bit quants.
+- [ ] **RMSNorm**: Final verification of the normalization kernel.
 
-### 2. Transformer Block Builder
-Extend `src/compute_graph.zig` to build a complete Llama transformer layer.
-- [ ] **RMSNorm**: Add `rmsnorm` node type and link to `rmsnorm_bda.spv`.
-- [ ] **Attention (Self-Attention)**: Implement:
-    - [ ] Query, Key, Value projections.
-    - [ ] RoPE (Rotary Positional Embeddings) kernel.
-    - [ ] Scaled Dot-Product Attention (Softmax).
-- [ ] **FFN (Feed-Forward Network)**: Implement:
-    - [ ] SwiGLU activation kernel.
-    - [ ] Up, Down, and Gate projections.
-- [ ] **KV Cache**: Manage memory for past tokens.
+### 2. Full Transformer Block Builder
+In `src/compute_graph.zig`, add a function to build a complete Llama block:
+- **Attention**: 
+  - Q, K, V Projections.
+  - RoPE application.
+  - Scaled Dot Product Attention.
+- **FFN**:
+  - Up/Down/Gate Projections.
+  - SwiGLU Activation.
 
-### 3. Inference Loop (`src/main.zig`)
-The main application loop that drives the model.
-1. **Prompting**: Accept user input from the CLI.
-2. **Tokenization**: Convert text to IDs using `src/tokenizer.zig`.
-3. **Graph Execution**: 
-    - Build graph for the current prompt.
-    - Dispatch to GPU via `src/compute_graph.zig`.
-    - Sample the next token from the output logits (Greedy or Top-P).
-4. **De-tokenization**: Print the generated character to stdout.
-5. **Repeat**: Feed the new token back into the model.
+### 3. Autoregressive Loop (`src/main.zig`)
+- [ ] Implement the `while` loop that:
+  - Takes the last generated token.
+  - Runs the compute graph for that token.
+  - Samples the next token from the output logits.
+  - Appends it to the prompt and prints it.
 
-## Current Progress: BDA Dispatcher & Kernels
-- **Dispatcher**: Supports BDA and Push Constants.
-- **Kernels**: 
-    - [x] `add` (GLSL)
-    - [x] `mul` (GLSL)
-    - [x] `rmsnorm` (HLSL/GLSL)
-    - [x] `softmax` (HLSL/GLSL)
+### 4. KV Cache Management
+- [ ] Allocate a large VRAM buffer to store Key and Value tensors for all layers to avoid recomputing past tokens.
+
+## Implementation Steps
+
+1.  **RoPE Kernel**: Write and compile `rope.glsl`.
+2.  **Llama Graph**: Implement `GraphBuilder.buildLlamaBlock`.
+3.  **Inference CLI**: Update `main.zig` to accept real-time prompts and generate text character by character.
 
 ## Success Criteria
-- [x] Successfully decode a GGUF vocabulary.
-- [ ] Run a single forward pass of a Llama 3 transformer block without errors.
-- [ ] Generate at least one coherent sentence from a prompt.
+- [ ] The model can generate a coherent 50-token response.
+- [ ] Token generation speed is > 10 tokens/sec on an RX 7700S.

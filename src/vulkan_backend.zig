@@ -11,8 +11,10 @@ const windows = if (builtin.os.tag == .windows) struct {
 } else struct {};
 
 pub const PushConstants = extern struct {
-    n: u32,
-    d: u32 = 0,
+    p1: u32,
+    p2: u32,
+    p3: u32,
+    p4: u32 = 0,
     a: u64,
     b: u64,
     c: u64,
@@ -367,10 +369,14 @@ pub const PipelineRegistry = struct {
     mul_shader: vk.ShaderModule,
     rmsnorm_shader: vk.ShaderModule,
     softmax_shader: vk.ShaderModule,
+    matmul_shader: vk.ShaderModule,
+    rope_shader: vk.ShaderModule,
     add_pipeline: Pipeline,
     mul_pipeline: Pipeline,
     rmsnorm_pipeline: Pipeline,
     softmax_pipeline: Pipeline,
+    matmul_pipeline: Pipeline,
+    rope_pipeline: Pipeline,
 
     pub fn init(allocator: std.mem.Allocator) !PipelineRegistry {
         return PipelineRegistry{
@@ -379,10 +385,14 @@ pub const PipelineRegistry = struct {
             .mul_shader = .null_handle,
             .rmsnorm_shader = .null_handle,
             .softmax_shader = .null_handle,
+            .matmul_shader = .null_handle,
+            .rope_shader = .null_handle,
             .add_pipeline = .{ .pipeline = .null_handle, .layout = .null_handle },
             .mul_pipeline = .{ .pipeline = .null_handle, .layout = .null_handle },
             .rmsnorm_pipeline = .{ .pipeline = .null_handle, .layout = .null_handle },
             .softmax_pipeline = .{ .pipeline = .null_handle, .layout = .null_handle },
+            .matmul_pipeline = .{ .pipeline = .null_handle, .layout = .null_handle },
+            .rope_pipeline = .{ .pipeline = .null_handle, .layout = .null_handle },
         };
     }
 
@@ -403,6 +413,14 @@ pub const PipelineRegistry = struct {
             self.softmax_pipeline.deinit(ctx);
             ctx.vkd.destroyShaderModule(ctx.device, self.softmax_shader, null);
         }
+        if (self.matmul_shader != .null_handle) {
+            self.matmul_pipeline.deinit(ctx);
+            ctx.vkd.destroyShaderModule(ctx.device, self.matmul_shader, null);
+        }
+        if (self.rope_shader != .null_handle) {
+            self.rope_pipeline.deinit(ctx);
+            ctx.vkd.destroyShaderModule(ctx.device, self.rope_shader, null);
+        }
     }
 
     pub fn register(self: *PipelineRegistry, ctx: Context, name: []const u8, shader_code: []const u8, entry_point: [*:0]const u8) !void {
@@ -421,6 +439,12 @@ pub const PipelineRegistry = struct {
         } else if (std.mem.eql(u8, name, "softmax")) {
             self.softmax_shader = shader;
             self.softmax_pipeline = pipeline;
+        } else if (std.mem.eql(u8, name, "matmul")) {
+            self.matmul_shader = shader;
+            self.matmul_pipeline = pipeline;
+        } else if (std.mem.eql(u8, name, "rope")) {
+            self.rope_shader = shader;
+            self.rope_pipeline = pipeline;
         }
     }
 };

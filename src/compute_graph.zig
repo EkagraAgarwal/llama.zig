@@ -8,6 +8,7 @@ pub const OpType = enum(u32) {
     matmul = 2,
     rms_norm = 3,
     softmax = 4,
+    rope = 5,
 };
 
 pub const TensorRole = enum(u2) {
@@ -33,7 +34,10 @@ pub const GraphNode = struct {
     dispatch_x: u32,
     dispatch_y: u32,
     dispatch_z: u32,
-    param: u32 = 0,
+    p1: u32 = 0,
+    p2: u32 = 0,
+    p3: u32 = 0,
+    p4: u32 = 0,
 };
 
 pub const Graph = struct {
@@ -91,7 +95,7 @@ pub const GraphBuilder = struct {
         });
     }
 
-    pub fn addNode(self: *GraphBuilder, op_type: OpType, input_names: []const []const u8, output_name: []const u8, dispatch_x: u32, param: u32) !void {
+    pub fn addNode(self: *GraphBuilder, op_type: OpType, input_names: []const []const u8, output_name: []const u8, dx: u32, dy: u32, p1: u32, p2: u32, p3: u32) !void {
         const owned_inputs = try self.graph.allocator.alloc([]const u8, input_names.len);
         for (input_names, 0..) |name, i| {
             owned_inputs[i] = try self.graph.allocator.dupe(u8, name);
@@ -102,10 +106,12 @@ pub const GraphBuilder = struct {
             .op_type = op_type,
             .input_names = owned_inputs,
             .output_name = owned_output,
-            .dispatch_x = dispatch_x,
-            .dispatch_y = 1,
+            .dispatch_x = dx,
+            .dispatch_y = dy,
             .dispatch_z = 1,
-            .param = param,
+            .p1 = p1,
+            .p2 = p2,
+            .p3 = p3,
         };
 
         self.node_list = try self.graph.allocator.realloc(self.node_list, self.node_count + 1);
@@ -191,17 +197,19 @@ pub const Dispatcher = struct {
         try self.ctx.vkd.queueSubmit(self.ctx.compute_queue, (&submit_info)[0..1], .null_handle);
         try self.ctx.vkd.queueWaitIdle(self.ctx.compute_queue);
         try self.ctx.vkd.deviceWaitIdle(self.ctx.device);
-        }
+    }
+
     fn recordNode(self: *Dispatcher, cmd_buf: *vk.CommandBuffer, node: *const GraphNode, node_idx: usize) !void {
         const pipeline_ref = switch (node.op_type) {
             .add => &self.pipeline_registry.add_pipeline,
             .mul => &self.pipeline_registry.mul_pipeline,
             .rms_norm => &self.pipeline_registry.rmsnorm_pipeline,
             .softmax => &self.pipeline_registry.softmax_pipeline,
-            else => return error.UnsupportedOpType,
+            .matmul => &self.pipeline_registry.matmul_pipeline,
+            .rope => &self.pipeline_registry.rope_pipeline,
         };
 
-        var pc = PushConstants{ .n = 0, .d = node.param, .a = 0, .b = 0, .c = 0 };
+        var pc = PushConstants{ .p1 = node.p1, .p2 = node.p2, .p3 = node.p3, .p4 = node.p4, .a = 0, .b = 0, .c = 0 };
 
         if (node.input_names.len >= 1) {
             const t = self.graph.tensors.get(node.input_names[0]) orelse return error.TensorNotFound;
@@ -210,7 +218,6 @@ pub const Dispatcher = struct {
             } else {
                 pc.a = self.scratchpad.address + t.offset;
             }
-            pc.n = @as(u32, @intCast(t.size / 4));
         }
         if (node.input_names.len >= 2) {
             const t = self.graph.tensors.get(node.input_names[1]) orelse return error.TensorNotFound;
@@ -223,8 +230,6 @@ pub const Dispatcher = struct {
 
         const ot = self.graph.tensors.get(node.output_name) orelse return error.TensorNotFound;
         pc.c = self.scratchpad.address + ot.offset;
-
-        std.debug.print("Dispatching {s}: a=0x{x}, b=0x{x}, c=0x{x}, n={}\n", .{ @tagName(node.op_type), pc.a, pc.b, pc.c, pc.n });
 
         self.ctx.vkd.cmdBindPipeline(cmd_buf.*, .compute, pipeline_ref.pipeline);
         self.ctx.vkd.cmdPushConstants(cmd_buf.*, pipeline_ref.layout, .{ .compute_bit = true }, 0, @sizeOf(PushConstants), &pc);
