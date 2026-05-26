@@ -12,7 +12,7 @@ const windows = if (builtin.os.tag == .windows) struct {
 
 pub const PushConstants = extern struct {
     n: u32,
-    padding: u32 = 0,
+    d: u32 = 0,
     a: u64,
     b: u64,
     c: u64,
@@ -223,6 +223,10 @@ pub const Context = struct {
     }
 
     pub fn copyBuffer(self: Context, src: Buffer, dst: Buffer, size: u64) !void {
+        try self.copyBufferOffset(src, 0, dst, 0, size);
+    }
+
+    pub fn copyBufferOffset(self: Context, src: Buffer, src_offset: u64, dst: Buffer, dst_offset: u64, size: u64) !void {
         var cmd_buf: vk.CommandBuffer = undefined;
         try self.vkd.allocateCommandBuffers(self.device, &.{
             .command_pool = self.cmd_pool,
@@ -235,8 +239,8 @@ pub const Context = struct {
         });
 
         const copy_region = vk.BufferCopy{
-            .src_offset = 0,
-            .dst_offset = 0,
+            .src_offset = src_offset,
+            .dst_offset = dst_offset,
             .size = size,
         };
         self.vkd.cmdCopyBuffer(cmd_buf, src.buffer, dst.buffer, (&copy_region)[0..1]);
@@ -361,16 +365,24 @@ pub const PipelineRegistry = struct {
     allocator: std.mem.Allocator,
     add_shader: vk.ShaderModule,
     mul_shader: vk.ShaderModule,
+    rmsnorm_shader: vk.ShaderModule,
+    softmax_shader: vk.ShaderModule,
     add_pipeline: Pipeline,
     mul_pipeline: Pipeline,
+    rmsnorm_pipeline: Pipeline,
+    softmax_pipeline: Pipeline,
 
     pub fn init(allocator: std.mem.Allocator) !PipelineRegistry {
         return PipelineRegistry{
             .allocator = allocator,
             .add_shader = .null_handle,
             .mul_shader = .null_handle,
+            .rmsnorm_shader = .null_handle,
+            .softmax_shader = .null_handle,
             .add_pipeline = .{ .pipeline = .null_handle, .layout = .null_handle },
             .mul_pipeline = .{ .pipeline = .null_handle, .layout = .null_handle },
+            .rmsnorm_pipeline = .{ .pipeline = .null_handle, .layout = .null_handle },
+            .softmax_pipeline = .{ .pipeline = .null_handle, .layout = .null_handle },
         };
     }
 
@@ -382,6 +394,14 @@ pub const PipelineRegistry = struct {
         if (self.mul_shader != .null_handle) {
             self.mul_pipeline.deinit(ctx);
             ctx.vkd.destroyShaderModule(ctx.device, self.mul_shader, null);
+        }
+        if (self.rmsnorm_shader != .null_handle) {
+            self.rmsnorm_pipeline.deinit(ctx);
+            ctx.vkd.destroyShaderModule(ctx.device, self.rmsnorm_shader, null);
+        }
+        if (self.softmax_shader != .null_handle) {
+            self.softmax_pipeline.deinit(ctx);
+            ctx.vkd.destroyShaderModule(ctx.device, self.softmax_shader, null);
         }
     }
 
@@ -395,6 +415,12 @@ pub const PipelineRegistry = struct {
         } else if (std.mem.eql(u8, name, "mul")) {
             self.mul_shader = shader;
             self.mul_pipeline = pipeline;
+        } else if (std.mem.eql(u8, name, "rmsnorm")) {
+            self.rmsnorm_shader = shader;
+            self.rmsnorm_pipeline = pipeline;
+        } else if (std.mem.eql(u8, name, "softmax")) {
+            self.softmax_shader = shader;
+            self.softmax_pipeline = pipeline;
         }
     }
 };

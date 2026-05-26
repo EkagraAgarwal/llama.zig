@@ -7,6 +7,7 @@ pub const OpType = enum(u32) {
     mul = 1,
     matmul = 2,
     rms_norm = 3,
+    softmax = 4,
 };
 
 pub const TensorRole = enum(u2) {
@@ -32,6 +33,7 @@ pub const GraphNode = struct {
     dispatch_x: u32,
     dispatch_y: u32,
     dispatch_z: u32,
+    param: u32 = 0,
 };
 
 pub const Graph = struct {
@@ -89,7 +91,7 @@ pub const GraphBuilder = struct {
         });
     }
 
-    pub fn addNode(self: *GraphBuilder, op_type: OpType, input_names: []const []const u8, output_name: []const u8, dispatch_x: u32) !void {
+    pub fn addNode(self: *GraphBuilder, op_type: OpType, input_names: []const []const u8, output_name: []const u8, dispatch_x: u32, param: u32) !void {
         const owned_inputs = try self.graph.allocator.alloc([]const u8, input_names.len);
         for (input_names, 0..) |name, i| {
             owned_inputs[i] = try self.graph.allocator.dupe(u8, name);
@@ -103,6 +105,7 @@ pub const GraphBuilder = struct {
             .dispatch_x = dispatch_x,
             .dispatch_y = 1,
             .dispatch_z = 1,
+            .param = param,
         };
 
         self.node_list = try self.graph.allocator.realloc(self.node_list, self.node_count + 1);
@@ -150,35 +153,18 @@ pub const Dispatcher = struct {
     ctx: *vulkan.Context,
     pipeline_registry: *vulkan.PipelineRegistry,
     scratchpad: vulkan.Buffer,
-    tensor_buffers: std.StringHashMap(vulkan.Buffer),
 
     pub fn init(graph: *Graph, ctx: *vulkan.Context, pipeline_registry: *vulkan.PipelineRegistry, scratchpad: vulkan.Buffer) !Dispatcher {
-        var dispatcher = Dispatcher{
+        return Dispatcher{
             .graph = graph,
             .ctx = ctx,
             .pipeline_registry = pipeline_registry,
             .scratchpad = scratchpad,
-            .tensor_buffers = std.StringHashMap(vulkan.Buffer).init(graph.allocator),
         };
-
-        var it = graph.tensors.iterator();
-        while (it.next()) |entry| {
-            const tensor = entry.value_ptr.*;
-            if (tensor.role != .weight) {
-                const buf = try vulkan.Buffer.init(ctx.*, tensor.size, .{ .storage_buffer_bit = true, .shader_device_address_bit = true, .transfer_src_bit = true, .transfer_dst_bit = true }, .{ .device_local_bit = true });
-                try dispatcher.tensor_buffers.put(entry.key_ptr.*, buf);
-            }
-        }
-
-        return dispatcher;
     }
 
     pub fn deinit(self: *Dispatcher) void {
-        var it = self.tensor_buffers.iterator();
-        while (it.next()) |entry| {
-            entry.value_ptr.*.deinit(self.ctx.*);
-        }
-        self.tensor_buffers.deinit();
+        _ = self;
     }
 
     pub fn execute(self: *Dispatcher) !void {
@@ -210,17 +196,19 @@ pub const Dispatcher = struct {
         const pipeline_ref = switch (node.op_type) {
             .add => &self.pipeline_registry.add_pipeline,
             .mul => &self.pipeline_registry.mul_pipeline,
+            .rms_norm => &self.pipeline_registry.rmsnorm_pipeline,
+            .softmax => &self.pipeline_registry.softmax_pipeline,
             else => return error.UnsupportedOpType,
         };
 
-        var pc = PushConstants{ .n = 0, .padding = 0, .a = 0, .b = 0, .c = 0 };
+        var pc = PushConstants{ .n = 0, .d = node.param, .a = 0, .b = 0, .c = 0 };
 
         if (node.input_names.len >= 1) {
             const t = self.graph.tensors.get(node.input_names[0]) orelse return error.TensorNotFound;
             if (t.role == .weight) {
                 pc.a = t.buffer.?.address + t.offset;
             } else {
-                pc.a = self.tensor_buffers.get(node.input_names[0]).?.address + t.offset;
+                pc.a = self.scratchpad.address + t.offset;
             }
             pc.n = @as(u32, @intCast(t.size / 4));
         }
@@ -229,12 +217,12 @@ pub const Dispatcher = struct {
             if (t.role == .weight) {
                 pc.b = t.buffer.?.address + t.offset;
             } else {
-                pc.b = self.tensor_buffers.get(node.input_names[1]).?.address + t.offset;
+                pc.b = self.scratchpad.address + t.offset;
             }
         }
 
         const ot = self.graph.tensors.get(node.output_name) orelse return error.TensorNotFound;
-        pc.c = self.tensor_buffers.get(node.output_name).?.address + ot.offset;
+        pc.c = self.scratchpad.address + ot.offset;
 
         std.debug.print("Dispatching {s}: a=0x{x}, b=0x{x}, c=0x{x}, n={}\n", .{ @tagName(node.op_type), pc.a, pc.b, pc.c, pc.n });
 
