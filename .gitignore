@@ -1,0 +1,23 @@
+# Models
+models/
+
+# Zig build artifacts
+zig-out/
+zig-cache/
+.zig-cache/
+zig-pkg/
+
+# OS/IDE
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# Binaries
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.pdb
+*.exe
