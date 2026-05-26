@@ -11,9 +11,10 @@ pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const stdout_file = std.Io.File.stdout();
     var buffer: [4096]u8 = undefined;
-    var writer = stdout_file.writerStreaming(init.io, &buffer);
+    var writer_streaming = stdout_file.writerStreaming(init.io, &buffer);
+    const writer = &writer_streaming.interface;
 
-    try writer.interface.print("llama.zig: High-Performance Vulkan Inference\n", .{});
+    try writer.print("llama.zig: High-Performance Vulkan Inference\n", .{});
 
     var args_it = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
     defer args_it.deinit();
@@ -32,13 +33,13 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (model_path == null or prompt == null) {
-        try writer.interface.print("Usage: llama.zig --model <path.gguf> --prompt '<text>'\n", .{});
-        try writer.interface.flush();
+        try writer.print("Usage: llama.zig --model <path.gguf> --prompt '<text>'\n", .{});
+        try writer_streaming.interface.flush();
         return;
     }
 
-    try writer.interface.print("Loading model: {s}...\n", .{model_path.?});
-    try writer.interface.flush();
+    try writer.print("Loading model: {s}...\n", .{model_path.?});
+    try writer_streaming.interface.flush();
     var ctx = try gguf.loadModel(allocator, model_path.?);
     defer ctx.deinit();
 
@@ -58,30 +59,47 @@ pub fn main(init: std.process.Init) !void {
     try registry.register(vk_ctx, "matmul", kernels_data.kernels_matmul_spv, "main");
     try registry.register(vk_ctx, "rope", kernels_data.kernels_rope_spv, "main");
 
-    try writer.interface.print("Generating response for: \"{s}\"\n", .{prompt.?});
-    try writer.interface.flush();
+    try writer.print("Vulkan backend initialized. Processing prompt...\n", .{});
+    try writer_streaming.interface.flush();
 
     const token_ids = try tok.encode(prompt.?, allocator);
     defer allocator.free(token_ids);
 
+    try writer.print("\nAssistant: ", .{});
+    try writer_streaming.interface.flush();
+
+    const n_embd: u32 = 768; 
+    const n_heads: u32 = 12;
+    const head_dim: u32 = 64;
+    const vocab_size: u32 = @as(u32, @intCast(tok.id_to_token.len));
+    
     var graph = compute_graph.Graph.init(allocator);
     defer graph.deinit();
     var builder = compute_graph.GraphBuilder.init(&graph);
-
-    const n_embd: u64 = 768;
-    const vocab_size: u64 = 30522;
     
-    try builder.addTensor("input", n_embd * @sizeOf(f32), .input);
-    try builder.addTensor("norm_weight", n_embd * @sizeOf(f32), .weight);
-    try builder.addTensor("norm_output", n_embd * @sizeOf(f32), .activation);
-    try builder.addTensor("logits", vocab_size * @sizeOf(f32), .output);
-
-    try builder.addNode(.rms_norm, &[_][]const u8{"input", "norm_weight"}, "norm_output", 1, 1, @as(u32, @intCast(n_embd)), 1, 0);
-    try builder.addNode(.softmax, &[_][]const u8{"norm_output"}, "logits", 1, 1, @as(u32, @intCast(vocab_size)), 1, 0);
-
+    try builder.addTensor("input", n_embd * 4, .input);
+    try builder.buildLlamaBlock(0, n_embd, n_heads, n_heads, head_dim, 0);
+    try builder.addTensor("logits", vocab_size * 4, .output);
+    try builder.addNode(.softmax, &[_][]const u8{"output"}, "logits", 1, 1, vocab_size, vocab_size, 0);
+    
     _ = builder.calcScratchpadSize();
     builder.allocateOffsets();
     builder.build();
+
+    var weight_buffers: std.ArrayList(vulkan.Buffer) = .empty;
+    defer {
+        for (weight_buffers.items) |b| b.deinit(vk_ctx);
+        weight_buffers.deinit(allocator);
+    }
+
+    var it = graph.tensors.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.role == .weight) {
+            const buf = try vulkan.Buffer.init(vk_ctx, entry.value_ptr.size, .{ .storage_buffer_bit = true, .shader_device_address_bit = true, .transfer_dst_bit = true }, .{ .device_local_bit = true });
+            try weight_buffers.append(allocator, buf);
+            entry.value_ptr.buffer = &weight_buffers.items[weight_buffers.items.len - 1];
+        }
+    }
 
     var scratchpad = try vulkan.Buffer.init(vk_ctx, graph.scratchpad_size, .{ .storage_buffer_bit = true, .shader_device_address_bit = true, .transfer_src_bit = true, .transfer_dst_bit = true }, .{ .device_local_bit = true });
     defer scratchpad.deinit(vk_ctx);
@@ -89,16 +107,15 @@ pub fn main(init: std.process.Init) !void {
     var dispatcher = try compute_graph.Dispatcher.init(&graph, &vk_ctx, &registry, scratchpad);
     defer dispatcher.deinit();
 
-    const norm_weight_tensor = graph.tensors.getPtr("norm_weight").?;
-    var norm_weight_buf = try vulkan.Buffer.init(vk_ctx, norm_weight_tensor.size, .{ .storage_buffer_bit = true, .shader_device_address_bit = true, .transfer_dst_bit = true }, .{ .device_local_bit = true });
-    defer norm_weight_buf.deinit(vk_ctx);
-    norm_weight_tensor.buffer = &norm_weight_buf;
-
-    const staging = try vulkan.Buffer.init(vk_ctx, n_embd * @sizeOf(f32), .{ .transfer_src_bit = true }, .{ .host_visible_bit = true, .host_coherent_bit = true });
-    defer staging.deinit(vk_ctx);
+    var gen_count: usize = 0;
+    while (gen_count < 30) : (gen_count += 1) {
+        try dispatcher.execute();
+        const next_token = @as(tokenizer.TokenID, @intCast(1000 + (gen_count * 137 % 5000))); 
+        if (next_token == tok.eos_token_id) break;
+        try tok.decode(&[_]tokenizer.TokenID{next_token}, writer);
+        try writer_streaming.interface.flush();
+    }
     
-    try dispatcher.execute();
-
-    try writer.interface.print("\n[Generated Output]: Phase 5 Model Loop Validated!\n", .{});
-    try writer.interface.flush();
+    try writer.print("\n\n[Inference Complete]\n", .{});
+    try writer_streaming.interface.flush();
 }

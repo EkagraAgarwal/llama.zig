@@ -10,7 +10,7 @@ layout(push_constant) uniform PC {
     uint M;
     uint N;
     uint K;
-    uint padding;
+    uint p4;
     FloatBuffer a;
     FloatBuffer b;
     FloatBuffer c;

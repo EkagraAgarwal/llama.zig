@@ -86,6 +86,7 @@ pub const GraphBuilder = struct {
     }
 
     pub fn addTensor(self: *GraphBuilder, name: []const u8, size: u64, role: TensorRole) !void {
+        if (self.graph.tensors.contains(name)) return;
         const owned_name = try self.graph.allocator.dupe(u8, name);
         try self.graph.tensors.put(owned_name, .{
             .name = owned_name,
@@ -112,6 +113,7 @@ pub const GraphBuilder = struct {
             .p1 = p1,
             .p2 = p2,
             .p3 = p3,
+            .p4 = 0,
         };
 
         self.node_list = try self.graph.allocator.realloc(self.node_list, self.node_count + 1);
@@ -119,12 +121,27 @@ pub const GraphBuilder = struct {
         self.node_count += 1;
     }
 
+    pub fn buildLlamaBlock(self: *GraphBuilder, layer_idx: u32, n_embd: u32, n_heads: u32, n_kv_heads: u32, head_dim: u32, seq_pos: u32) !void {
+        _ = n_heads; _ = n_kv_heads; _ = head_dim; _ = seq_pos;
+        const layer_name = try std.fmt.allocPrint(self.graph.allocator, "blk.{}", .{layer_idx});
+        defer self.graph.allocator.free(layer_name);
+
+        const norm_weight = try std.fmt.allocPrint(self.graph.allocator, "{s}.attn_norm.weight", .{layer_name});
+        defer self.graph.allocator.free(norm_weight);
+        try self.addTensor(norm_weight, n_embd * 4, .weight);
+        try self.addTensor("normed_input", n_embd * 4, .activation);
+        try self.addNode(.rms_norm, &[_][]const u8{"input", norm_weight}, "normed_input", (n_embd + 63) / 64, 1, n_embd, n_embd, 0);
+
+        try self.addTensor("output", n_embd * 4, .activation);
+        try self.addNode(.add, &[_][]const u8{"input", "normed_input"}, "output", (n_embd + 63) / 64, 1, n_embd, 1, 0);
+    }
+
     pub fn calcScratchpadSize(self: *GraphBuilder) u64 {
         var total: u64 = 0;
         var it = self.graph.tensors.iterator();
         while (it.next()) |entry| {
             if (entry.value_ptr.role != .weight) {
-                total += entry.value_ptr.size;
+                total += (entry.value_ptr.size + 15) & ~@as(u64, 15);
             }
         }
         self.graph.scratchpad_size = total;
@@ -138,10 +155,9 @@ pub const GraphBuilder = struct {
             var tensor = entry.value_ptr.*;
             if (tensor.role == .weight) {
                 tensor.offset = 0;
-                tensor.is_static = true;
             } else {
                 tensor.offset = offset;
-                offset += tensor.size;
+                offset += (tensor.size + 15) & ~@as(u64, 15);
             }
             entry.value_ptr.* = tensor;
         }

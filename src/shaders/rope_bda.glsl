@@ -10,10 +10,10 @@ layout(push_constant) uniform PC {
     uint n_heads;
     uint head_dim;
     uint pos;
-    uint padding;
-    FloatBuffer a; // input/output
-    FloatBuffer unused1;
-    FloatBuffer unused2;
+    uint p4;
+    FloatBuffer a;
+    FloatBuffer b;
+    FloatBuffer c;
 } pc;
 
 layout(local_size_x = 64) in;

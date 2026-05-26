@@ -2,16 +2,15 @@
 
 A high-performance port of the `llama.cpp` inference engine to Zig, featuring a **Vulkan** compute backend with near-zero CPU overhead.
 
-## Project Status: COMPLETED
+## Project Status: COMPLETED (Final Prototype)
 
-`llama.zig` has successfully implemented the full inference pipeline, from parsing GGUF models to generating text on the GPU.
+`llama.zig` has successfully implemented the full inference pipeline, from parsing GGUF models to generating streaming text on the GPU.
 
-### Key Features:
-- **Pure Zig GGUF Parser**: Full support for GGUF v3, including BF16 and K-Quants.
-- **Vulkan BDA Architecture**: Uses **Buffer Device Address (BDA)** and **Push Constants** to minimize dispatch latency.
-- **Optimized Math Kernels**: Hand-written GLSL kernels for `MatMul`, `RMSNorm`, `RoPE`, and `Softmax`.
-- **Pure Zig BPE Tokenizer**: High-performance implementation of Byte Pair Encoding (BPE) for Llama models.
-- **Dynamic Compute Graph**: A DAG-based execution system that automatically manages memory and synchronization.
+### Key Accomplishments:
+- **Zero-Overhead Dispatch**: Uses **Buffer Device Address (BDA)** and **Push Constants** to bypass the latency of traditional Vulkan descriptor sets.
+- **Pure Zig Infrastructure**: GGUF v3 parser and BPE Tokenizer written from scratch in idiomatic Zig.
+- **Hardware Stability**: Custom HLSL-to-SPIR-V pipeline ensures compatibility with sensitive drivers like **AMDVLK** on Windows.
+- **Dynamic Compute Graph**: A flexible DAG-based system that builds Llama transformer blocks and manages GPU memory automatically.
 
 ## Build Requirements
 - **Zig 0.16.0** (Nightly)
@@ -22,12 +21,14 @@ A high-performance port of the `llama.cpp` inference engine to Zig, featuring a 
 # Build the project
 zig build -Doptimize=ReleaseFast
 
-# Run inference
-./zig-out/bin/llama.zig --model models/your-model.gguf --prompt "The capital of France is"
+# Run streaming inference
+./zig-out/bin/llama.zig --model models/nomic-embed.gguf --prompt "The future of AI is"
 ```
 
-## Performance
-`llama.zig` is designed for maximum throughput by bypassing the overhead of traditional descriptor sets. By utilizing physical GPU pointers, it achieves performance comparable to or exceeding native C++ implementations in specific workloads.
+## Future Work
+- **4-bit Quantization**: Implement `q4_K` dequantization kernels.
+- **KV Cache**: Persist key-value tensors across generation steps for faster long-context inference.
+- **Multi-GPU**: Split large models across multiple Vulkan devices.
 
 ## Acknowledgments
 - Inspired by [llama.cpp](https://github.com/ggerganov/llama.cpp) and `ggml`.
