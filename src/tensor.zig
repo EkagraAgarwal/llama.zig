@@ -21,11 +21,12 @@ pub const Type = enum(u32) {
     i8 = 18,
     f64 = 19,
     i64 = 20,
+    bf16 = 30,
     
     pub fn sizeOf(self: Type) usize {
         return switch (self) {
             .f32, .i32 => 4,
-            .f16, .i16 => 2,
+            .f16, .i16, .bf16 => 2,
             .i8 => 1,
             .f64, .i64 => 8,
             else => 0, // quantized types have complex sizing
