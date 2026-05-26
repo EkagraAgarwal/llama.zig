@@ -21,6 +21,7 @@ pub const Context = struct {
     compute_family_index: u32,
     mem_props: vk.PhysicalDeviceMemoryProperties,
     cmd_pool: vk.CommandPool,
+    descriptor_pool: vk.DescriptorPool,
 
     vki: vk.InstanceWrapper,
     vkd: vk.DeviceWrapper,
@@ -127,6 +128,23 @@ pub const Context = struct {
         const mem_props = vki.getPhysicalDeviceMemoryProperties(pdev);
         std.debug.print("Selected GPU: {s} (Validation: {})\n", .{std.mem.sliceTo(&props.device_name, 0), validation_layer_enabled});
 
+        // Check for bufferDeviceAddress support
+        var bda_features = vk.PhysicalDeviceBufferDeviceAddressFeatures{
+            .p_next = null,
+            .buffer_device_address = .true,
+            .buffer_device_address_capture_replay = .false,
+            .buffer_device_address_multi_device = .false,
+        };
+        var features2 = vk.PhysicalDeviceFeatures2{
+            .p_next = &bda_features,
+            .features = .{},
+        };
+        vki.getPhysicalDeviceFeatures2(pdev, &features2);
+
+        if (bda_features.buffer_device_address == .false) {
+            return error.VulkanDeviceDoesNotSupportBufferDeviceAddress;
+        }
+
         const queue_priority = [_]f32{1.0};
         const queue_create_info = vk.DeviceQueueCreateInfo{
             .queue_family_index = best_compute_index,
@@ -135,6 +153,7 @@ pub const Context = struct {
         };
 
         const device = try vki.createDevice(pdev, &.{
+            .p_next = &features2, // Enable features2 and bda_features
             .queue_create_info_count = 1,
             .p_queue_create_infos = (&queue_create_info)[0..1],
         }, null);
@@ -149,6 +168,16 @@ pub const Context = struct {
             .flags = .{ .reset_command_buffer_bit = true },
         }, null);
 
+        const pool_size = vk.DescriptorPoolSize{
+            .type = .storage_buffer,
+            .descriptor_count = 100,
+        };
+        const descriptor_pool = try vkd.createDescriptorPool(device, &.{
+            .pool_size_count = 1,
+            .p_pool_sizes = (&pool_size)[0..1],
+            .max_sets = 100,
+        }, null);
+
         return Context{
             .allocator = allocator,
             .handle = handle,
@@ -159,6 +188,7 @@ pub const Context = struct {
             .compute_family_index = best_compute_index,
             .mem_props = mem_props,
             .cmd_pool = cmd_pool,
+            .descriptor_pool = descriptor_pool,
             .vki = vki,
             .vkd = vkd,
         };
@@ -167,7 +197,7 @@ pub const Context = struct {
     pub fn findMemoryType(self: Context, type_filter: u32, properties: vk.MemoryPropertyFlags) !u32 {
         for (0..self.mem_props.memory_type_count) |i| {
             const i_u32 = @as(u32, @intCast(i));
-            if ((type_filter & (@as(u32, 1) << i_u32)) != 0 and
+            if ((type_filter & (@as(u32, 1) << @as(u5, @intCast(i_u32)))) != 0 and
                 (self.mem_props.memory_types[i].property_flags.toInt() & properties.toInt()) == properties.toInt())
             {
                 return i_u32;
@@ -177,12 +207,21 @@ pub const Context = struct {
     }
 
     pub fn deinit(self: *Context) void {
+        self.vkd.destroyDescriptorPool(self.device, self.descriptor_pool, null);
         self.vkd.destroyCommandPool(self.device, self.cmd_pool, null);
         self.vkd.destroyDevice(self.device, null);
         self.vki.destroyInstance(self.instance, null);
         if (builtin.os.tag == .windows) {
             _ = windows.FreeLibrary(self.handle);
         }
+    }
+
+    pub fn createShaderModule(self: Context, code: []const u8) !vk.ShaderModule {
+        const create_info = vk.ShaderModuleCreateInfo{
+            .code_size = code.len,
+            .p_code = @ptrCast(@alignCast(code.ptr)),
+        };
+        return try self.vkd.createShaderModule(self.device, &create_info, null);
     }
 
     pub fn copyBuffer(self: Context, src: Buffer, dst: Buffer, size: u64) !void {
@@ -202,7 +241,7 @@ pub const Context = struct {
             .dst_offset = 0,
             .size = size,
         };
-        self.vkd.cmdCopyBuffer(cmd_buf, src.buffer, dst.buffer, 1, (&copy_region)[0..1]);
+        self.vkd.cmdCopyBuffer(cmd_buf, src.buffer, dst.buffer, (&copy_region)[0..1]);
 
         try self.vkd.endCommandBuffer(cmd_buf);
 
@@ -211,10 +250,10 @@ pub const Context = struct {
             .p_command_buffers = (&cmd_buf)[0..1],
         };
 
-        try self.vkd.queueSubmit(self.compute_queue, 1, (&submit_info)[0..1], .null_handle);
+        try self.vkd.queueSubmit(self.compute_queue, (&submit_info)[0..1], .null_handle);
         try self.vkd.queueWaitIdle(self.compute_queue);
 
-        self.vkd.freeCommandBuffers(self.device, self.cmd_pool, 1, (&cmd_buf)[0..1]);
+        self.vkd.freeCommandBuffers(self.device, self.cmd_pool, (&cmd_buf)[0..1]);
     }
 };
 
@@ -222,6 +261,7 @@ pub const Buffer = struct {
     buffer: vk.Buffer,
     memory: vk.DeviceMemory,
     size: u64,
+    address: u64 = 0,
     
     pub fn init(ctx: Context, size: u64, usage: vk.BufferUsageFlags, properties: vk.MemoryPropertyFlags) !Buffer {
         const buffer = try ctx.vkd.createBuffer(ctx.device, &.{
@@ -234,23 +274,107 @@ pub const Buffer = struct {
         const mem_requirements = ctx.vkd.getBufferMemoryRequirements(ctx.device, buffer);
         const mem_type = try ctx.findMemoryType(mem_requirements.memory_type_bits, properties);
 
-        const memory = try ctx.vkd.allocateMemory(ctx.device, &.{
+        var alloc_info = vk.MemoryAllocateInfo{
             .allocation_size = mem_requirements.size,
             .memory_type_index = mem_type,
-        }, null);
+            .p_next = null,
+        };
+
+        var flags_info: vk.MemoryAllocateFlagsInfo = undefined;
+        if (usage.shader_device_address_bit) {
+            flags_info = .{
+                .p_next = null,
+                .flags = .{ .device_address_bit = true },
+                .device_mask = 0,
+            };
+            alloc_info.p_next = &flags_info;
+        }
+
+        const memory = try ctx.vkd.allocateMemory(ctx.device, &alloc_info, null);
         errdefer ctx.vkd.freeMemory(ctx.device, memory, null);
 
         try ctx.vkd.bindBufferMemory(ctx.device, buffer, memory, 0);
+
+        var address: u64 = 0;
+        if (usage.shader_device_address_bit) {
+            address = ctx.vkd.getBufferDeviceAddress(ctx.device, &.{ .buffer = buffer });
+        }
 
         return Buffer{
             .buffer = buffer,
             .memory = memory,
             .size = size,
+            .address = address,
         };
     }
 
     pub fn deinit(self: Buffer, ctx: Context) void {
         ctx.vkd.destroyBuffer(ctx.device, self.buffer, null);
         ctx.vkd.freeMemory(ctx.device, self.memory, null);
+    }
+};
+
+pub const Pipeline = struct {
+    pipeline: vk.Pipeline,
+    layout: vk.PipelineLayout,
+    set_layout: vk.DescriptorSetLayout,
+    
+    pub fn init(ctx: Context, shader: vk.ShaderModule, entry_point: [*:0]const u8, n_buffers: u32) !Pipeline {
+        var bindings = try ctx.allocator.alloc(vk.DescriptorSetLayoutBinding, n_buffers);
+        defer ctx.allocator.free(bindings);
+
+        for (0..n_buffers) |i| {
+            bindings[i] = .{
+                .binding = @as(u32, @intCast(i)),
+                .descriptor_type = .storage_buffer,
+                .descriptor_count = 1,
+                .stage_flags = .{ .compute_bit = true },
+                .p_immutable_samplers = null,
+            };
+        }
+
+        const set_layout = try ctx.vkd.createDescriptorSetLayout(ctx.device, &.{
+            .binding_count = n_buffers,
+            .p_bindings = bindings.ptr,
+        }, null);
+        errdefer ctx.vkd.destroyDescriptorSetLayout(ctx.device, set_layout, null);
+
+        const layout = try ctx.vkd.createPipelineLayout(ctx.device, &.{
+            .flags = .{},
+            .set_layout_count = 1,
+            .p_set_layouts = (&set_layout)[0..1],
+            .push_constant_range_count = 0,
+            .p_push_constant_ranges = null,
+        }, null);
+        errdefer ctx.vkd.destroyPipelineLayout(ctx.device, layout, null);
+
+        const stage_info = vk.PipelineShaderStageCreateInfo{
+            .stage = .{ .compute_bit = true },
+            .module = shader,
+            .p_name = entry_point,
+            .p_specialization_info = null,
+        };
+
+        const compute_info = vk.ComputePipelineCreateInfo{
+            .stage = stage_info,
+            .layout = layout,
+            .base_pipeline_handle = .null_handle,
+            .base_pipeline_index = -1,
+        };
+
+        var pipeline: vk.Pipeline = undefined;
+        _ = try ctx.vkd.createComputePipelines(ctx.device, .null_handle, (&compute_info)[0..1], null, (&pipeline)[0..1]);
+
+        return Pipeline{
+            .pipeline = pipeline,
+            .layout = layout,
+            .set_layout = set_layout,
+        };
+    }
+
+    pub fn deinit(self: Pipeline, ctx: Context) void {
+        ctx.vkd.destroyPipeline(ctx.device, self.pipeline, null);
+        ctx.vkd.destroyPipelineLayout(ctx.device, self.layout, null);
+        ctx.vkd.destroyDescriptorSetLayout(ctx.device, self.set_layout, null);
     }
 };
