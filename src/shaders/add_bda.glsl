@@ -8,7 +8,7 @@ layout(buffer_reference, std430, buffer_reference_align = 4) buffer FloatBuffer 
 
 layout(push_constant) uniform PC {
     uint n;
-    uint padding; // Explicit padding to match Zig's extern struct alignment
+    uint d;
     FloatBuffer a;
     FloatBuffer b;
     FloatBuffer c;
