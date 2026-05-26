@@ -2,18 +2,21 @@
 
 A high-performance port of the `llama.cpp` inference engine to Zig, featuring a **Vulkan** compute backend.
 
-## Project Status: Foundations (Phase 1 & 2)
+## Project Status: Infrastructure (Phase 1 & 2 Complete)
 
-The project is currently in the early development phase. 
+The project has established its core infrastructure and is ready for compute kernel development.
 
 ### Current Capabilities:
-- **GGUF Parser:** A pure Zig implementation capable of parsing GGUF v3 metadata, Key-Value pairs, and tensor definitions.
-- **Build System:** Integrated with Zig 0.16.0 package manager, utilizing `vulkan-zig` and `Vulkan-Headers` for automatic binding generation.
-- **Architecture:** Core `Tensor` and `Context` structures established, mirroring `ggml` concepts.
+- **GGUF Parser:** A pure Zig implementation capable of parsing GGUF v3 metadata, Key-Value pairs, and tensor definitions (including K-Quants).
+- **Vulkan Backend:** 
+    - Custom Windows loader for `vulkan-1.dll` (bypassing Zig 0.16.0 standard library limitations).
+    - Smart Physical Device selection (Discrete GPU prioritization).
+    - Fully initialized Logical Device with Compute Queues and Command Pools.
+    - `Buffer` abstraction for VRAM management and Host-to-Device copying.
+- **Build System:** Integrated with Zig 0.16.0 package manager, utilizing `vulkan-zig` and `Vulkan-Headers`.
 
 ### Upcoming Milestones:
-- [ ] Vulkan Device & Queue initialization.
-- [ ] Zig-to-SPIR-V compute kernels for tensor math (Add, MatMul, etc.).
+- [ ] Zig-to-SPIR-V compute kernels for tensor math (Add, MatMul, RMSNorm).
 - [ ] Static Compute Graph dispatcher.
 - [ ] Llama 3 model orchestration.
 
@@ -21,15 +24,15 @@ The project is currently in the early development phase.
 
 ### Prerequisites
 - **Zig (0.16.0 or newer):** [Download Zig](https://ziglang.org/download/)
-- **Vulkan SDK:** Required for the `vk.xml` registry and runtime.
+- **Vulkan SDK:** Required for the `vk.xml` registry and validation layers.
 
 ### Build
 ```bash
 zig build
 ```
 
-### Usage (Parser Validation)
-You can currently test the GGUF parser by pointing it to a model file:
+### Usage (Validation)
+You can test the GGUF parser and Vulkan initialization by pointing it to a model file:
 ```bash
 zig build run -- --model path/to/model.gguf
 ```

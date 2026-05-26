@@ -43,10 +43,9 @@ pub fn main(init: std.process.Init) !void {
     try writer.interface.print("Initializing Vulkan backend...\n", .{});
     try writer.interface.flush();
     
-    // Skip Vulkan for now to show parser success
-    // var vk_ctx = try vulkan.Context.init(allocator);
-    // defer vk_ctx.deinit();
-    // try writer.interface.print("Vulkan backend initialized.\n", .{});
+    var vk_ctx = try vulkan.Context.init(allocator);
+    defer vk_ctx.deinit();
+    try writer.interface.print("Vulkan backend initialized successfully.\n", .{});
     
     try writer.interface.flush();
 }
