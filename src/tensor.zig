@@ -5,17 +5,22 @@ pub const Type = enum(u32) {
     f16 = 1,
     q4_0 = 2,
     q4_1 = 3,
-    // Add other types as needed
-    // ...
     q5_0 = 6,
     q5_1 = 7,
     q8_0 = 8,
     q8_1 = 9,
-    i32 = 14,
-    f64 = 15,
-    i8 = 16,
+    // k-quants
+    q2_k = 10,
+    q3_k = 11,
+    q4_k = 12,
+    q5_k = 13,
+    q6_k = 14,
+    q8_k = 15,
+    i32 = 16,
     i16 = 17,
-    i64 = 18,
+    i8 = 18,
+    f64 = 19,
+    i64 = 20,
     
     pub fn sizeOf(self: Type) usize {
         return switch (self) {
@@ -23,7 +28,7 @@ pub const Type = enum(u32) {
             .f16, .i16 => 2,
             .i8 => 1,
             .f64, .i64 => 8,
-            else => @panic("Unsupported type size requested"),
+            else => 0, // quantized types have complex sizing
         };
     }
 };

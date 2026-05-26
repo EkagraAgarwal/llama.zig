@@ -43,7 +43,7 @@ pub const KV = struct {
 
 pub const GGUFContext = struct {
     allocator: std.mem.Allocator,
-    file: std.fs.File,
+    file: std.Io.File,
     version: u32,
     tensor_count: u64,
     kv_count: u64,
@@ -51,8 +51,7 @@ pub const GGUFContext = struct {
     tensors: std.StringHashMap(*Tensor),
     data_offset: u64,
     
-    pub fn init(allocator: std.mem.Allocator, file_path: []const u8) !GGUFContext {
-        const file = try std.fs.cwd().openFile(file_path, .{});
+    pub fn init(allocator: std.mem.Allocator, file: std.Io.File) GGUFContext {
         return GGUFContext{
             .allocator = allocator,
             .file = file,
@@ -82,7 +81,8 @@ pub const GGUFContext = struct {
         }
         self.tensors.deinit();
 
-        self.file.close();
+        const io = std.Io.Threaded.global_single_threaded.io();
+        self.file.close(io);
     }
 };
 
@@ -100,33 +100,37 @@ fn freeMetadataValue(allocator: std.mem.Allocator, value: MetadataValue) void {
 }
 
 pub fn loadModel(allocator: std.mem.Allocator, path: []const u8) !GGUFContext {
-    var ctx = try GGUFContext.init(allocator, path);
+    // Open file using std.Io
+    const cwd = std.Io.Dir.cwd();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const file = try cwd.openFile(io, path, .{ .mode = .read_only });
+    
+    var ctx = GGUFContext.init(allocator, file);
     errdefer ctx.deinit();
 
-    var reader = ctx.file.reader();
+    var read_buffer: [8192]u8 = undefined;
+    var file_reader = file.readerStreaming(io, &read_buffer);
+    const reader = &file_reader.interface;
     
     // Read Magic
-    const magic = try reader.readInt(u32, .little);
+    const magic = try readInt(u32, reader);
     if (magic != GGUFMagic) {
-        std.debug.print("Invalid GGUF magic: {x}\n", .{magic});
         return error.InvalidMagic;
     }
 
     // Read Version
-    ctx.version = try reader.readInt(u32, .little);
+    ctx.version = try readInt(u32, reader);
     
     // Read counts
-    ctx.tensor_count = try reader.readInt(u64, .little);
-    ctx.kv_count = try reader.readInt(u64, .little);
-
-    std.debug.print("GGUF Version: {}, Tensors: {}, KV Pairs: {}\n", .{ctx.version, ctx.tensor_count, ctx.kv_count});
+    ctx.tensor_count = try readInt(u64, reader);
+    ctx.kv_count = try readInt(u64, reader);
 
     // Parse KV pairs
     for (0..ctx.kv_count) |_| {
         const key = try readString(allocator, reader);
         errdefer allocator.free(key);
         
-        const val_type_int = try reader.readInt(u32, .little);
+        const val_type_int = try readInt(u32, reader);
         const val_type = @as(ValueType, @enumFromInt(val_type_int));
         
         const val = try readMetadataValue(allocator, reader, val_type);
@@ -138,17 +142,17 @@ pub fn loadModel(allocator: std.mem.Allocator, path: []const u8) !GGUFContext {
         const name = try readString(allocator, reader);
         errdefer allocator.free(name);
 
-        const n_dims = try reader.readInt(u32, .little);
+        const n_dims = try readInt(u32, reader);
         var dims = try allocator.alloc(u64, n_dims);
         defer allocator.free(dims);
 
         for (0..n_dims) |i| {
-            dims[i] = try reader.readInt(u64, .little);
+            dims[i] = try readInt(u64, reader);
         }
 
-        const tensor_type_int = try reader.readInt(u32, .little);
+        const tensor_type_int = try readInt(u32, reader);
         const tensor_type = @as(Type, @enumFromInt(tensor_type_int));
-        const offset = try reader.readInt(u64, .little);
+        const offset = try readInt(u64, reader);
 
         var tensor = try Tensor.init(allocator, name, tensor_type, dims);
         tensor.offset = offset;
@@ -158,7 +162,7 @@ pub fn loadModel(allocator: std.mem.Allocator, path: []const u8) !GGUFContext {
 
     // The data offset requires aligning to a multiple
     const alignment = getAlignment(ctx.kvs);
-    const current_pos = try ctx.file.getPos();
+    const current_pos = file_reader.logicalPos();
     
     const remainder = current_pos % alignment;
     if (remainder != 0) {
@@ -167,16 +171,18 @@ pub fn loadModel(allocator: std.mem.Allocator, path: []const u8) !GGUFContext {
         ctx.data_offset = current_pos;
     }
 
-    std.debug.print("Tensor data offset: {}\n", .{ctx.data_offset});
-
     return ctx;
 }
 
 fn getAlignment(kvs: std.StringHashMap(MetadataValue)) u64 {
     if (kvs.get("general.alignment")) |val| {
         return switch (val) {
+            .u8 => |v| @as(u64, v),
+            .u16 => |v| @as(u64, v),
             .u32 => |v| @as(u64, v),
             .u64 => |v| v,
+            .i8 => |v| @as(u64, @intCast(v)),
+            .i16 => |v| @as(u64, @intCast(v)),
             .i32 => |v| @as(u64, @intCast(v)),
             .i64 => |v| @as(u64, @intCast(v)),
             else => 32,
@@ -185,33 +191,38 @@ fn getAlignment(kvs: std.StringHashMap(MetadataValue)) u64 {
     return 32; // default GGUF alignment
 }
 
-fn readString(allocator: std.mem.Allocator, reader: anytype) ![]const u8 {
-    const len = try reader.readInt(u64, .little);
+fn readString(allocator: std.mem.Allocator, reader: *std.Io.Reader) ![]const u8 {
+    const len = try readInt(u64, reader);
     const buf = try allocator.alloc(u8, len);
     errdefer allocator.free(buf);
-    const read_len = try reader.readAll(buf);
-    if (read_len != len) return error.EndOfStream;
+    try reader.readSliceAll(buf);
     return buf;
 }
 
-fn readMetadataValue(allocator: std.mem.Allocator, reader: anytype, val_type: ValueType) anyerror!MetadataValue {
+fn readInt(comptime T: type, reader: *std.Io.Reader) !T {
+    var bytes: [@sizeOf(T)]u8 = undefined;
+    try reader.readSliceAll(&bytes);
+    return std.mem.readInt(T, &bytes, .little);
+}
+
+fn readMetadataValue(allocator: std.mem.Allocator, reader: *std.Io.Reader, val_type: ValueType) anyerror!MetadataValue {
     return switch (val_type) {
-        .u8 => .{ .u8 = try reader.readInt(u8, .little) },
-        .i8 => .{ .i8 = try reader.readInt(i8, .little) },
-        .u16 => .{ .u16 = try reader.readInt(u16, .little) },
-        .i16 => .{ .i16 = try reader.readInt(i16, .little) },
-        .u32 => .{ .u32 = try reader.readInt(u32, .little) },
-        .i32 => .{ .i32 = try reader.readInt(i32, .little) },
-        .f32 => .{ .f32 = @bitCast(try reader.readInt(u32, .little)) },
-        .f64 => .{ .f64 = @bitCast(try reader.readInt(u64, .little)) },
-        .u64 => .{ .u64 = try reader.readInt(u64, .little) },
-        .i64 => .{ .i64 = try reader.readInt(i64, .little) },
-        .bool => .{ .bool = (try reader.readInt(u8, .little)) != 0 },
+        .u8 => .{ .u8 = (try readInt(u8, reader)) },
+        .i8 => .{ .i8 = @bitCast(try readInt(u8, reader)) },
+        .u16 => .{ .u16 = try readInt(u16, reader) },
+        .i16 => .{ .i16 = @bitCast(try readInt(i16, reader)) },
+        .u32 => .{ .u32 = try readInt(u32, reader) },
+        .i32 => .{ .i32 = @bitCast(try readInt(i32, reader)) },
+        .f32 => .{ .f32 = @bitCast(try readInt(u32, reader)) },
+        .f64 => .{ .f64 = @bitCast(try readInt(u64, reader)) },
+        .u64 => .{ .u64 = try readInt(u64, reader) },
+        .i64 => .{ .i64 = @bitCast(try readInt(i64, reader)) },
+        .bool => .{ .bool = (try readInt(u8, reader)) != 0 },
         .string => .{ .string = try readString(allocator, reader) },
         .array => {
-            const arr_val_type_int = try reader.readInt(u32, .little);
+            const arr_val_type_int = try readInt(u32, reader);
             const arr_val_type = @as(ValueType, @enumFromInt(arr_val_type_int));
-            const arr_len = try reader.readInt(u64, .little);
+            const arr_len = try readInt(u64, reader);
             
             var arr = try allocator.alloc(MetadataValue, arr_len);
             errdefer allocator.free(arr);

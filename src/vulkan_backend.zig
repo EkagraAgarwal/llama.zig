@@ -1,5 +1,6 @@
 const std = @import("std");
 const vk = @import("vulkan");
+const builtin = @import("builtin");
 
 /// Manages the Vulkan instance, physical device, logical device, and compute queues.
 pub const Context = struct {
@@ -10,41 +11,11 @@ pub const Context = struct {
     compute_queue: vk.Queue,
     compute_family_index: u32,
 
-    vki: InstanceDispatch,
-    vkd: DeviceDispatch,
-
-    const InstanceDispatch = vk.InstanceWrapper(.{
-        .destroyInstance = true,
-        .getPhysicalDeviceQueueFamilyProperties = true,
-        .createDevice = true,
-        .getDeviceProcAddr = true,
-    });
-
-    const DeviceDispatch = vk.DeviceWrapper(.{
-        .destroyDevice = true,
-        .getDeviceQueue = true,
-        .createBuffer = true,
-        .allocateMemory = true,
-        .bindBufferMemory = true,
-        .mapMemory = true,
-        .unmapMemory = true,
-        .createShaderModule = true,
-        .createPipelineLayout = true,
-        .createComputePipelines = true,
-        .createCommandPool = true,
-        .allocateCommandBuffers = true,
-        .beginCommandBuffer = true,
-        .endCommandBuffer = true,
-        .cmdBindPipeline = true,
-        .cmdDispatch = true,
-        .queueSubmit = true,
-        .queueWaitIdle = true,
-    });
+    vki: vk.InstanceWrapper,
+    vkd: vk.DeviceWrapper,
 
     pub fn init(allocator: std.mem.Allocator) !Context {
         _ = allocator;
-        // In a real scenario, we'd need to load vkGetInstanceProcAddr from the dynamic library.
-        // For now, this is a structural template.
         return error.NotImplemented;
     }
 
