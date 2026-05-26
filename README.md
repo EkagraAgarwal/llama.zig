@@ -2,9 +2,9 @@
 
 A high-performance port of the `llama.cpp` inference engine to Zig, featuring a **Vulkan** compute backend.
 
-## Project Status: GPU Computing (Phase 1, 2, & 3 Complete)
+## Project Status: Compute Graph (Phase 4 in Progress)
 
-The project has achieved its most significant technical milestone: **Pure Zig GPU Kernels**.
+The project has achieved its most significant technical milestone: **Pure Zig GPU Kernels** and a **Compute Graph Dispatcher**.
 
 ### Current Capabilities:
 - **GGUF Parser:** Full support for GGUF v3, including BF16 and K-Quants.
@@ -12,15 +12,15 @@ The project has achieved its most significant technical milestone: **Pure Zig GP
     - Custom Windows loader for high-performance GPU access.
     - Smart GPU scoring and selection (Discrete GPU prioritized).
     - VRAM allocation and Host-to-Device memory synchronization.
+- **Compute Graph:** 
+    - DAG-based execution defined in `src/compute_graph.zig`.
+    - BDA (Buffer Device Address) dispatcher for high-performance dispatch.
 - **Zig-to-SPIR-V Kernels:** 
     - Compute shaders are written directly in Zig (`src/shaders/kernels.zig`).
-    - Kernels are compiled to SPIR-V and embedded into the executable during the build process.
-    - Support for `VK_KHR_buffer_device_address` (64-bit GPU pointers).
-- **Build System:** Fully automated Zig 0.16.0 build pipeline with zero external dependencies (Vulkan SDK required for runtime).
+    - [!] **Note**: AMDVLK on Windows currently segfaults during pipeline creation with Zig-generated SPIR-V. See `AGENTS.md` for investigation details.
 
 ### Upcoming Milestones:
-- [ ] Static Compute Graph dispatcher (Phase 4).
-- [ ] Llama 3 model forward pass implementation.
+- [ ] Llama 3 model forward pass implementation (Phase 5).
 - [ ] Tokenizer & Chat interface.
 
 ## Getting Started

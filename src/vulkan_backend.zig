@@ -10,7 +10,14 @@ const windows = if (builtin.os.tag == .windows) struct {
     pub extern "kernel32" fn FreeLibrary(hModule: HMODULE) callconv(.winapi) std.os.windows.BOOL;
 } else struct {};
 
-/// Manages the Vulkan instance, physical device, logical device, and compute queues.
+pub const PushConstants = extern struct {
+    n: u32,
+    padding: u32 = 0,
+    a: u64,
+    b: u64,
+    c: u64,
+};
+
 pub const Context = struct {
     allocator: std.mem.Allocator,
     handle: if (builtin.os.tag == .windows) windows.HMODULE else *anyopaque,
@@ -21,14 +28,13 @@ pub const Context = struct {
     compute_family_index: u32,
     mem_props: vk.PhysicalDeviceMemoryProperties,
     cmd_pool: vk.CommandPool,
-    descriptor_pool: vk.DescriptorPool,
 
     vki: vk.InstanceWrapper,
     vkd: vk.DeviceWrapper,
 
     pub fn init(allocator: std.mem.Allocator) !Context {
         const loader_name = if (builtin.os.tag == .windows) "vulkan-1.dll" else "libvulkan.so.1";
-        
+
         var handle: if (builtin.os.tag == .windows) windows.HMODULE else *anyopaque = undefined;
         var vkGetInstanceProcAddr: vk.PfnGetInstanceProcAddr = undefined;
 
@@ -39,7 +45,6 @@ pub const Context = struct {
             const proc = windows.GetProcAddress(handle, "vkGetInstanceProcAddr") orelse return error.VulkanLoaderNotFound;
             vkGetInstanceProcAddr = @ptrCast(proc);
         } else {
-            // Placeholder for other OS
             return error.UnsupportedPlatform;
         }
 
@@ -79,7 +84,6 @@ pub const Context = struct {
         const vki = vk.InstanceWrapper.load(instance, vkGetInstanceProcAddr);
         errdefer vki.destroyInstance(instance, null);
 
-        // Find Physical Device
         var pdev_count: u32 = 0;
         _ = try vki.enumeratePhysicalDevices(instance, &pdev_count, null);
         if (pdev_count == 0) return error.NoVulkanDevicesFound;
@@ -94,8 +98,7 @@ pub const Context = struct {
 
         for (pdevs) |candidate| {
             const props = vki.getPhysicalDeviceProperties(candidate);
-            
-            // Check for compute support
+
             var qf_count: u32 = 0;
             vki.getPhysicalDeviceQueueFamilyProperties(candidate, &qf_count, null);
             const qfs = try allocator.alloc(vk.QueueFamilyProperties, qf_count);
@@ -126,9 +129,8 @@ pub const Context = struct {
         const pdev = best_pdev orelse return error.NoSuitableVulkanDevice;
         const props = vki.getPhysicalDeviceProperties(pdev);
         const mem_props = vki.getPhysicalDeviceMemoryProperties(pdev);
-        std.debug.print("Selected GPU: {s} (Validation: {})\n", .{std.mem.sliceTo(&props.device_name, 0), validation_layer_enabled});
+        std.debug.print("Selected GPU: {s}\n", .{std.mem.sliceTo(&props.device_name, 0)});
 
-        // Check for bufferDeviceAddress support
         var bda_features = vk.PhysicalDeviceBufferDeviceAddressFeatures{
             .p_next = null,
             .buffer_device_address = .true,
@@ -137,7 +139,9 @@ pub const Context = struct {
         };
         var features2 = vk.PhysicalDeviceFeatures2{
             .p_next = &bda_features,
-            .features = .{},
+            .features = .{
+                .shader_int_64 = .true,
+            },
         };
         vki.getPhysicalDeviceFeatures2(pdev, &features2);
 
@@ -152,10 +156,16 @@ pub const Context = struct {
             .p_queue_priorities = &queue_priority,
         };
 
+        const device_extensions = [_][*:0]const u8{
+            vk.extensions.khr_buffer_device_address.name,
+        };
+
         const device = try vki.createDevice(pdev, &.{
-            .p_next = &features2, // Enable features2 and bda_features
+            .p_next = &features2,
             .queue_create_info_count = 1,
             .p_queue_create_infos = (&queue_create_info)[0..1],
+            .enabled_extension_count = @as(u32, @intCast(device_extensions.len)),
+            .pp_enabled_extension_names = &device_extensions,
         }, null);
 
         const vkd = vk.DeviceWrapper.load(device, vki.dispatch.vkGetDeviceProcAddr.?);
@@ -168,16 +178,6 @@ pub const Context = struct {
             .flags = .{ .reset_command_buffer_bit = true },
         }, null);
 
-        const pool_size = vk.DescriptorPoolSize{
-            .type = .storage_buffer,
-            .descriptor_count = 100,
-        };
-        const descriptor_pool = try vkd.createDescriptorPool(device, &.{
-            .pool_size_count = 1,
-            .p_pool_sizes = (&pool_size)[0..1],
-            .max_sets = 100,
-        }, null);
-
         return Context{
             .allocator = allocator,
             .handle = handle,
@@ -188,7 +188,6 @@ pub const Context = struct {
             .compute_family_index = best_compute_index,
             .mem_props = mem_props,
             .cmd_pool = cmd_pool,
-            .descriptor_pool = descriptor_pool,
             .vki = vki,
             .vkd = vkd,
         };
@@ -207,7 +206,6 @@ pub const Context = struct {
     }
 
     pub fn deinit(self: *Context) void {
-        self.vkd.destroyDescriptorPool(self.device, self.descriptor_pool, null);
         self.vkd.destroyCommandPool(self.device, self.cmd_pool, null);
         self.vkd.destroyDevice(self.device, null);
         self.vki.destroyInstance(self.instance, null);
@@ -262,7 +260,7 @@ pub const Buffer = struct {
     memory: vk.DeviceMemory,
     size: u64,
     address: u64 = 0,
-    
+
     pub fn init(ctx: Context, size: u64, usage: vk.BufferUsageFlags, properties: vk.MemoryPropertyFlags) !Buffer {
         const buffer = try ctx.vkd.createBuffer(ctx.device, &.{
             .size = size,
@@ -274,21 +272,17 @@ pub const Buffer = struct {
         const mem_requirements = ctx.vkd.getBufferMemoryRequirements(ctx.device, buffer);
         const mem_type = try ctx.findMemoryType(mem_requirements.memory_type_bits, properties);
 
+        var flags_info = vk.MemoryAllocateFlagsInfo{
+            .p_next = null,
+            .flags = .{ .device_address_bit = true },
+            .device_mask = 0,
+        };
+
         var alloc_info = vk.MemoryAllocateInfo{
             .allocation_size = mem_requirements.size,
             .memory_type_index = mem_type,
-            .p_next = null,
+            .p_next = if (usage.shader_device_address_bit) &flags_info else null,
         };
-
-        var flags_info: vk.MemoryAllocateFlagsInfo = undefined;
-        if (usage.shader_device_address_bit) {
-            flags_info = .{
-                .p_next = null,
-                .flags = .{ .device_address_bit = true },
-                .device_mask = 0,
-            };
-            alloc_info.p_next = &flags_info;
-        }
 
         const memory = try ctx.vkd.allocateMemory(ctx.device, &alloc_info, null);
         errdefer ctx.vkd.freeMemory(ctx.device, memory, null);
@@ -317,34 +311,20 @@ pub const Buffer = struct {
 pub const Pipeline = struct {
     pipeline: vk.Pipeline,
     layout: vk.PipelineLayout,
-    set_layout: vk.DescriptorSetLayout,
-    
-    pub fn init(ctx: Context, shader: vk.ShaderModule, entry_point: [*:0]const u8, n_buffers: u32) !Pipeline {
-        var bindings = try ctx.allocator.alloc(vk.DescriptorSetLayoutBinding, n_buffers);
-        defer ctx.allocator.free(bindings);
 
-        for (0..n_buffers) |i| {
-            bindings[i] = .{
-                .binding = @as(u32, @intCast(i)),
-                .descriptor_type = .storage_buffer,
-                .descriptor_count = 1,
-                .stage_flags = .{ .compute_bit = true },
-                .p_immutable_samplers = null,
-            };
-        }
-
-        const set_layout = try ctx.vkd.createDescriptorSetLayout(ctx.device, &.{
-            .binding_count = n_buffers,
-            .p_bindings = bindings.ptr,
-        }, null);
-        errdefer ctx.vkd.destroyDescriptorSetLayout(ctx.device, set_layout, null);
+    pub fn init(ctx: Context, shader: vk.ShaderModule, entry_point: [*:0]const u8) !Pipeline {
+        const pc_range = vk.PushConstantRange{
+            .stage_flags = .{ .compute_bit = true },
+            .offset = 0,
+            .size = @sizeOf(PushConstants),
+        };
 
         const layout = try ctx.vkd.createPipelineLayout(ctx.device, &.{
             .flags = .{},
-            .set_layout_count = 1,
-            .p_set_layouts = (&set_layout)[0..1],
-            .push_constant_range_count = 0,
-            .p_push_constant_ranges = null,
+            .set_layout_count = 0,
+            .p_set_layouts = null,
+            .push_constant_range_count = 1,
+            .p_push_constant_ranges = (&pc_range)[0..1],
         }, null);
         errdefer ctx.vkd.destroyPipelineLayout(ctx.device, layout, null);
 
@@ -368,13 +348,53 @@ pub const Pipeline = struct {
         return Pipeline{
             .pipeline = pipeline,
             .layout = layout,
-            .set_layout = set_layout,
         };
     }
 
     pub fn deinit(self: Pipeline, ctx: Context) void {
         ctx.vkd.destroyPipeline(ctx.device, self.pipeline, null);
         ctx.vkd.destroyPipelineLayout(ctx.device, self.layout, null);
-        ctx.vkd.destroyDescriptorSetLayout(ctx.device, self.set_layout, null);
+    }
+};
+
+pub const PipelineRegistry = struct {
+    allocator: std.mem.Allocator,
+    add_shader: vk.ShaderModule,
+    mul_shader: vk.ShaderModule,
+    add_pipeline: Pipeline,
+    mul_pipeline: Pipeline,
+
+    pub fn init(allocator: std.mem.Allocator) !PipelineRegistry {
+        return PipelineRegistry{
+            .allocator = allocator,
+            .add_shader = .null_handle,
+            .mul_shader = .null_handle,
+            .add_pipeline = .{ .pipeline = .null_handle, .layout = .null_handle },
+            .mul_pipeline = .{ .pipeline = .null_handle, .layout = .null_handle },
+        };
+    }
+
+    pub fn deinit(self: *PipelineRegistry, ctx: Context) void {
+        if (self.add_shader != .null_handle) {
+            self.add_pipeline.deinit(ctx);
+            ctx.vkd.destroyShaderModule(ctx.device, self.add_shader, null);
+        }
+        if (self.mul_shader != .null_handle) {
+            self.mul_pipeline.deinit(ctx);
+            ctx.vkd.destroyShaderModule(ctx.device, self.mul_shader, null);
+        }
+    }
+
+    pub fn register(self: *PipelineRegistry, ctx: Context, name: []const u8, shader_code: []const u8, entry_point: [*:0]const u8) !void {
+        const shader = try ctx.createShaderModule(shader_code);
+        const pipeline = try Pipeline.init(ctx, shader, entry_point);
+
+        if (std.mem.eql(u8, name, "add")) {
+            self.add_shader = shader;
+            self.add_pipeline = pipeline;
+        } else if (std.mem.eql(u8, name, "mul")) {
+            self.mul_shader = shader;
+            self.mul_pipeline = pipeline;
+        }
     }
 };

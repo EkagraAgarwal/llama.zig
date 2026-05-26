@@ -4,7 +4,6 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // Vulkan code generation
     const vk_xml_path = b.dependency("vulkan_headers", .{}).path("registry/vk.xml");
 
     const vulkan_dep = b.dependency("vulkan", .{
@@ -13,22 +12,8 @@ pub fn build(b: *std.Build) void {
 
     const vulkan_mod = vulkan_dep.module("vulkan-zig");
 
-    // SPIR-V Kernel Compilation via System Command
-    // We use raw spirv64-vulkan which seems to produce more compatible output
-    const kernels_compile = b.addSystemCommand(&.{
-        b.graph.zig_exe,
-        "build-obj",
-        b.pathFromRoot("src/shaders/kernels.zig"),
-        "-target", "spirv64-vulkan",
-        "-ofmt=spirv",
-    });
-    const kernels_spv = kernels_compile.addPrefixedOutputFileArg("-femit-bin=", "kernels.spv");
-
-    const wf = b.addWriteFile("kernels_data.zig", "pub const data = @embedFile(\"kernels.spv\");\n");
-    _ = wf.addCopyFile(kernels_spv, "kernels.spv");
-    
     const kernels_data_mod = b.createModule(.{
-        .root_source_file = wf.getDirectory().path(b, "kernels_data.zig"),
+        .root_source_file = b.path("kernels_data.zig"),
     });
 
     const exe = b.addExecutable(.{
