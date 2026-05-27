@@ -1,6 +1,9 @@
 # Models
 models/
 
+# Local llama.cpp reference binaries and source checkout (not vendored)
+Reference/
+
 # Zig build artifacts
 zig-out/
 zig-cache/

@@ -8,6 +8,10 @@ pub const SpecialTokens = struct {
     start_of_role: ?TokenID = null,
     end_of_role: ?TokenID = null,
     end_of_text: ?TokenID = null,
+    begin_of_text: ?TokenID = null,
+    eot_id: ?TokenID = null,
+    start_header_id: ?TokenID = null,
+    end_header_id: ?TokenID = null,
 };
 
 pub const Tokenizer = struct {
@@ -21,6 +25,7 @@ pub const Tokenizer = struct {
     unk_token_id: ?TokenID = null,
     add_bos_token: bool = true,
     special: SpecialTokens = .{},
+    chat_template: ?[]const u8 = null,
 
     pub fn init(allocator: std.mem.Allocator, ctx: *GGUFContext) !Tokenizer {
         var tokenizer = Tokenizer{
@@ -70,12 +75,21 @@ pub const Tokenizer = struct {
                 else => true,
             };
         }
+        if (ctx.kvs.get("tokenizer.chat_template")) |val| {
+            if (val == .string) {
+                tokenizer.chat_template = try allocator.dupe(u8, val.string);
+            }
+        }
 
         // 4. Load Granite/Chat special tokens by scanning the vocab
         for (tokens_array, 0..) |tok_str, i| {
             if (std.mem.eql(u8, tok_str.string, "<|start_of_role|>")) tokenizer.special.start_of_role = @as(TokenID, @intCast(i));
             if (std.mem.eql(u8, tok_str.string, "<|end_of_role|>")) tokenizer.special.end_of_role = @as(TokenID, @intCast(i));
             if (std.mem.eql(u8, tok_str.string, "<|end_of_text|>")) tokenizer.special.end_of_text = @as(TokenID, @intCast(i));
+            if (std.mem.eql(u8, tok_str.string, "<|begin_of_text|>")) tokenizer.special.begin_of_text = @as(TokenID, @intCast(i));
+            if (std.mem.eql(u8, tok_str.string, "<|eot_id|>")) tokenizer.special.eot_id = @as(TokenID, @intCast(i));
+            if (std.mem.eql(u8, tok_str.string, "<|start_header_id|>")) tokenizer.special.start_header_id = @as(TokenID, @intCast(i));
+            if (std.mem.eql(u8, tok_str.string, "<|end_header_id|>")) tokenizer.special.end_header_id = @as(TokenID, @intCast(i));
         }
 
         return tokenizer;
@@ -88,6 +102,9 @@ pub const Tokenizer = struct {
             self.allocator.free(tok);
         }
         self.allocator.free(self.id_to_token);
+        if (self.chat_template) |tpl| {
+            self.allocator.free(tpl);
+        }
 
         var merges_it = self.merges.iterator();
         while (merges_it.next()) |entry| {
@@ -110,8 +127,18 @@ pub const Tokenizer = struct {
             }
         }
 
-        var it = PreTokenizerIterator{ .text = text };
-        while (it.next()) |chunk| {
+        var cursor: usize = 0;
+        while (cursor < text.len) {
+            if (findSpecialTokenAt(self, text, cursor)) |m| {
+                try token_ids.append(out_allocator, m.id);
+                cursor += m.len;
+                continue;
+            }
+
+            var it = PreTokenizerIterator{ .text = text[cursor..] };
+            const chunk = it.next() orelse break;
+            cursor += chunk.len;
+
             // Apply byte-to-unicode mapping to chunk
             var symbols: std.ArrayList([]const u8) = .empty;
             defer symbols.deinit(arena);
@@ -274,3 +301,52 @@ const PreTokenizerIterator = struct {
         }
     }
 };
+
+const TokenMatch = struct {
+    id: TokenID,
+    len: usize,
+};
+
+fn findSpecialTokenAt(self: *const Tokenizer, text: []const u8, at: usize) ?TokenMatch {
+    var best: ?TokenMatch = null;
+    for (self.id_to_token, 0..) |tok, i| {
+        if (tok.len < 4) continue;
+        if (!(tok[0] == '<' and tok[tok.len - 1] == '>')) continue;
+        if (at + tok.len > text.len) continue;
+        if (std.mem.eql(u8, text[at .. at + tok.len], tok)) {
+            if (best == null or tok.len > best.?.len) {
+                best = .{ .id = @as(TokenID, @intCast(i)), .len = tok.len };
+            }
+        }
+    }
+    return best;
+}
+
+test "encode preserves special token spans" {
+    const alloc = std.testing.allocator;
+    var t = Tokenizer{
+        .allocator = alloc,
+        .vocab = std.StringHashMap(TokenID).init(alloc),
+        .id_to_token = try alloc.alloc([]const u8, 7),
+        .merges = std.StringHashMap(usize).init(alloc),
+        .bos_token_id = null,
+        .eos_token_id = null,
+        .pad_token_id = null,
+        .unk_token_id = null,
+        .add_bos_token = false,
+        .special = .{},
+    };
+    defer t.deinit();
+
+    const toks = [_][]const u8{ "<|begin_of_text|>", "h", "e", "l", "o", " ", "!" };
+    for (toks, 0..) |tok, i| {
+        const owned = try alloc.dupe(u8, tok);
+        t.id_to_token[i] = owned;
+        try t.vocab.put(owned, @as(TokenID, @intCast(i)));
+    }
+
+    const ids = try t.encode("<|begin_of_text|>hello!", alloc);
+    defer alloc.free(ids);
+    try std.testing.expect(ids.len >= 2);
+    try std.testing.expectEqual(@as(TokenID, 0), ids[0]);
+}

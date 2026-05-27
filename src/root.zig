@@ -12,6 +12,7 @@ pub const vulkan_backend = @import("vulkan_backend.zig");
 test {
     _ = @import("weights.zig");
     _ = @import("sampler.zig");
+    _ = @import("tokenizer.zig");
 }
 
 test "bf16 roundtrip" {

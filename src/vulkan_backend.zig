@@ -34,6 +34,7 @@ pub const Context = struct {
     compute_family_index: u32,
     mem_props: vk.PhysicalDeviceMemoryProperties,
     cmd_pool: vk.CommandPool,
+    transfer_fence: vk.Fence = .null_handle,
 
     vki: vk.InstanceWrapper,
     vkd: *vk.DeviceWrapper,
@@ -156,6 +157,9 @@ pub const Context = struct {
     }
 
     pub fn deinit(self: *Context) void {
+        if (self.transfer_fence != .null_handle) {
+            self.vkd.dispatch.vkDestroyFence.?(self.device, self.transfer_fence, null);
+        }
         self.vkd.dispatch.vkDestroyCommandPool.?(self.device, self.cmd_pool, null);
         self.vkd.dispatch.vkDestroyDevice.?(self.device, null);
         self.allocator.destroy(self.vkd);
@@ -177,18 +181,27 @@ pub const Context = struct {
         return shader;
     }
 
-    pub fn copyBufferOffset(self: Context, src: Buffer, src_off: u64, dst: Buffer, dst_off: u64, size: u64) !void {
+    fn ensureTransferFence(self: *Context) !vk.Fence {
+        if (self.transfer_fence == .null_handle) {
+            _ = self.vkd.dispatch.vkCreateFence.?(self.device, &.{ .flags = .{} }, null, &self.transfer_fence);
+        }
+        return self.transfer_fence;
+    }
+
+    pub fn copyBufferOffset(self: *Context, src: Buffer, src_off: u64, dst: Buffer, dst_off: u64, size: u64) !void {
         var cmd: vk.CommandBuffer = undefined;
         _ = self.vkd.dispatch.vkAllocateCommandBuffers.?(self.device, &.{ .command_pool = self.cmd_pool, .level = .primary, .command_buffer_count = 1 }, (&cmd)[0..1]);
+        defer self.vkd.dispatch.vkFreeCommandBuffers.?(self.device, self.cmd_pool, 1, (&cmd)[0..1]);
         _ = self.vkd.dispatch.vkBeginCommandBuffer.?(cmd, &.{ .flags = .{ .one_time_submit_bit = true }, .p_inheritance_info = null });
         self.vkd.dispatch.vkCmdCopyBuffer.?(cmd, src.buffer, dst.buffer, 1, &[_]vk.BufferCopy{.{ .src_offset = src_off, .dst_offset = dst_off, .size = size }});
         _ = self.vkd.dispatch.vkEndCommandBuffer.?(cmd);
-        _ = self.vkd.dispatch.vkQueueSubmit.?(self.compute_queue, 1, &[_]vk.SubmitInfo{.{ .wait_semaphore_count = 0, .p_wait_semaphores = null, .p_wait_dst_stage_mask = null, .command_buffer_count = 1, .p_command_buffers = (&cmd)[0..1], .signal_semaphore_count = 0, .p_signal_semaphores = null }}, .null_handle);
-        _ = self.vkd.dispatch.vkQueueWaitIdle.?(self.compute_queue);
-        self.vkd.dispatch.vkFreeCommandBuffers.?(self.device, self.cmd_pool, 1, (&cmd)[0..1]);
+        const fence = try self.ensureTransferFence();
+        _ = self.vkd.dispatch.vkResetFences.?(self.device, 1, (&fence)[0..1]);
+        _ = self.vkd.dispatch.vkQueueSubmit.?(self.compute_queue, 1, &[_]vk.SubmitInfo{.{ .wait_semaphore_count = 0, .p_wait_semaphores = null, .p_wait_dst_stage_mask = null, .command_buffer_count = 1, .p_command_buffers = (&cmd)[0..1], .signal_semaphore_count = 0, .p_signal_semaphores = null }}, fence);
+        _ = self.vkd.dispatch.vkWaitForFences.?(self.device, 1, (&fence)[0..1], @enumFromInt(1), std.math.maxInt(u64));
     }
     
-    pub fn copyBuffer(self: Context, src: Buffer, dst: Buffer, size: u64) !void {
+    pub fn copyBuffer(self: *Context, src: Buffer, dst: Buffer, size: u64) !void {
         try self.copyBufferOffset(src, 0, dst, 0, size);
     }
 };

@@ -54,8 +54,22 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_ops_tests = b.addRunArtifact(ops_tests);
-    const test_step = b.step("test", "Run CPU reference tests for core math ops");
+    const root_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/root.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "vulkan", .module = vulkan_mod },
+                .{ .name = "kernels_data", .module = kernels_data_mod },
+            },
+        }),
+    });
+    const run_root_tests = b.addRunArtifact(root_tests);
+
+    const test_step = b.step("test", "Run CPU and parity-focused unit tests");
     test_step.dependOn(&run_ops_tests.step);
+    test_step.dependOn(&run_root_tests.step);
 }
 
 fn compileShaders(b: *std.Build) ?*std.Build.Step {
@@ -63,6 +77,13 @@ fn compileShaders(b: *std.Build) ?*std.Build.Step {
         .{ .src = "src/shaders/add_bda.glsl", .out = "add_bda.spv" },
         .{ .src = "src/shaders/mul_bda.glsl", .out = "mul_bda.spv" },
         .{ .src = "src/shaders/matmul_bda.glsl", .out = "matmul_bda.spv" },
+        .{ .src = "src/shaders/matmul_q4_k_bda.glsl", .out = "matmul_q4_k_bda.spv" },
+        .{ .src = "src/shaders/matmul_q6_k_bda.glsl", .out = "matmul_q6_k_bda.spv" },
+        .{ .src = "src/shaders/matvec_q4_k_bda.glsl", .out = "matvec_q4_k_bda.spv" },
+        .{ .src = "src/shaders/matvec_q6_k_bda.glsl", .out = "matvec_q6_k_bda.spv" },
+        .{ .src = "src/shaders/get_rows_q_bda.glsl", .out = "get_rows_q_bda.spv" },
+        .{ .src = "src/shaders/topk_bda.glsl", .out = "topk_bda.spv" },
+        .{ .src = "src/shaders/flash_attn_bda.glsl", .out = "flash_attn_bda.spv" },
         .{ .src = "src/shaders/rmsnorm_bda.glsl", .out = "rmsnorm_bda.spv" },
         .{ .src = "src/shaders/softmax_bda.glsl", .out = "softmax_bda.spv" },
         .{ .src = "src/shaders/rope_bda.glsl", .out = "rope_bda.spv" },

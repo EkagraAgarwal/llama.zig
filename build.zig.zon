@@ -49,6 +49,7 @@
         "add_bda.spv",
         "mul_bda.spv",
         "matmul_bda.spv",
+        "matmul_q_bda.spv",
         "rmsnorm_bda.spv",
         "softmax_bda.spv",
         "rope_bda.spv",
