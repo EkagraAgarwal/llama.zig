@@ -44,9 +44,17 @@
     .paths = .{
         "build.zig",
         "build.zig.zon",
+        "kernels_data.zig",
         "src",
-        // For example...
-        //"LICENSE",
-        //"README.md",
+        "add_bda.spv",
+        "mul_bda.spv",
+        "matmul_bda.spv",
+        "rmsnorm_bda.spv",
+        "softmax_bda.spv",
+        "rope_bda.spv",
+        "silu_mul_bda.spv",
+        "attention_bda.spv",
+        "kv_write_bda.spv",
+        "scaled_add_bda.spv",
     },
 }

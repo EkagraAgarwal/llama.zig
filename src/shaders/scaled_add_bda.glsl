@@ -8,7 +8,7 @@ layout(buffer_reference, std430, buffer_reference_align = 4) buffer FloatBuffer 
 
 layout(push_constant) uniform PC {
     uint n;
-    uint d;
+    uint scale_bits;
     uint p3;
     uint p4;
     uint p5;
@@ -25,6 +25,7 @@ layout(local_size_x = 64) in;
 void main() {
     uint idx = gl_GlobalInvocationID.x;
     if (idx < pc.n) {
-        pc.c.data[idx] = pc.a.data[idx] * pc.b.data[idx];
+        float s = uintBitsToFloat(pc.scale_bits);
+        pc.c.data[idx] = pc.a.data[idx] + s * pc.b.data[idx];
     }
 }

@@ -1,37 +1,60 @@
 # llama.zig
 
-A high-performance port of the `llama.cpp` inference engine to Zig, featuring a **Vulkan** compute backend with near-zero CPU overhead.
+A high-performance port of the `llama.cpp` inference engine to Zig, featuring a **Vulkan** compute backend with near-zero CPU overhead (BDA + push constants).
 
-## Project Status: COMPLETED (Final Prototype)
+## Features
 
-`llama.zig` has successfully implemented the full inference pipeline, from parsing GGUF models to generating streaming text on the GPU.
-
-### Key Accomplishments:
-- **Zero-Overhead Dispatch**: Uses **Buffer Device Address (BDA)** and **Push Constants** to bypass the latency of traditional Vulkan descriptor sets.
-- **Direct Vulkan Dispatch**: Bypasses abstraction layers to directly call Vulkan dispatch tables, eliminating stack-overflow segfaults on deep layer graphs.
-- **Pure Zig Infrastructure**: GGUF v3 parser and BPE Tokenizer written from scratch in idiomatic Zig.
-- **Hardware Stability**: Custom GLSL-to-SPIR-V pipeline ensures compatibility with sensitive drivers like **AMDVLK** on Windows, circumventing the experimental Zig SPIR-V backend.
-- **Dynamic Compute Graph**: A flexible DAG-based system that builds Llama and Granite transformer blocks (RMSNorm, RoPE, SwiGLU) and manages multi-layer GPU memory automatically.
+- **GGUF v3** parser with architecture detection (`llama`, `granite`)
+- **BF16 / F32 / Q4_K** host-side dequantization to FP32 VRAM weights
+- **Full transformer forward pass**: RMSNorm, Q/K/V projections, RoPE, KV cache, scaled dot-product attention, SwiGLU FFN, LM head
+- **Autoregressive generation** with temperature + top-p sampling
+- **GLSL → SPIR-V** kernels via `glslangValidator` (AMDVLK-safe)
 
 ## Build Requirements
-- **Zig 0.16.0**
-- **Vulkan SDK** (For `glslangValidator` and validation layers)
 
-## Quick Start
+- **Zig 0.14.0**
+- **Vulkan SDK** (`glslangValidator`, loader)
+- Windows or Linux with a Vulkan 1.2+ GPU (BDA required)
+
+## Build
+
 ```bash
-# Build the project
 zig build -Doptimize=ReleaseFast
-
-# Run streaming inference
-./zig-out/bin/llama.zig --model models/granite-4.0-350m-BF16.gguf --prompt "The future of AI is"
 ```
 
-## Future Work (Phase 6)
-- **KV Cache**: Persist key-value tensors across generation steps for context-aware sequential inference.
-- **Memory Cleanup**: Fix minor `allocPrint` string memory leaks present during graph teardown.
-- **4-bit Quantization**: Implement `Q4_K_M` dequantization kernels to run larger Llama 3 models locally within 8GB VRAM.
-- **Multi-GPU**: Split large models across multiple Vulkan devices.
+Shaders are compiled automatically when `glslangValidator` is on `PATH`; prebuilt `.spv` files are used as fallback.
 
-## Acknowledgments
-- Inspired by [llama.cpp](https://github.com/ggerganov/llama.cpp) and `ggml`.
-- Utilizing [vulkan-zig](https://github.com/Snektron/vulkan-zig) for type-safe bindings.
+## Run
+
+```bash
+./zig-out/bin/llama.zig --model models/granite-4.0-350m-BF16.gguf --prompt "The future of AI is" --max-tokens 32 --temperature 0.8
+```
+
+### CLI flags
+
+| Flag | Description |
+|------|-------------|
+| `--model` | Path to `.gguf` model |
+| `--prompt` | Input text |
+| `--max-tokens` | Tokens to generate after prompt (default 64) |
+| `--temperature` | Sampling temperature (default 0.8) |
+
+## Architecture
+
+```
+main.zig
+  ├── model.zig        (GGUF metadata + model config)
+  ├── sampler.zig      (temperature / top-p sampling)
+  ├── tokenizer.zig    (BPE encode/decode)
+  ├── weights.zig      (dequant + upload to GPU)
+  ├── vulkan_backend.zig (BDA buffers, pipelines)
+  ├── compute_graph.zig (DAG + dispatcher)
+  └── root.zig         (root comptime struct for all ops)
+```
+
+## Remaining / Future Work
+
+- Fused GPU dequant matmul (avoid full FP32 weight VRAM)
+- Flash-attention style tiled attention kernel
+- Multi-GPU model splitting
+- Chat templates for instruct models

@@ -32,6 +32,36 @@ pub const Type = enum(u32) {
             else => 0, // quantized types have complex sizing
         };
     }
+
+    pub fn blockSize(self: Type) usize {
+        return switch (self) {
+            .q2_k, .q3_k, .q4_k, .q5_k, .q6_k, .q8_k => 256,
+            .q4_0, .q4_1, .q5_0, .q5_1, .q8_0, .q8_1 => 32,
+            else => 1,
+        };
+    }
+
+    /// Bytes per block for quantized types, or bytes per element for scalar types.
+    pub fn bytesPerBlock(self: Type) usize {
+        return switch (self) {
+            .f32, .i32 => 4,
+            .f16, .i16, .bf16 => 2,
+            .i8 => 1,
+            .f64, .i64 => 8,
+            .q4_0 => 18,   // 2 + 16
+            .q4_1 => 20,   // 4 + 16
+            .q5_0 => 22,   // 2 + 4 + 16
+            .q5_1 => 24,   // 4 + 4 + 16
+            .q8_0 => 34,   // 2 + 32
+            .q8_1 => 36,   // 4 + 32
+            .q2_k => 84,   // 256 elements in 84 bytes
+            .q3_k => 110,  // 256 elements in 110 bytes
+            .q4_k => 144,  // 256 elements in 144 bytes
+            .q5_k => 176,  // 256 elements in 176 bytes
+            .q6_k => 210,  // 256 elements in 210 bytes
+            .q8_k => 292,  // 256 elements in 292 bytes
+        };
+    }
 };
 
 pub const Tensor = struct {
@@ -71,7 +101,14 @@ pub const Tensor = struct {
     }
 
     pub fn size(self: *const Tensor) u64 {
-        return self.nb[3] * self.ne[3];
+        const n_elems = self.ne[0] * self.ne[1] * self.ne[2] * self.ne[3];
+        const blk = self.type.blockSize();
+        if (blk > 1) {
+            // Quantized: size = ceil(n_elems / blockSize) * bytesPerBlock
+            const n_blocks = (n_elems + blk - 1) / blk;
+            return n_blocks * self.type.bytesPerBlock();
+        }
+        return n_elems * self.type.bytesPerBlock();
     }
 
     pub fn deinit(self: *Tensor, allocator: std.mem.Allocator) void {

@@ -9,8 +9,12 @@ layout(buffer_reference, std430, buffer_reference_align = 4) buffer FloatBuffer 
 layout(push_constant) uniform PC {
     uint n;
     uint d;
-    uint p3;
+    uint eps_bits;
     uint p4;
+    uint p5;
+    uint p6;
+    uint p7;
+    uint p8;
     FloatBuffer a;
     FloatBuffer b;
     FloatBuffer c;
@@ -21,19 +25,19 @@ layout(local_size_x = 64) in;
 void main() {
     uint row_idx = gl_GlobalInvocationID.x;
     uint num_rows = pc.n / pc.d;
-    
+    float eps = uintBitsToFloat(pc.eps_bits);
+
     if (row_idx < num_rows) {
         uint row_offset = row_idx * pc.d;
-        
+
         float sum_sq = 0.0;
         for (uint i = 0; i < pc.d; i++) {
             float val = pc.a.data[row_offset + i];
             sum_sq += val * val;
         }
-        
-        float mean_sq = sum_sq / float(pc.d);
-        float rms_scale = 1.0 / sqrt(mean_sq + 1e-5);
-        
+
+        float rms_scale = 1.0 / sqrt(sum_sq / float(pc.d) + eps);
+
         for (uint j = 0; j < pc.d; j++) {
             float val = pc.a.data[row_offset + j];
             float weight = pc.b.data[j];

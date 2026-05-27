@@ -10,7 +10,11 @@ layout(push_constant) uniform PC {
     uint n_heads;
     uint head_dim;
     uint pos;
-    uint p4;
+    uint rope_theta_bits;
+    uint p5;
+    uint p6;
+    uint p7;
+    uint p8;
     FloatBuffer a;
     FloatBuffer b;
     FloatBuffer c;
@@ -20,20 +24,21 @@ layout(local_size_x = 64) in;
 
 void main() {
     uint i = gl_GlobalInvocationID.x;
+    float rope_base = uintBitsToFloat(pc.rope_theta_bits);
     if (i < pc.n_heads * (pc.head_dim / 2)) {
         uint head_idx = i / (pc.head_dim / 2);
         uint pair_idx = i % (pc.head_dim / 2);
-        
-        uint idx0 = head_idx * pc.head_dim + pair_idx;
-        uint idx1 = idx0 + pc.head_dim / 2;
-        
-        float theta = float(pc.pos) * pow(10000.0, -2.0 * float(pair_idx) / float(pc.head_dim));
+
+        uint idx0 = head_idx * pc.head_dim + 2 * pair_idx;
+        uint idx1 = idx0 + 1;
+
+        float theta = float(pc.pos) * pow(rope_base, -2.0 * float(pair_idx) / float(pc.head_dim));
         float cos_theta = cos(theta);
         float sin_theta = sin(theta);
-        
+
         float v0 = pc.a.data[idx0];
         float v1 = pc.a.data[idx1];
-        
+
         pc.a.data[idx0] = v0 * cos_theta - v1 * sin_theta;
         pc.a.data[idx1] = v0 * sin_theta + v1 * cos_theta;
     }

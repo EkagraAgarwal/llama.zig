@@ -1,11 +1,12 @@
 const std = @import("std");
-const tensor = @import("tensor.zig");
 const vulkan = @import("vulkan_backend.zig");
 const gguf = @import("gguf.zig");
 const kernels_data = @import("kernels_data");
 const compute_graph = @import("compute_graph.zig");
-const vk = @import("vulkan");
 const tokenizer = @import("tokenizer.zig");
+const model = @import("model.zig");
+const weights = @import("weights.zig");
+const sampler = @import("sampler.zig");
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
@@ -22,17 +23,38 @@ pub fn main(init: std.process.Init) !void {
 
     var model_path: ?[]const u8 = null;
     var prompt_text: ?[]const u8 = null;
+    var max_tokens: u32 = 64;
+    var temperature: f32 = 0.8;
+    var seed: u64 = 0;
+    var debug_logits: u32 = 0;
+    var chat_mode: bool = false;
+    var verbose: bool = false;
+    var inspect_block: bool = false;
 
     while (args_it.next()) |arg| {
         if (std.mem.eql(u8, arg, "--model")) {
             model_path = args_it.next();
         } else if (std.mem.eql(u8, arg, "--prompt")) {
             prompt_text = args_it.next();
+        } else if (std.mem.eql(u8, arg, "--max-tokens")) {
+            max_tokens = std.fmt.parseInt(u32, args_it.next() orelse "64", 10) catch 64;
+        } else if (std.mem.eql(u8, arg, "--temperature")) {
+            temperature = std.fmt.parseFloat(f32, args_it.next() orelse "0.8") catch 0.8;
+        } else if (std.mem.eql(u8, arg, "--seed")) {
+            seed = std.fmt.parseInt(u64, args_it.next() orelse "0", 10) catch 0;
+        } else if (std.mem.eql(u8, arg, "--chat")) {
+            chat_mode = true;
+        } else if (std.mem.eql(u8, arg, "--verbose")) {
+            verbose = true;
+        } else if (std.mem.eql(u8, arg, "--debug-logits")) {
+            debug_logits = std.fmt.parseInt(u32, args_it.next() orelse "10", 10) catch 10;
+        } else if (std.mem.eql(u8, arg, "--inspect-block")) {
+            inspect_block = true;
         }
     }
 
     if (model_path == null or prompt_text == null) {
-        try writer.print("Usage: llama.zig --model <path.gguf> --prompt '<text>'\n", .{});
+        try writer.print("Usage: llama.zig --model <path.gguf> --prompt '<text>' [--max-tokens N] [--temperature T]\n", .{});
         try writer_streaming.interface.flush();
         return;
     }
@@ -44,6 +66,65 @@ pub fn main(init: std.process.Init) !void {
 
     var tok = try tokenizer.Tokenizer.init(allocator, &ctx);
     defer tok.deinit();
+
+    const vocab_size: u32 = @intCast(tok.id_to_token.len);
+    var cfg = try model.ModelConfig.init(allocator, &ctx, vocab_size);
+    defer cfg.deinit(allocator);
+
+    try writer.print("Config: arch={s} L={} D={} H={} KV={} FF={} ctx={} rope={d:.0}\n", .{
+        cfg.arch_prefix, cfg.n_layer, cfg.n_embd, cfg.n_heads, cfg.n_kv_heads, cfg.n_ff, cfg.max_ctx, cfg.rope_theta,
+    });
+    try writer.print("Scales: emb={d} attn={d} res={d} logit={d}\n", .{
+        cfg.embedding_scale, cfg.attention_scale, cfg.residual_scale, cfg.logit_scale,
+    });
+
+    // Dump GGUF metadata for debugging
+    if (verbose) {
+        try writer.print("[verbose] GGUF KV metadata (count={}):\n", .{ctx.kvs.count()});
+        var kv_it = ctx.kvs.iterator();
+        while (kv_it.next()) |entry| {
+            const key = entry.key_ptr.*;
+            const tag_name = @tagName(entry.value_ptr.*);
+            if (entry.value_ptr.* == .array) {
+                const arr = entry.value_ptr.array;
+                try writer.print("  {s} [array len={}]\n", .{key, arr.len});
+                if (arr.len <= 32) {
+                    for (arr, 0..) |item, ai| {
+                        try writer.print("    [{d}] tag={s} ", .{ai, @tagName(item)});
+                        switch (item) {
+                            .u8 => |v| try writer.print("{}\n", .{v}),
+                            .u16 => |v| try writer.print("{}\n", .{v}),
+                            .u32 => |v| try writer.print("{}\n", .{v}),
+                            .u64 => |v| try writer.print("{}\n", .{v}),
+                            .i32 => |v| try writer.print("{}\n", .{v}),
+                            .i64 => |v| try writer.print("{}\n", .{v}),
+                            .f32 => |v| try writer.print("{d}\n", .{v}),
+                            .string => |v| try writer.print("\"{s}\"\n", .{v}),
+                            else => try writer.print("?\n", .{}),
+                        }
+                    }
+                }
+            } else {
+                try writer.print("  {s} [{s}] = ", .{key, tag_name});
+                switch (entry.value_ptr.*) {
+                    .u8 => |v| try writer.print("{}\n", .{v}),
+                    .u16 => |v| try writer.print("{}\n", .{v}),
+                    .u32 => |v| try writer.print("{}\n", .{v}),
+                    .u64 => |v| try writer.print("{}\n", .{v}),
+                    .i8 => |v| try writer.print("{}\n", .{v}),
+                    .i16 => |v| try writer.print("{}\n", .{v}),
+                    .i32 => |v| try writer.print("{}\n", .{v}),
+                    .i64 => |v| try writer.print("{}\n", .{v}),
+                    .f32 => |v| try writer.print("{d}\n", .{v}),
+                    .f64 => |v| try writer.print("{d}\n", .{v}),
+                    .bool => |v| try writer.print("{}\n", .{v}),
+                    .string => |v| try writer.print("\"{s}\"\n", .{v}),
+                    else => try writer.print("?\n", .{}),
+                }
+            }
+        }
+        try writer_streaming.interface.flush();
+    }
 
     var vk_ctx = try vulkan.Context.init(allocator);
     defer vk_ctx.deinit();
@@ -58,115 +139,362 @@ pub fn main(init: std.process.Init) !void {
     try registry.register(&vk_ctx, "matmul", kernels_data.kernels_matmul_spv, "main");
     try registry.register(&vk_ctx, "rope", kernels_data.kernels_rope_spv, "main");
     try registry.register(&vk_ctx, "silu_mul", kernels_data.kernels_silu_mul_spv, "main");
-
-    const n_embd = if (ctx.kvs.get("llama.embedding_length")) |val| switch (val) { .u32 => |v| v, .u64 => |v| @as(u32, @intCast(v)), else => 768 } else 768;
-    const n_heads = if (ctx.kvs.get("llama.attention.head_count")) |val| switch (val) { .u32 => |v| v, .u64 => |v| @as(u32, @intCast(v)), else => 12 } else 12;
-    const head_dim = n_embd / n_heads;
-    const n_layer = if (ctx.kvs.get("llama.block_count")) |val| switch (val) { .u32 => |v| v, .u64 => |v| @as(u32, @intCast(v)), else => 1 } else 1;
-    const vocab_size = @as(u32, @intCast(tok.id_to_token.len));
-
-    try writer.print("Inference config: L={}, D={}, H={}, V={}\n", .{ n_layer, n_embd, n_heads, vocab_size });
-    try writer_streaming.interface.flush();
+    try registry.register(&vk_ctx, "attention", kernels_data.kernels_attention_spv, "main");
+    try registry.register(&vk_ctx, "kv_write", kernels_data.kernels_kv_write_spv, "main");
+    try registry.register(&vk_ctx, "scaled_add", kernels_data.kernels_scaled_add_spv, "main");
 
     var graph = compute_graph.Graph.init(allocator);
     defer graph.deinit();
-    var builder = compute_graph.GraphBuilder.init(&graph);
-    
-    try builder.addTensor("input", n_embd * 4, .input);
+    var builder = compute_graph.GraphBuilder.init(&graph, &cfg);
+
+    try builder.addTensor("input", model.f32Bytes(cfg.n_embd), .input);
+    try builder.initKvCaches();
+
     var prev_out: []const u8 = "input";
-    for (0..@min(n_layer, 2)) |l| {
-        const out_name = if (l == @min(n_layer, 2) - 1) "output" else try std.fmt.allocPrint(allocator, "blk.{}.output", .{l});
-        try builder.buildLlamaBlock(@intCast(l), n_embd, n_heads, head_dim, 0, prev_out, out_name);
-        prev_out = out_name;
+    var l: u32 = 0;
+    while (l < cfg.n_layer) : (l += 1) {
+        const out_owned = if (l == cfg.n_layer - 1)
+            try allocator.dupe(u8, "hidden")
+        else
+            try std.fmt.allocPrint(allocator, "blk.{d}.out", .{l});
+        defer allocator.free(out_owned);
+        try builder.buildLlamaBlock(l, 0, prev_out, out_owned);
+        // Use the graph's owned copy of the name so it outlives this iteration.
+        prev_out = graph.tensors.getPtr(out_owned).?.name;
     }
-    try builder.addTensor("logits", vocab_size * 4, .output);
-    try builder.addNode(.softmax, &[_][]const u8{"output"}, "logits", (vocab_size + 255) / 256, 1, vocab_size, vocab_size, 0);
-    
+
+    const has_output = ctx.tensors.get("output.weight") != null;
+    if (has_output) {
+        try builder.addTensor("output.weight", model.f32Bytes(@as(u64, cfg.vocab_size) * cfg.n_embd), .weight);
+    }
+    try builder.addTensor("output_norm.weight", model.f32Bytes(cfg.n_embd), .weight);
+    try builder.buildLmHead(prev_out, "logits", has_output);
     builder.finalize();
 
-    // 1. Stable Weight Allocation
-    var total_weight_count: usize = 0;
-    var count_it = graph.tensors.iterator();
-    while (count_it.next()) |entry| {
-        if (entry.value_ptr.role == .weight) total_weight_count += 1;
-    }
-    
-    var weight_buffers = try allocator.alloc(vulkan.Buffer, total_weight_count);
+    // Upload weights (dequant to f32 on host)
+    var weight_buffers = std.ArrayList(vulkan.Buffer).empty;
     defer {
-        for (weight_buffers) |b| b.deinit(&vk_ctx);
-        allocator.free(weight_buffers);
+        for (weight_buffers.items) |b| b.deinit(&vk_ctx);
+        weight_buffers.deinit(allocator);
     }
 
-    var max_weight_size: u64 = 0;
+    var max_staging: u64 = 0;
     var t_it = graph.tensors.iterator();
     while (t_it.next()) |entry| {
-        if (entry.value_ptr.role == .weight) max_weight_size = @max(max_weight_size, entry.value_ptr.size);
+        if (entry.value_ptr.role == .weight) {
+            if (ctx.tensors.get(entry.key_ptr.*)) |gt| {
+                max_staging = @max(max_staging, model.weightF32Size(gt));
+            } else {
+                max_staging = @max(max_staging, entry.value_ptr.size);
+            }
+        }
     }
-    
-    var weight_staging = try vulkan.Buffer.init(&vk_ctx, max_weight_size, .{ .transfer_src_bit = true, .transfer_dst_bit = true }, .{ .host_visible_bit = true, .host_coherent_bit = true });
+
+    var weight_staging = try vulkan.Buffer.init(&vk_ctx, max_staging, .{ .transfer_src_bit = true }, .{ .host_visible_bit = true, .host_coherent_bit = true });
     defer weight_staging.deinit(&vk_ctx);
 
-    var w_idx: usize = 0;
     t_it = graph.tensors.iterator();
     while (t_it.next()) |entry| {
-        if (entry.value_ptr.role == .weight) {
-            const size = if (ctx.tensors.get(entry.key_ptr.*)) |gt| gt.size() else entry.value_ptr.size;
-            weight_buffers[w_idx] = try vulkan.Buffer.init(&vk_ctx, size, .{ .storage_buffer_bit = true, .shader_device_address_bit = true, .transfer_dst_bit = true }, .{ .device_local_bit = true });
-            entry.value_ptr.buffer = &weight_buffers[w_idx];
+        if (entry.value_ptr.role != .weight) continue;
+        const gt = ctx.tensors.get(entry.key_ptr.*);
+        if (gt == null and verbose) {
+            try writer.print("[verbose] weight not in GGUF: {s}\n", .{entry.key_ptr.*});
+        }
+        const f32_size = if (gt) |t| model.weightF32Size(t) else entry.value_ptr.size;
+        const buf = try vulkan.Buffer.init(&vk_ctx, f32_size, .{ .storage_buffer_bit = true, .shader_device_address_bit = true, .transfer_dst_bit = true }, .{ .device_local_bit = true });
+        entry.value_ptr.buffer = try allocator.create(vulkan.Buffer);
+        entry.value_ptr.buffer.?.* = buf;
+        try weight_buffers.append(allocator, buf);
 
-            if (ctx.tensors.get(entry.key_ptr.*)) |gt| {
-                const mapped = try vk_ctx.vkd.mapMemory(vk_ctx.device, weight_staging.memory, 0, gt.size(), .{});
-                try ctx.readTensorData(gt, @as([*]u8, @ptrCast(mapped))[0..gt.size()]);
+        if (gt) |t| {
+            const n = t.ne[0] * t.ne[1] * t.ne[2] * t.ne[3];
+            const f32_data = try allocator.alloc(f32, n);
+            defer allocator.free(f32_data);
+            try weights.dequantToF32(&ctx, t, f32_data);
+            const mapped = try vk_ctx.vkd.mapMemory(vk_ctx.device, weight_staging.memory, 0, f32_size, .{});
+            @memcpy(@as([*]u8, @ptrCast(mapped))[0..f32_size], std.mem.sliceAsBytes(f32_data));
+            vk_ctx.vkd.unmapMemory(vk_ctx.device, weight_staging.memory);
+            try vk_ctx.copyBuffer(weight_staging, buf, f32_size);
+        }
+    }
+
+    // token_embd for LM head if tied and not yet uploaded
+    if (!has_output) {
+        if (graph.tensors.getPtr("token_embd.weight")) |gt_entry| {
+            if (ctx.tensors.get("token_embd.weight")) |t| {
+                const n = t.ne[0] * t.ne[1] * t.ne[2] * t.ne[3];
+                const f32_data = try allocator.alloc(f32, n);
+                defer allocator.free(f32_data);
+                try weights.dequantToF32(&ctx, t, f32_data);
+                const f32_size = model.weightF32Size(t);
+                if (gt_entry.buffer == null) {
+                    const buf = try vulkan.Buffer.init(&vk_ctx, f32_size, .{ .storage_buffer_bit = true, .shader_device_address_bit = true, .transfer_dst_bit = true }, .{ .device_local_bit = true });
+                    gt_entry.buffer = try allocator.create(vulkan.Buffer);
+                    gt_entry.buffer.?.* = buf;
+                    try weight_buffers.append(allocator, buf);
+                }
+                const mapped = try vk_ctx.vkd.mapMemory(vk_ctx.device, weight_staging.memory, 0, f32_size, .{});
+                @memcpy(@as([*]u8, @ptrCast(mapped))[0..f32_size], std.mem.sliceAsBytes(f32_data));
                 vk_ctx.vkd.unmapMemory(vk_ctx.device, weight_staging.memory);
-                try vk_ctx.copyBuffer(weight_staging, weight_buffers[w_idx], gt.size());
+                try vk_ctx.copyBuffer(weight_staging, gt_entry.buffer.?.*, f32_size);
             }
-            w_idx += 1;
         }
     }
 
     var scratchpad = try vulkan.Buffer.init(&vk_ctx, graph.scratchpad_size, .{ .storage_buffer_bit = true, .shader_device_address_bit = true, .transfer_src_bit = true, .transfer_dst_bit = true }, .{ .device_local_bit = true });
     defer scratchpad.deinit(&vk_ctx);
 
-    var input_staging = try vulkan.Buffer.init(&vk_ctx, n_embd * 4, .{ .transfer_src_bit = true }, .{ .host_visible_bit = true, .host_coherent_bit = true });
+    var kv_cache = try vulkan.Buffer.init(&vk_ctx, graph.kv_cache_size, .{ .storage_buffer_bit = true, .shader_device_address_bit = true }, .{ .device_local_bit = true });
+    defer kv_cache.deinit(&vk_ctx);
+
+    var input_staging = try vulkan.Buffer.init(&vk_ctx, model.f32Bytes(cfg.n_embd), .{ .transfer_src_bit = true }, .{ .host_visible_bit = true, .host_coherent_bit = true });
     defer input_staging.deinit(&vk_ctx);
 
-    var logits_staging = try vulkan.Buffer.init(&vk_ctx, vocab_size * 4, .{ .transfer_dst_bit = true }, .{ .host_visible_bit = true, .host_coherent_bit = true });
+    var logits_staging = try vulkan.Buffer.init(&vk_ctx, model.f32Bytes(cfg.vocab_size), .{ .transfer_dst_bit = true }, .{ .host_visible_bit = true, .host_coherent_bit = true });
     defer logits_staging.deinit(&vk_ctx);
 
-    var dispatcher = compute_graph.Dispatcher.init(&graph, &vk_ctx, &registry, scratchpad);
+    var dispatcher = compute_graph.Dispatcher.init(&graph, &vk_ctx, &registry, scratchpad, kv_cache, &cfg);
+    if (verbose) {
+        try writer.print("[verbose] graph: {} nodes, {} tensors\n", .{graph.nodes.items.len, graph.tensors.count()});
+        try writer_streaming.interface.flush();
+    }
 
-    const token_ids = try tok.encode(prompt_text.?, allocator);
+    // Build prompt: apply chat template for Granite if --chat is set.
+    // Format: <|start_of_role|>user<|end_of_role|>{prompt}<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>
+    var final_prompt: []const u8 = prompt_text.?;
+    var final_prompt_owned: bool = false;
+    if (chat_mode) {
+        const sr_str: []const u8 = if (tok.special.start_of_role) |id| tok.id_to_token[id] else "<|start_of_role|>";
+        const er_str: []const u8 = if (tok.special.end_of_role) |id| tok.id_to_token[id] else "<|end_of_role|>";
+        const et_str: []const u8 = if (tok.special.end_of_text) |id| tok.id_to_token[id] else "<|end_of_text|>";
+        final_prompt = try std.fmt.allocPrint(allocator, "{s}user{s}{s}{s}\n{s}assistant{s}", .{
+            sr_str, er_str, et_str, prompt_text.?, sr_str, er_str,
+        });
+        final_prompt_owned = true;
+    }
+
+    const token_ids = try tok.encode(final_prompt, allocator);
     defer allocator.free(token_ids);
+    if (final_prompt_owned) {
+        defer allocator.free(final_prompt);
+    }
+
+    const embd_tensor = ctx.tensors.get("token_embd.weight") orelse return error.MissingEmbeddings;
+
+    // Verbose debug: dump token IDs
+    if (verbose) {
+        try writer.print("[verbose] token_ids ({d} tokens): ", .{token_ids.len});
+        for (token_ids, 0..) |tid, i| {
+            try writer.print("{d}", .{tid});
+            if (i < token_ids.len - 1) try writer.print(", ", .{});
+        }
+        try writer.print("\n", .{});
+        try writer_streaming.interface.flush();
+    }
+
+    // Extra stop tokens: <|end_of_text|> and <|end_of_role|> beyond the normal EOS.
+    const extra_stops = blk: {
+        var stops: [4]tokenizer.TokenID = undefined;
+        var n: usize = 0;
+        if (tok.eos_token_id) |id| { stops[n] = id; n += 1; }
+        if (tok.special.end_of_text) |id| { stops[n] = id; n += 1; }
+        if (tok.special.end_of_role) |id| { stops[n] = id; n += 1; }
+        break :blk stops[0..n];
+    };
 
     try writer.print("\nAssistant: ", .{});
     try writer_streaming.interface.flush();
 
-    const embd_tensor = ctx.tensors.get("token_embd.weight") orelse return error.MissingEmbeddings;
+    var pos: u32 = 0;
+    var generated: u32 = 0;
+    const sample_cfg = sampler.SamplerConfig{
+        .temperature = temperature,
+        .top_p = 0.9,
+        .seed = if (seed != 0) seed else 0xDEADBEEF,
+        .repetition_window = 0,
+        .repetition_penalty = 1.0,
+    };
 
     for (token_ids) |tid| {
-        const mapped_in = try vk_ctx.vkd.mapMemory(vk_ctx.device, input_staging.memory, 0, n_embd * 4, .{});
-        const row_offset = @as(u64, tid) * n_embd * 4;
-        _ = try ctx.file.readPositionalAll(std.Io.Threaded.global_single_threaded.io(), @as([*]u8, @ptrCast(mapped_in))[0 .. n_embd * 4], ctx.data_offset + embd_tensor.offset + row_offset);
-        vk_ctx.vkd.unmapMemory(vk_ctx.device, input_staging.memory);
-        try vk_ctx.copyBufferOffset(input_staging, 0, scratchpad, graph.tensors.get("input").?.offset, n_embd * 4);
+        try loadEmbedding(&ctx, embd_tensor, tid, cfg.n_embd, &vk_ctx, &input_staging, &scratchpad, &graph, cfg.embedding_scale);
+        try dispatcher.execute(pos);
+        pos += 1;
+    }
 
-        try dispatcher.execute();
+    var current_token: tokenizer.TokenID = if (token_ids.len > 0) token_ids[token_ids.len - 1] else 0;
 
-        const t_logits = graph.tensors.get("logits").?;
-        try vk_ctx.copyBufferOffset(scratchpad, t_logits.offset, logits_staging, 0, vocab_size * 4);
-        const mapped_l = try vk_ctx.vkd.mapMemory(vk_ctx.device, logits_staging.memory, 0, vocab_size * 4, .{});
-        const logits: [*]f32 = @ptrCast(@alignCast(mapped_l));
-        var best_id: tokenizer.TokenID = 0;
-        var max_logit: f32 = -1e30;
-        for (0..vocab_size) |i| {
-            if (logits[i] > max_logit) { max_logit = logits[i]; best_id = @intCast(i); }
+    // Track generated token history for repetition penalty (fixed-size ring buffer).
+    var gen_history: [256]tokenizer.TokenID = undefined;
+    var gen_history_len: usize = 0;
+
+    // Inspect intermediate activations after prefill.
+    if (inspect_block) {
+        const inspect_size = model.f32Bytes(cfg.n_embd);
+        var inspect_staging = try vulkan.Buffer.init(&vk_ctx, inspect_size, .{ .transfer_dst_bit = true }, .{ .host_visible_bit = true, .host_coherent_bit = true });
+        defer inspect_staging.deinit(&vk_ctx);
+        // Per-layer hidden state stats
+        {
+            var layer_name_buf: [32]u8 = undefined;
+            for (0..cfg.n_layer) |li| {
+                const lname = if (li == cfg.n_layer - 1)
+                    "hidden"
+                else
+                    try std.fmt.bufPrint(&layer_name_buf, "blk.{d}.out", .{li});
+                const gt_l = graph.tensors.get(lname) orelse continue;
+                try vk_ctx.copyBufferOffset(scratchpad, gt_l.offset, inspect_staging, 0, inspect_size);
+                const mapped_l = try vk_ctx.vkd.mapMemory(vk_ctx.device, inspect_staging.memory, 0, inspect_size, .{});
+                const lvals = @as([*]const f32, @ptrCast(@alignCast(mapped_l)))[0..cfg.n_embd];
+                var lmin: f32 = lvals[0];
+                var lmax: f32 = lvals[0];
+                var lsum: f32 = 0;
+                var lsumsq: f32 = 0;
+                for (lvals) |v| {
+                    if (v < lmin) lmin = v;
+                    if (v > lmax) lmax = v;
+                    lsum += v;
+                    lsumsq += v * v;
+                }
+                const lmean = lsum / @as(f32, @floatFromInt(cfg.n_embd));
+                const lstd = @sqrt(lsumsq / @as(f32, @floatFromInt(cfg.n_embd)) - lmean * lmean);
+                try writer.print("[layer] {d:2} {s}: min={d:.3} max={d:.3} mean={d:.3} std={d:.3}\n", .{ li, lname, lmin, lmax, lmean, lstd });
+                vk_ctx.vkd.unmapMemory(vk_ctx.device, inspect_staging.memory);
+            }
         }
-        vk_ctx.vkd.unmapMemory(vk_ctx.device, logits_staging.memory);
-        
-        try tok.decode(&[_]tokenizer.TokenID{best_id}, writer);
+        // Dump first 8 values of key tensors
+        const names_to_dump = [_][]const u8{ "input", "blk.0.normed", "blk.0.attn", "blk.0.attn_out", "blk.0.res1", "hidden", "final.normed" };
+        for (names_to_dump) |tname| {
+            const gt = graph.tensors.get(tname) orelse continue;
+            const sz = @min(inspect_size, gt.size);
+            try vk_ctx.copyBufferOffset(scratchpad, gt.offset, inspect_staging, 0, sz);
+            const mapped_i = try vk_ctx.vkd.mapMemory(vk_ctx.device, inspect_staging.memory, 0, sz, .{});
+            const vals = @as([*]const f32, @ptrCast(@alignCast(mapped_i)))[0..@min(8, sz / 4)];
+            try writer.print("[inspect] {s}: ", .{tname});
+            for (vals) |v| try writer.print("{d:.4} ", .{v});
+            try writer.print("\n", .{});
+            vk_ctx.vkd.unmapMemory(vk_ctx.device, inspect_staging.memory);
+        }
+
         try writer_streaming.interface.flush();
     }
-    
+
+    // Debug dump of top logits after prefill.
+    if (debug_logits > 0) {
+        const t_logits = graph.tensors.get("logits").?;
+        try vk_ctx.copyBufferOffset(scratchpad, t_logits.offset, logits_staging, 0, model.f32Bytes(cfg.vocab_size));
+        const mapped_l = try vk_ctx.vkd.mapMemory(vk_ctx.device, logits_staging.memory, 0, model.f32Bytes(cfg.vocab_size), .{});
+        const logits = @as([*]f32, @ptrCast(@alignCast(mapped_l)))[0..cfg.vocab_size];
+        // Find top-N
+        var indices = try allocator.alloc(u32, cfg.vocab_size);
+        defer allocator.free(indices);
+        for (indices, 0..) |*v, i| v.* = @as(u32, @intCast(i));
+        std.mem.sort(u32, indices, logits, struct {
+            fn lessThan(probs: []const f32, a: u32, b: u32) bool {
+                return probs[a] > probs[b];
+            }
+        }.lessThan);
+        try writer.print("\n[top {d} logits after prefill]\n", .{debug_logits});
+        for (indices[0..debug_logits]) |idx| {
+            try writer.print("  id={:6}  logit={:9.4}  token=", .{ idx, logits[idx] });
+            try tok.decode(&[_]tokenizer.TokenID{idx}, writer);
+            try writer.print("\n", .{});
+        }
+        vk_ctx.vkd.unmapMemory(vk_ctx.device, logits_staging.memory);
+    }
+
+    while (generated < max_tokens) : (generated += 1) {
+        const t_logits = graph.tensors.get("logits").?;
+        try vk_ctx.copyBufferOffset(scratchpad, t_logits.offset, logits_staging, 0, model.f32Bytes(cfg.vocab_size));
+        const mapped_l = try vk_ctx.vkd.mapMemory(vk_ctx.device, logits_staging.memory, 0, model.f32Bytes(cfg.vocab_size), .{});
+        const logits = @as([*]f32, @ptrCast(@alignCast(mapped_l)))[0..cfg.vocab_size];
+        if (cfg.logit_scale != 1.0 and cfg.logit_scale != 0.0) {
+            const inv = 1.0 / cfg.logit_scale;
+            for (logits) |*v| v.* *= inv;
+        }
+        current_token = try sampler.sampleTopP(allocator, logits, sample_cfg, gen_history[0..gen_history_len]);
+        vk_ctx.vkd.unmapMemory(vk_ctx.device, logits_staging.memory);
+
+        // Per-step debug logits (dump after each decode step)
+        if (verbose and debug_logits > 0) {
+            try vk_ctx.copyBufferOffset(scratchpad, graph.tensors.get("logits").?.offset, logits_staging, 0, model.f32Bytes(cfg.vocab_size));
+            const mapped_s = try vk_ctx.vkd.mapMemory(vk_ctx.device, logits_staging.memory, 0, model.f32Bytes(cfg.vocab_size), .{});
+            const logits_s = @as([*]f32, @ptrCast(@alignCast(mapped_s)))[0..cfg.vocab_size];
+            var indices_s = try allocator.alloc(u32, cfg.vocab_size);
+            defer allocator.free(indices_s);
+            for (indices_s, 0..) |*v, i| v.* = @as(u32, @intCast(i));
+            std.mem.sort(u32, indices_s, logits_s, struct {
+                fn lessThan(probs: []const f32, a: u32, b: u32) bool {
+                    return probs[a] > probs[b];
+                }
+            }.lessThan);
+            try writer.print("\n[step {} top {} logits]\n", .{ pos, debug_logits });
+            for (indices_s[0..debug_logits]) |idx| {
+                try writer.print("  id={:6}  logit={:9.4}  token=", .{ idx, logits_s[idx] });
+                try tok.decode(&[_]tokenizer.TokenID{idx}, writer);
+                try writer.print("\n", .{});
+            }
+            vk_ctx.vkd.unmapMemory(vk_ctx.device, logits_staging.memory);
+        }
+
+        // Check stop: normal EOS, plus Granite <|end_of_text|> and <|end_of_role|>.
+        for (extra_stops) |stop_id| {
+            if (current_token == stop_id) {
+                try writer.print("\n[stop token {}]\n", .{stop_id});
+                try writer_streaming.interface.flush();
+                return;
+            }
+        }
+
+        if (gen_history_len < 256) {
+            gen_history[gen_history_len] = current_token;
+            gen_history_len += 1;
+        } else {
+            @memcpy(gen_history[0..255], gen_history[1..256]);
+            gen_history[255] = current_token;
+        }
+        try tok.decode(&[_]tokenizer.TokenID{current_token}, writer);
+        try writer_streaming.interface.flush();
+
+        if (generated + 1 >= max_tokens) break;
+        try loadEmbedding(&ctx, embd_tensor, current_token, cfg.n_embd, &vk_ctx, &input_staging, &scratchpad, &graph, cfg.embedding_scale);
+
+        // Debug: verify input embedding actually changed
+        if (verbose) {
+            const inp_t = graph.tensors.get("input").?;
+            const inp_sz = @min(model.f32Bytes(8), inp_t.size);
+            var dbg_staging = try vulkan.Buffer.init(&vk_ctx, inp_sz, .{ .transfer_dst_bit = true }, .{ .host_visible_bit = true, .host_coherent_bit = true });
+            defer dbg_staging.deinit(&vk_ctx);
+            try vk_ctx.copyBufferOffset(scratchpad, inp_t.offset, dbg_staging, 0, inp_sz);
+            const dbg_mapped = try vk_ctx.vkd.mapMemory(vk_ctx.device, dbg_staging.memory, 0, inp_sz, .{});
+            const dbg_vals = @as([*]const f32, @ptrCast(@alignCast(dbg_mapped)))[0..8];
+            try writer.print("[debug] input[0..8] before execute({}): ", .{pos});
+            for (dbg_vals) |v| try writer.print("{d:.4} ", .{v});
+            try writer.print("(token={})\n", .{current_token});
+            vk_ctx.vkd.unmapMemory(vk_ctx.device, dbg_staging.memory);
+            try writer_streaming.interface.flush();
+        }
+
+        try dispatcher.execute(pos);
+        pos += 1;
+    }
+
     try writer.print("\n\n[Inference Complete]\n", .{});
     try writer_streaming.interface.flush();
+}
+
+fn loadEmbedding(
+    ctx: *gguf.GGUFContext,
+    embd: *@import("tensor.zig").Tensor,
+    tid: tokenizer.TokenID,
+    n_embd: u32,
+    vk_ctx: *vulkan.Context,
+    staging: *vulkan.Buffer,
+    scratch: *vulkan.Buffer,
+    graph: *compute_graph.Graph,
+    scale: f32,
+) !void {
+    const mapped = try vk_ctx.vkd.mapMemory(vk_ctx.device, staging.memory, 0, model.f32Bytes(n_embd), .{});
+    const dst = @as([*]f32, @ptrCast(@alignCast(mapped)))[0..n_embd];
+    try weights.readEmbeddingF32(ctx, embd, tid, dst, scale);
+    vk_ctx.vkd.unmapMemory(vk_ctx.device, staging.memory);
+    try vk_ctx.copyBufferOffset(staging.*, 0, scratch.*, graph.tensors.get("input").?.offset, model.f32Bytes(n_embd));
 }

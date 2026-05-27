@@ -11,6 +11,10 @@ layout(push_constant) uniform PC {
     uint d;
     uint p3;
     uint p4;
+    uint p5;
+    uint p6;
+    uint p7;
+    uint p8;
     FloatBuffer a; // input
     FloatBuffer b; // weights
     FloatBuffer c; // output

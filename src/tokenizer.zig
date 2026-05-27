@@ -4,6 +4,12 @@ const GGUFContext = gguf.GGUFContext;
 
 pub const TokenID = u32;
 
+pub const SpecialTokens = struct {
+    start_of_role: ?TokenID = null,
+    end_of_role: ?TokenID = null,
+    end_of_text: ?TokenID = null,
+};
+
 pub const Tokenizer = struct {
     allocator: std.mem.Allocator,
     vocab: std.StringHashMap(TokenID),
@@ -13,6 +19,8 @@ pub const Tokenizer = struct {
     eos_token_id: ?TokenID = null,
     pad_token_id: ?TokenID = null,
     unk_token_id: ?TokenID = null,
+    add_bos_token: bool = true,
+    special: SpecialTokens = .{},
 
     pub fn init(allocator: std.mem.Allocator, ctx: *GGUFContext) !Tokenizer {
         var tokenizer = Tokenizer{
@@ -56,6 +64,19 @@ pub const Tokenizer = struct {
         if (ctx.kvs.get("tokenizer.ggml.unknown_token_id")) |val| {
             tokenizer.unk_token_id = getU32Value(val);
         }
+        if (ctx.kvs.get("tokenizer.ggml.add_bos_token")) |val| {
+            tokenizer.add_bos_token = switch (val) {
+                .bool => |b| b,
+                else => true,
+            };
+        }
+
+        // 4. Load Granite/Chat special tokens by scanning the vocab
+        for (tokens_array, 0..) |tok_str, i| {
+            if (std.mem.eql(u8, tok_str.string, "<|start_of_role|>")) tokenizer.special.start_of_role = @as(TokenID, @intCast(i));
+            if (std.mem.eql(u8, tok_str.string, "<|end_of_role|>")) tokenizer.special.end_of_role = @as(TokenID, @intCast(i));
+            if (std.mem.eql(u8, tok_str.string, "<|end_of_text|>")) tokenizer.special.end_of_text = @as(TokenID, @intCast(i));
+        }
 
         return tokenizer;
     }
@@ -83,8 +104,10 @@ pub const Tokenizer = struct {
         var token_ids: std.ArrayList(TokenID) = .empty;
         errdefer token_ids.deinit(out_allocator);
 
-        if (self.bos_token_id) |bos| {
-            try token_ids.append(out_allocator, bos);
+        if (self.add_bos_token) {
+            if (self.bos_token_id) |bos| {
+                try token_ids.append(out_allocator, bos);
+            }
         }
 
         var it = PreTokenizerIterator{ .text = text };
