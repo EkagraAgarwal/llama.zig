@@ -85,7 +85,7 @@ pub const GGUFContext = struct {
 
     pub fn readTensorData(self: *GGUFContext, t: *Tensor, buffer: []u8) !void {
         const io = std.Io.Threaded.global_single_threaded.io();
-        try self.file.preadAll(io, buffer, self.data_offset + t.offset);
+        _ = try self.file.readPositionalAll(io, buffer, self.data_offset + t.offset);
     }
 };
 

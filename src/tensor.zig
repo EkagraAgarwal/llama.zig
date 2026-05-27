@@ -70,6 +70,10 @@ pub const Tensor = struct {
         return tensor;
     }
 
+    pub fn size(self: *const Tensor) u64 {
+        return self.nb[3] * self.ne[3];
+    }
+
     pub fn deinit(self: *Tensor, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
         allocator.destroy(self);

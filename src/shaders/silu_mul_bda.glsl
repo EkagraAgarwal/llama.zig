@@ -11,9 +11,9 @@ layout(push_constant) uniform PC {
     uint d;
     uint p3;
     uint p4;
-    FloatBuffer a;
-    FloatBuffer b;
-    FloatBuffer c;
+    FloatBuffer a; // input
+    FloatBuffer b; // weights
+    FloatBuffer c; // output
 } pc;
 
 layout(local_size_x = 64) in;
@@ -21,6 +21,9 @@ layout(local_size_x = 64) in;
 void main() {
     uint i = gl_GlobalInvocationID.x;
     if (i < pc.n) {
-        pc.c.data[i] = pc.a.data[i];
+        float x = pc.a.data[i];
+        float w = pc.b.data[i];
+        // silu(x) * w
+        pc.c.data[i] = (x / (1.0 + exp(-x))) * w;
     }
 }

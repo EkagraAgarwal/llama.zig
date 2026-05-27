@@ -4,3 +4,4 @@ pub const kernels_rmsnorm_spv = @embedFile("rmsnorm_bda.spv");
 pub const kernels_softmax_spv = @embedFile("softmax_bda.spv");
 pub const kernels_matmul_spv = @embedFile("matmul_bda.spv");
 pub const kernels_rope_spv = @embedFile("rope_bda.spv");
+pub const kernels_silu_mul_spv = @embedFile("silu_mul_bda.spv");
