@@ -53,7 +53,6 @@ pub fn main(init: std.process.Init) !void {
     var prefill_chunk: u32 = 0;
     var gpu_embed: bool = true;
     var report_json: bool = false;
-    var enable_q4q8_native: bool = false;
 
     while (args_it.next()) |arg| {
         if (std.mem.eql(u8, arg, "--model")) {
@@ -88,8 +87,6 @@ pub fn main(init: std.process.Init) !void {
             gpu_embed = false;
         } else if (std.mem.eql(u8, arg, "--report-json")) {
             report_json = true;
-        } else if (std.mem.eql(u8, arg, "--enable-q4q8-native")) {
-            enable_q4q8_native = true;
         }
     }
 
@@ -125,8 +122,8 @@ pub fn main(init: std.process.Init) !void {
         );
     }
 
-    try writer.print("Config: arch={s} L={} D={} H={} KV={} FF={} ctx={} rope={d:.0}\n", .{
-        cfg.arch_prefix, cfg.n_layer, cfg.n_embd, cfg.n_heads, cfg.n_kv_heads, cfg.n_ff, cfg.max_ctx, cfg.rope_theta,
+    try writer.print("Config: arch={s} act={s} L={} D={} H={} KV={} FF={} ctx={} rope={d:.0}\n", .{
+        cfg.arch_prefix, @tagName(cfg.activation), cfg.n_layer, cfg.n_embd, cfg.n_heads, cfg.n_kv_heads, cfg.n_ff, cfg.max_ctx, cfg.rope_theta,
     });
     try writer.print("Scales: emb={d} attn={d} res={d} logit={d}\n", .{
         cfg.embedding_scale, cfg.attention_scale, cfg.residual_scale, cfg.logit_scale,
@@ -183,6 +180,15 @@ pub fn main(init: std.process.Init) !void {
         try writer_streaming.interface.flush();
     }
 
+    if (verbose) {
+        try writer.print("[verbose] GGUF Tensors (count={}):\n", .{ctx.tensors.count()});
+        var t_it = ctx.tensors.iterator();
+        while (t_it.next()) |entry| {
+            try writer.print("  {s} type={} dims={}\n", .{ entry.key_ptr.*, entry.value_ptr.*.type, entry.value_ptr.*.n_dims });
+        }
+        try writer_streaming.interface.flush();
+    }
+
     var vk_ctx = try vulkan.Context.init(allocator);
     defer vk_ctx.deinit();
 
@@ -210,6 +216,8 @@ pub fn main(init: std.process.Init) !void {
     try registry.register(&vk_ctx, "get_rows_q", kernels_data.kernels_get_rows_q_spv, "main");
     try registry.register(&vk_ctx, "topk", kernels_data.kernels_topk_spv, "main");
     try registry.register(&vk_ctx, "attention_flash", kernels_data.kernels_flash_attn_spv, "main");
+    try registry.register(&vk_ctx, "gelu_mul", kernels_data.kernels_gelu_mul_spv, "main");
+    try registry.register(&vk_ctx, "copy", kernels_data.kernels_copy_spv, "main");
 
     var graph = compute_graph.Graph.init(allocator);
     defer graph.deinit();
@@ -226,7 +234,7 @@ pub fn main(init: std.process.Init) !void {
         else
             try std.fmt.allocPrint(allocator, "blk.{d}.out", .{l});
         defer allocator.free(out_owned);
-        try builder.buildLlamaBlock(l, 0, prev_out, out_owned);
+        try builder.buildTransformerBlock(l, 0, prev_out, out_owned);
         // Use the graph's owned copy of the name so it outlives this iteration.
         prev_out = graph.tensors.getPtr(out_owned).?.name;
     }
@@ -246,7 +254,7 @@ pub fn main(init: std.process.Init) !void {
         if (node.op_type != .matmul or node.input_names.len < 2) continue;
         const w_name = node.input_names[1];
         const w_t = ctx.tensors.get(w_name) orelse continue;
-        if (isNativeQuantType(w_t.type, enable_q4q8_native)) {
+        if (isNativeQuantType(w_t.type)) {
             node.op_type = .matmul_q;
             node.p5 = @intFromEnum(w_t.type);
         }
@@ -264,7 +272,7 @@ pub fn main(init: std.process.Init) !void {
     while (t_it.next()) |entry| {
         if (entry.value_ptr.role == .weight) {
             if (ctx.tensors.get(entry.key_ptr.*)) |gt| {
-                max_staging = @max(max_staging, if (isNativeQuantType(gt.type, enable_q4q8_native)) gt.size() else model.weightF32Size(gt));
+                max_staging = @max(max_staging, if (isNativeQuantType(gt.type)) gt.size() else model.weightF32Size(gt));
             } else {
                 max_staging = @max(max_staging, entry.value_ptr.size);
             }
@@ -282,7 +290,7 @@ pub fn main(init: std.process.Init) !void {
             try writer.print("[verbose] weight not in GGUF: {s}\n", .{entry.key_ptr.*});
         }
         const upload_size = if (gt) |t|
-            if (isNativeQuantType(t.type, enable_q4q8_native)) t.size() else model.weightF32Size(t)
+            if (isNativeQuantType(t.type)) t.size() else model.weightF32Size(t)
         else
             entry.value_ptr.size;
         const buf = try vulkan.Buffer.init(&vk_ctx, upload_size, .{ .storage_buffer_bit = true, .shader_device_address_bit = true, .transfer_dst_bit = true }, .{ .device_local_bit = true });
@@ -291,7 +299,7 @@ pub fn main(init: std.process.Init) !void {
         try weight_buffers.append(allocator, buf);
 
         if (gt) |t| {
-            if (isNativeQuantType(t.type, enable_q4q8_native)) {
+            if (isNativeQuantType(t.type)) {
                 const raw_size = t.size();
                 const raw = try allocator.alloc(u8, raw_size);
                 defer allocator.free(raw);
@@ -327,7 +335,7 @@ pub fn main(init: std.process.Init) !void {
     if (!has_output) {
         if (graph.tensors.getPtr("token_embd.weight")) |gt_entry| {
             if (ctx.tensors.get("token_embd.weight")) |t| {
-                const upload_size = if (isNativeQuantType(t.type, enable_q4q8_native)) t.size() else model.weightF32Size(t);
+                const upload_size = if (isNativeQuantType(t.type)) t.size() else model.weightF32Size(t);
                 if (gt_entry.buffer == null) {
                     const buf = try vulkan.Buffer.init(&vk_ctx, upload_size, .{ .storage_buffer_bit = true, .shader_device_address_bit = true, .transfer_dst_bit = true }, .{ .device_local_bit = true });
                     gt_entry.buffer = try allocator.create(vulkan.Buffer);
@@ -335,7 +343,7 @@ pub fn main(init: std.process.Init) !void {
                     try weight_buffers.append(allocator, buf);
                 }
                 gt_entry.size = upload_size;
-                if (isNativeQuantType(t.type, enable_q4q8_native)) {
+                if (isNativeQuantType(t.type)) {
                     const raw_size = t.size();
                     const raw = try allocator.alloc(u8, raw_size);
                     defer allocator.free(raw);
@@ -432,7 +440,7 @@ pub fn main(init: std.process.Init) !void {
         embd_cache_transposed = cache;
     }
 
-    const embd_quant_gpu = gpu_embed and embd_standard_layout and isNativeQuantType(embd_tensor.type, enable_q4q8_native);
+    const embd_quant_gpu = gpu_embed and embd_standard_layout and isNativeQuantType(embd_tensor.type);
     var embd_gpu_buf: ?*vulkan.Buffer = null;
     const embd_row_bytes: u32 = @intCast(weights.quantRowBytes(embd_tensor.type, embd_tensor.ne[0]) orelse 0);
     if (embd_quant_gpu) {
@@ -730,10 +738,9 @@ pub fn main(init: std.process.Init) !void {
     try writer_streaming.interface.flush();
 }
 
-fn isNativeQuantType(tt: @import("tensor.zig").Type, enable_q4q8_native: bool) bool {
+fn isNativeQuantType(tt: @import("tensor.zig").Type) bool {
     return switch (tt) {
-        .q4_k, .q6_k => true,
-        .q4_0, .q8_0 => enable_q4q8_native,
+        .q4_k, .q6_k, .q4_0, .q8_0 => true,
         else => false,
     };
 }
@@ -746,10 +753,6 @@ fn validateModelLayout(ctx: *gguf.GGUFContext) !void {
         "blk.0.attn_k.weight",
         "blk.0.attn_v.weight",
         "blk.0.attn_output.weight",
-        "blk.0.ffn_norm.weight",
-        "blk.0.ffn_gate.weight",
-        "blk.0.ffn_up.weight",
-        "blk.0.ffn_down.weight",
         "output_norm.weight",
     };
     for (required) |name| {

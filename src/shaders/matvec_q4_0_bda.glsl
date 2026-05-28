@@ -6,9 +6,9 @@ layout(buffer_reference, std430, buffer_reference_align = 4) buffer FloatBuffer 
 layout(buffer_reference, std430, buffer_reference_align = 4) buffer UIntBuffer { uint data[]; };
 
 layout(push_constant) uniform PC {
-    uint n;
-    uint k;
-    uint p3;
+    uint m; // p1
+    uint n; // p2
+    uint k; // p3
     uint p4;
     uint p5;
     uint p6;
@@ -42,23 +42,29 @@ float f16ToF32(uint h) {
     return uintBitsToFloat((s << 31u) | ((e + 112u) << 23u) | (m << 13u));
 }
 
-float q40Weight(uint row, uint kidx) {
+float q40BlockDot(uint row, uint block, uint k_rem) {
     uint blocks = (pc.k + 31u) / 32u;
-    uint b = kidx / 32u;
-    uint i = kidx % 32u;
-    uint base = (row * blocks + b) * 18u;
+    uint base = (row * blocks + block) * 18u;
     float d = f16ToF32(getU16(pc.b, base + 0u));
-    uint qbyte = getByte(pc.b, base + 2u + (i / 2u));
-    int qv = int((i & 1u) == 0u ? (qbyte & 0xFu) : (qbyte >> 4u)) - 8;
-    return d * float(qv);
+    float sum = 0.0;
+    uint k0 = block * 32u;
+    for (uint i = 0u; i < 32u; ++i) {
+        if (k0 + i < pc.k) {
+            uint qbyte = getByte(pc.b, base + 2u + (i / 2u));
+            int qv = int((i & 1u) == 0u ? (qbyte & 0xFu) : (qbyte >> 4u)) - 8;
+            sum += pc.a.data[k0 + i] * (d * float(qv));
+        }
+    }
+    return sum;
 }
 
 void main() {
     uint col = gl_GlobalInvocationID.x;
     if (col >= pc.n) return;
     float sum = 0.0;
-    for (uint kk = 0u; kk < pc.k; ++kk) {
-        sum += pc.a.data[kk] * q40Weight(col, kk);
+    uint nblocks = (pc.k + 31u) / 32u;
+    for (uint bi = 0u; bi < nblocks; ++bi) {
+        sum += q40BlockDot(col, bi, pc.k);
     }
     pc.c.data[col] = sum;
 }

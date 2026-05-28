@@ -10,9 +10,15 @@ pub const Architecture = enum {
     unknown,
 };
 
+pub const Activation = enum {
+    silu,
+    gelu,
+};
+
 pub const ModelConfig = struct {
     arch: Architecture,
     arch_prefix: []const u8,
+    activation: Activation,
     n_embd: u32,
     n_layer: u32,
     n_heads: u32,
@@ -85,8 +91,13 @@ pub const ModelConfig = struct {
             break :blk .f32;
         };
 
+        const final_logit_softcapping = (try getMetaF32Any(ctx, arch_prefix, arch_alt_prefix, "final_logit_softcapping")) orelse 0.0;
+
+        const activation: Activation = if (arch == .gemma) .gelu else .silu;
+        const default_embedding_scale: f32 = if (arch == .gemma) @sqrt(@as(f32, @floatFromInt(n_embd))) else 1.0;
+
         const embedding_scale = (try getMetaF32Any(ctx, arch_prefix, arch_alt_prefix, "embedding_scale")) orelse
-            (try getMetaF32Any(ctx, arch_prefix, arch_alt_prefix, "embedding_multiplier")) orelse 1.0;
+            (try getMetaF32Any(ctx, arch_prefix, arch_alt_prefix, "embedding_multiplier")) orelse default_embedding_scale;
         const attention_scale = (try getMetaF32Any(ctx, arch_prefix, arch_alt_prefix, "attention.scale")) orelse
             (try getMetaF32Any(ctx, arch_prefix, arch_alt_prefix, "attention_scale")) orelse
             (try getMetaF32Any(ctx, arch_prefix, arch_alt_prefix, "attention_multiplier")) orelse 0.0;
@@ -94,11 +105,11 @@ pub const ModelConfig = struct {
             (try getMetaF32Any(ctx, arch_prefix, arch_alt_prefix, "residual_multiplier")) orelse 1.0;
         const logit_scale = (try getMetaF32Any(ctx, arch_prefix, arch_alt_prefix, "logit_scale")) orelse
             (try getMetaF32Any(ctx, arch_prefix, arch_alt_prefix, "logits_scaling")) orelse 1.0;
-        const final_logit_softcapping = (try getMetaF32Any(ctx, arch_prefix, arch_alt_prefix, "final_logit_softcapping")) orelse 0.0;
 
         return ModelConfig{
             .arch = arch,
             .arch_prefix = try allocator.dupe(u8, arch_prefix),
+            .activation = activation,
             .n_embd = n_embd,
             .n_layer = n_layer,
             .n_heads = n_heads,
@@ -218,4 +229,60 @@ test "architecture canonical metadata prefix" {
     try t.expectEqualStrings("gemma", canonicalArchitecturePrefix("gemma2"));
     try t.expectEqualStrings("qwen", canonicalArchitecturePrefix("qwen2moe"));
     try t.expectEqualStrings("unknown_arch", canonicalArchitecturePrefix("unknown_arch"));
+}
+
+test "ModelConfig dynamic activation and scaling" {
+    const t = std.testing;
+    const allocator = t.allocator;
+
+    var kvs = std.StringHashMap(gguf.MetadataValue).init(allocator);
+    defer {
+        var it = kvs.iterator();
+        while (it.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            // MetadataValue cleaning
+            switch (entry.value_ptr.*) {
+                .string => |s| allocator.free(s),
+                else => {},
+            }
+        }
+        kvs.deinit();
+    }
+
+    var tensors = std.StringHashMap(*tensor.Tensor).init(allocator);
+    defer tensors.deinit();
+
+    var ctx = gguf.GGUFContext{
+        .allocator = allocator,
+        .file = undefined,
+        .version = 3,
+        .tensor_count = 0,
+        .kv_count = 0,
+        .kvs = kvs,
+        .tensors = tensors,
+        .data_offset = 0,
+    };
+
+    // Test Llama (defaults)
+    try ctx.kvs.put(try allocator.dupe(u8, "general.architecture"), .{ .string = try allocator.dupe(u8, "llama") });
+    try ctx.kvs.put(try allocator.dupe(u8, "llama.embedding_length"), .{ .u32 = 4096 });
+    try ctx.kvs.put(try allocator.dupe(u8, "llama.block_count"), .{ .u32 = 32 });
+    
+    var cfg = try ModelConfig.init(allocator, &ctx, 32000);
+    defer cfg.deinit(allocator);
+    
+    try t.expectEqual(Architecture.llama, cfg.arch);
+    try t.expectEqual(Activation.silu, cfg.activation);
+    try t.expectEqual(@as(f32, 1.0), cfg.embedding_scale);
+
+    // Test Gemma
+    try ctx.kvs.put(try allocator.dupe(u8, "general.architecture"), .{ .string = try allocator.dupe(u8, "gemma") });
+    try ctx.kvs.put(try allocator.dupe(u8, "gemma.embedding_length"), .{ .u32 = 2048 });
+    
+    var cfg_gemma = try ModelConfig.init(allocator, &ctx, 256000);
+    defer cfg_gemma.deinit(allocator);
+    
+    try t.expectEqual(Architecture.gemma, cfg_gemma.arch);
+    try t.expectEqual(Activation.gelu, cfg_gemma.activation);
+    try t.expectEqual(@sqrt(@as(f32, 2048.0)), cfg_gemma.embedding_scale);
 }

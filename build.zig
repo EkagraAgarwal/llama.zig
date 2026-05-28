@@ -95,6 +95,8 @@ fn compileShaders(b: *std.Build) ?*std.Build.Step {
         .{ .src = "src/shaders/attention_bda.glsl", .out = "attention_bda.spv" },
         .{ .src = "src/shaders/kv_write_bda.glsl", .out = "kv_write_bda.spv" },
         .{ .src = "src/shaders/scaled_add_bda.glsl", .out = "scaled_add_bda.spv" },
+        .{ .src = "src/shaders/gelu_mul_bda.glsl", .out = "gelu_mul_bda.spv" },
+        .{ .src = "src/shaders/copy_bda.glsl", .out = "copy_bda.spv" },
     };
 
     const step = b.step("shaders", "Compile GLSL compute shaders to SPIR-V");

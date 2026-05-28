@@ -19,6 +19,8 @@ pub const OpType = enum(u32) {
     get_rows_q = 11,
     topk = 12,
     attention_flash = 13,
+    gelu_mul = 14,
+    copy = 15,
 };
 
 pub const TensorRole = enum(u8) {
@@ -88,7 +90,10 @@ pub const Graph = struct {
         for (self.nodes.items) |node| {
             if (!self.tensors.contains(node.output_name)) return error.MissingOutputTensor;
             for (node.input_names) |input_name| {
-                if (!self.tensors.contains(input_name)) return error.MissingInputTensor;
+                if (!self.tensors.contains(input_name)) {
+                    std.debug.print("Error: Missing input tensor '{s}' for op {s}\n", .{ input_name, @tagName(node.op_type) });
+                    return error.MissingInputTensor;
+                }
             }
         }
     }
@@ -141,6 +146,11 @@ pub const GraphBuilder = struct {
         return @as(u64, n) * 4;
     }
 
+    fn hasTensor(self: *GraphBuilder, name: []const u8) bool {
+        if (self.model_tensors) |tbl| return tbl.contains(name);
+        return false;
+    }
+
     fn matmulDims(self: *GraphBuilder, weight_name: []const u8, fallback_out: u32, fallback_in: u32) struct { out: u32, in: u32 } {
         if (self.model_tensors) |tbl| {
             if (tbl.get(weight_name)) |wt| {
@@ -190,7 +200,7 @@ pub const GraphBuilder = struct {
         }
     }
 
-    pub fn buildLlamaBlock(self: *GraphBuilder, layer: u32, pos: u32, in_name: []const u8, out_name: []const u8) !void {
+    pub fn buildTransformerBlock(self: *GraphBuilder, layer: u32, pos: u32, in_name: []const u8, out_name: []const u8) !void {
         const cfg = self.cfg;
         const n_embd = cfg.n_embd;
         const n_heads = cfg.n_heads;
@@ -203,6 +213,7 @@ pub const GraphBuilder = struct {
         var ln_buf: [32]u8 = undefined;
         const ln = try std.fmt.bufPrint(&ln_buf, "blk.{d}", .{layer});
 
+        // 1. Attention Norm
         var nw_buf: [64]u8 = undefined;
         const nw = try std.fmt.bufPrint(&nw_buf, "{s}.attn_norm.weight", .{ln});
         var normed_buf: [64]u8 = undefined;
@@ -211,58 +222,132 @@ pub const GraphBuilder = struct {
         try self.addTensor(normed, f32Size(n_embd), .activation);
         try self.addNode(.rms_norm, &.{ in_name, nw }, normed, (n_embd + 63) / 64, 1, n_embd, n_embd, eps_bits, 0);
 
+        // 2. QKV Projections
         var qw_buf: [64]u8 = undefined;
         const qw = try std.fmt.bufPrint(&qw_buf, "{s}.attn_q.weight", .{ln});
         var kw_buf: [64]u8 = undefined;
         const kw = try std.fmt.bufPrint(&kw_buf, "{s}.attn_k.weight", .{ln});
         var vw_buf: [64]u8 = undefined;
         const vw = try std.fmt.bufPrint(&vw_buf, "{s}.attn_v.weight", .{ln});
+        var qkvw_buf: [64]u8 = undefined;
+        const qkvw = try std.fmt.bufPrint(&qkvw_buf, "{s}.attn_qkv.weight", .{ln});
+
         var qn_buf: [64]u8 = undefined;
         const qn = try std.fmt.bufPrint(&qn_buf, "{s}.q", .{ln});
         var kn_buf: [64]u8 = undefined;
         const kn = try std.fmt.bufPrint(&kn_buf, "{s}.k", .{ln});
         var vn_buf: [64]u8 = undefined;
         const vn = try std.fmt.bufPrint(&vn_buf, "{s}.v", .{ln});
+
+        const q_out = n_heads * head_dim;
+        const kv_out = n_kv * head_dim;
+
+        if (self.hasTensor(qkvw)) {
+            const qkv_dims = self.matmulDims(qkvw, q_out + 2 * kv_out, n_embd);
+            var qkvn_buf: [64]u8 = undefined;
+            const qkvn = try std.fmt.bufPrint(&qkvn_buf, "{s}.qkv", .{ln});
+            try self.addTensor(qkvw, f32Size(qkv_dims.out * qkv_dims.in), .weight);
+            try self.addTensor(qkvn, f32Size(qkv_dims.out), .activation);
+            try self.addNode(.matmul, &.{ normed, qkvw }, qkvn, (qkv_dims.out + 15) / 16, 1, 1, qkv_dims.out, qkv_dims.in, 0);
+
+            try self.addTensor(qn, f32Size(q_out), .activation);
+            try self.addTensor(kn, f32Size(kv_out), .activation);
+            try self.addTensor(vn, f32Size(kv_out), .activation);
+            
+            try self.addNodeP(.copy, &.{qkvn}, qn, (q_out + 63) / 64, 1, q_out, 0, 0, 0, 0);
+            try self.addNodeP(.copy, &.{qkvn}, kn, (kv_out + 63) / 64, 1, kv_out, 0, q_out, 0, 0);
+            try self.addNodeP(.copy, &.{qkvn}, vn, (kv_out + 63) / 64, 1, kv_out, 0, q_out + kv_out, 0, 0);
+        } else {
+            const q_dims = self.matmulDims(qw, q_out, n_embd);
+            const k_dims = self.matmulDims(kw, kv_out, n_embd);
+            const v_dims = self.matmulDims(vw, kv_out, n_embd);
+
+            try self.addTensor(qw, f32Size(q_dims.out * q_dims.in), .weight);
+            try self.addTensor(kw, f32Size(k_dims.out * k_dims.in), .weight);
+            try self.addTensor(vw, f32Size(v_dims.out * v_dims.in), .weight);
+            try self.addTensor(qn, f32Size(q_dims.out), .activation);
+            try self.addTensor(kn, f32Size(k_dims.out), .activation);
+            try self.addTensor(vn, f32Size(v_dims.out), .activation);
+
+            try self.addNodeP(.matmul, &.{ normed, qw }, qn, (q_out + 15) / 16, 1, 1, q_out, n_embd, 0, 0);
+            try self.addNodeP(.matmul, &.{ normed, kw }, kn, (kv_out + 15) / 16, 1, 1, kv_out, n_embd, 0, 0);
+            try self.addNodeP(.matmul, &.{ normed, vw }, vn, (kv_out + 15) / 16, 1, 1, kv_out, n_embd, 0, 0);
+
+        }
+
+        // 3. Optional QKV Biases (Qwen2)
+        const q_bias_name = try std.fmt.allocPrint(self.graph.allocator, "{s}.attn_q.bias", .{ln});
+        defer self.graph.allocator.free(q_bias_name);
+        if (self.hasTensor(q_bias_name)) {
+            try self.addTensor(q_bias_name, f32Size(q_out), .weight);
+            try self.addNode(.add, &.{ qn, q_bias_name }, qn, (q_out + 63) / 64, 1, q_out, q_out, 0, 0);
+        }
+        const k_bias_name = try std.fmt.allocPrint(self.graph.allocator, "{s}.attn_k.bias", .{ln});
+        defer self.graph.allocator.free(k_bias_name);
+        if (self.hasTensor(k_bias_name)) {
+            try self.addTensor(k_bias_name, f32Size(kv_out), .weight);
+            try self.addNode(.add, &.{ kn, k_bias_name }, kn, (kv_out + 63) / 64, 1, kv_out, kv_out, 0, 0);
+        }
+        const v_bias_name = try std.fmt.allocPrint(self.graph.allocator, "{s}.attn_v.bias", .{ln});
+        defer self.graph.allocator.free(v_bias_name);
+        if (self.hasTensor(v_bias_name)) {
+            try self.addTensor(v_bias_name, f32Size(kv_out), .weight);
+            try self.addNode(.add, &.{ vn, v_bias_name }, vn, (kv_out + 63) / 64, 1, kv_out, kv_out, 0, 0);
+        }
+
+        // 4. Optional QK Norm (Qwen3)
+        const q_norm_w = try std.fmt.allocPrint(self.graph.allocator, "{s}.attn_q_norm.weight", .{ln});
+        defer self.graph.allocator.free(q_norm_w);
+        if (self.hasTensor(q_norm_w)) {
+            try self.addTensor(q_norm_w, f32Size(q_out), .weight);
+            try self.addNode(.rms_norm, &.{ qn, q_norm_w }, qn, (q_out + 63) / 64, 1, q_out, q_out, eps_bits, 0);
+        }
+        const k_norm_w = try std.fmt.allocPrint(self.graph.allocator, "{s}.attn_k_norm.weight", .{ln});
+        defer self.graph.allocator.free(k_norm_w);
+        if (self.hasTensor(k_norm_w)) {
+            try self.addTensor(k_norm_w, f32Size(kv_out), .weight);
+            try self.addNode(.rms_norm, &.{ kn, k_norm_w }, kn, (kv_out + 63) / 64, 1, kv_out, kv_out, eps_bits, 0);
+        }
+
+        // 5. RoPE
+        const q_head_dim = if (n_heads > 0) q_out / n_heads else head_dim;
+        const k_head_dim = if (n_kv > 0) kv_out / n_kv else head_dim;
+        try self.addNode(.rope, &.{qn}, qn, (q_out + 63) / 64, 1, n_heads, q_head_dim, pos, rope_bits);
+        try self.addNode(.rope, &.{kn}, kn, (kv_out + 63) / 64, 1, n_kv, k_head_dim, pos, rope_bits);
+
+        // 6. Attention
         var attn_buf: [64]u8 = undefined;
         const attn = try std.fmt.bufPrint(&attn_buf, "{s}.attn", .{ln});
-
-        const q_dims = self.matmulDims(qw, n_embd, n_embd);
-        const k_dims = self.matmulDims(kw, n_kv * head_dim, n_embd);
-        const v_dims = self.matmulDims(vw, n_kv * head_dim, n_embd);
-
-        try self.addTensor(qw, f32Size(q_dims.out * q_dims.in), .weight);
-        try self.addTensor(kw, f32Size(k_dims.out * k_dims.in), .weight);
-        try self.addTensor(vw, f32Size(v_dims.out * v_dims.in), .weight);
-        try self.addTensor(qn, f32Size(q_dims.out), .activation);
-        try self.addTensor(kn, f32Size(k_dims.out), .activation);
-        try self.addTensor(vn, f32Size(v_dims.out), .activation);
-        try self.addTensor(attn, f32Size(q_dims.out), .activation);
-
-        try self.addNode(.matmul, &.{ normed, qw }, qn, (q_dims.out + 15) / 16, 1, 1, q_dims.out, q_dims.in, 0);
-        try self.addNode(.matmul, &.{ normed, kw }, kn, (k_dims.out + 15) / 16, 1, 1, k_dims.out, k_dims.in, 0);
-        try self.addNode(.matmul, &.{ normed, vw }, vn, (v_dims.out + 15) / 16, 1, 1, v_dims.out, v_dims.in, 0);
-
-        const q_head_dim = if (n_heads > 0) q_dims.out / n_heads else head_dim;
-        const k_head_dim = if (n_kv > 0) k_dims.out / n_kv else head_dim;
-        try self.addNode(.rope, &.{qn}, qn, (q_dims.out + 63) / 64, 1, n_heads, q_head_dim, pos, rope_bits);
-        try self.addNode(.rope, &.{kn}, kn, (k_dims.out + 63) / 64, 1, n_kv, k_head_dim, pos, rope_bits);
+        try self.addTensor(attn, f32Size(q_out), .activation);
 
         var kv_name_buf: [16]u8 = undefined;
         const kv_name = try std.fmt.bufPrint(&kv_name_buf, "kv.{d}", .{layer});
-        try self.addNode(.kv_write, &.{ kn, vn, kv_name }, kn, (k_dims.out + 63) / 64, 1, n_kv, k_head_dim, cfg.max_ctx, pos);
+        try self.addNode(.kv_write, &.{ kn, vn, kv_name }, kn, (kv_out + 63) / 64, 1, n_kv, k_head_dim, cfg.max_ctx, pos);
         const attn_p2 = k_head_dim | (n_kv << 16);
         const attn_scale_bits: u32 = @bitCast(cfg.attention_scale);
         try self.addNodeP(.attention, &.{ qn, kv_name }, attn, n_heads, 1, n_heads, attn_p2, cfg.max_ctx, pos, attn_scale_bits);
 
+        // 7. Output Projection
         var ow_buf: [64]u8 = undefined;
-        const ow = try std.fmt.bufPrint(&ow_buf, "{s}.attn_output.weight", .{ln});
+        var ow = try std.fmt.bufPrint(&ow_buf, "{s}.attn_output.weight", .{ln});
+        if (!self.hasTensor(ow)) ow = try std.fmt.bufPrint(&ow_buf, "{s}.proj.weight", .{ln});
+
         var attn_out_buf: [64]u8 = undefined;
         const attn_out = try std.fmt.bufPrint(&attn_out_buf, "{s}.attn_out", .{ln});
-        const o_dims = self.matmulDims(ow, n_embd, q_dims.out);
+        const o_dims = self.matmulDims(ow, n_embd, q_out);
         try self.addTensor(ow, f32Size(o_dims.out * o_dims.in), .weight);
         try self.addTensor(attn_out, f32Size(o_dims.out), .activation);
-        try self.addNode(.matmul, &.{ attn, ow }, attn_out, (o_dims.out + 15) / 16, 1, 1, o_dims.out, o_dims.in, 0);
+        try self.addNodeP(.matmul, &.{ attn, ow }, attn_out, (o_dims.out + 15) / 16, 1, 1, o_dims.out, o_dims.in, 0, 0);
 
+        // 8. Optional Post-Attention Norm (Gemma2)
+        const attn_post_norm_w = try std.fmt.allocPrint(self.graph.allocator, "{s}.attn_post_norm.weight", .{ln});
+        defer self.graph.allocator.free(attn_post_norm_w);
+        if (self.hasTensor(attn_post_norm_w)) {
+            try self.addTensor(attn_post_norm_w, f32Size(o_dims.out), .weight);
+            try self.addNode(.rms_norm, &.{ attn_out, attn_post_norm_w }, attn_out, (o_dims.out + 63) / 64, 1, o_dims.out, o_dims.out, eps_bits, 0);
+        }
+
+        // 9. Residual Add 1
         var res1_buf: [64]u8 = undefined;
         const res1 = try std.fmt.bufPrint(&res1_buf, "{s}.res1", .{ln});
         try self.addTensor(res1, f32Size(o_dims.out), .activation);
@@ -273,6 +358,7 @@ pub const GraphBuilder = struct {
             try self.addNode(.add, &.{ in_name, attn_out }, res1, (o_dims.out + 63) / 64, 1, o_dims.out, 0, 0, 0);
         }
 
+        // 10. FFN Norm
         var fnw_buf: [64]u8 = undefined;
         const fnw = try std.fmt.bufPrint(&fnw_buf, "{s}.ffn_norm.weight", .{ln});
         var ffn_normed_buf: [64]u8 = undefined;
@@ -281,6 +367,7 @@ pub const GraphBuilder = struct {
         try self.addTensor(ffn_normed, f32Size(o_dims.out), .activation);
         try self.addNode(.rms_norm, &.{ res1, fnw }, ffn_normed, (o_dims.out + 63) / 64, 1, o_dims.out, o_dims.out, eps_bits, 0);
 
+        // 11. Feed Forward
         var gw_buf: [64]u8 = undefined;
         const gw = try std.fmt.bufPrint(&gw_buf, "{s}.ffn_gate.weight", .{ln});
         var uw_buf: [64]u8 = undefined;
@@ -295,9 +382,11 @@ pub const GraphBuilder = struct {
         try self.addTensor(uw, f32Size(u_dims.out * u_dims.in), .weight);
         try self.addTensor(gate, f32Size(g_dims.out), .activation);
         try self.addTensor(up, f32Size(u_dims.out), .activation);
-        try self.addNode(.matmul, &.{ ffn_normed, gw }, gate, (g_dims.out + 15) / 16, 1, 1, g_dims.out, g_dims.in, 0);
-        try self.addNode(.matmul, &.{ ffn_normed, uw }, up, (u_dims.out + 15) / 16, 1, 1, u_dims.out, u_dims.in, 0);
-        try self.addNode(.silu_mul, &.{ gate, up }, gate, (g_dims.out + 63) / 64, 1, g_dims.out, 0, 0, 0);
+        try self.addNodeP(.matmul, &.{ ffn_normed, gw }, gate, (g_dims.out + 15) / 16, 1, 1, g_dims.out, g_dims.in, 0, 0);
+        try self.addNodeP(.matmul, &.{ ffn_normed, uw }, up, (u_dims.out + 15) / 16, 1, 1, u_dims.out, u_dims.in, 0, 0);
+        
+        const activation_op: OpType = if (cfg.activation == .gelu) .gelu_mul else .silu_mul;
+        try self.addNode(activation_op, &.{ gate, up }, gate, (g_dims.out + 63) / 64, 1, g_dims.out, 0, 0, 0);
 
         var dw_buf: [64]u8 = undefined;
         const dw = try std.fmt.bufPrint(&dw_buf, "{s}.ffn_down.weight", .{ln});
@@ -306,8 +395,17 @@ pub const GraphBuilder = struct {
         const d_dims = self.matmulDims(dw, o_dims.out, g_dims.out);
         try self.addTensor(dw, f32Size(d_dims.out * d_dims.in), .weight);
         try self.addTensor(ffn_out, f32Size(d_dims.out), .activation);
-        try self.addNode(.matmul, &.{ gate, dw }, ffn_out, (d_dims.out + 15) / 16, 1, 1, d_dims.out, d_dims.in, 0);
+        try self.addNodeP(.matmul, &.{ gate, dw }, ffn_out, (d_dims.out + 15) / 16, 1, 1, d_dims.out, d_dims.in, 0, 0);
 
+        // 12. Optional Post-FFN Norm (Gemma2)
+        const ffn_post_norm_w = try std.fmt.allocPrint(self.graph.allocator, "{s}.ffn_post_norm.weight", .{ln});
+        defer self.graph.allocator.free(ffn_post_norm_w);
+        if (self.hasTensor(ffn_post_norm_w)) {
+            try self.addTensor(ffn_post_norm_w, f32Size(d_dims.out), .weight);
+            try self.addNode(.rms_norm, &.{ ffn_out, ffn_post_norm_w }, ffn_out, (d_dims.out + 63) / 64, 1, d_dims.out, d_dims.out, eps_bits, 0);
+        }
+
+        // 13. Residual Add 2
         try self.addTensor(out_name, f32Size(d_dims.out), .activation);
         if (cfg.residual_scale != 1.0) {
             try self.addNode(.scaled_add, &.{ res1, ffn_out }, out_name, (d_dims.out + 63) / 64, 1, d_dims.out, res_scale_bits, 0, 0);
@@ -322,17 +420,23 @@ pub const GraphBuilder = struct {
 
         const norm_w = "output_norm.weight";
         const normed = "final.normed";
+        try self.addTensor(norm_w, f32Size(cfg.n_embd), .weight);
         try self.addTensor(normed, f32Size(cfg.n_embd), .activation);
         try self.addNode(.rms_norm, &.{ in_name, norm_w }, normed, (cfg.n_embd + 63) / 64, 1, cfg.n_embd, cfg.n_embd, eps_bits, 0);
 
         const out_w = if (has_output_weight) "output.weight" else "token_embd.weight";
         const out_dims = self.matmulDims(out_w, cfg.vocab_size, cfg.n_embd);
-        if (!has_output_weight) {
-            try self.addTensor("token_embd.weight", f32Size(out_dims.out * out_dims.in), .weight);
+        try self.addTensor(out_w, f32Size(out_dims.out * out_dims.in), .weight);
+        
+        try self.addTensor(logits_name, f32Size(out_dims.out), .activation);
+        try self.addNodeP(.matmul, &.{ normed, out_w }, logits_name, (out_dims.out + 15) / 16, 1, 1, out_dims.out, out_dims.in, 0, 0);
+
+        // Optional Output Bias (Qwen)
+        const out_bias = "output.bias";
+        if (self.hasTensor(out_bias)) {
+            try self.addTensor(out_bias, f32Size(out_dims.out), .weight);
+            try self.addNode(.add, &.{ logits_name, out_bias }, logits_name, (out_dims.out + 63) / 64, 1, out_dims.out, out_dims.out, 0, 0);
         }
-        try self.addTensor(logits_name, f32Size(out_dims.out), .output);
-        const mat_dx = (out_dims.out + 15) / 16;
-        try self.addNode(.matmul, &.{ normed, out_w }, logits_name, mat_dx, 1, 1, out_dims.out, out_dims.in, 0);
     }
 
     pub fn finalize(self: *GraphBuilder) void {
@@ -453,6 +557,7 @@ pub const Dispatcher = struct {
                 if (node.p4 + 1 >= self.flash_attn_threshold) break :blk "attention_flash";
                 break :blk "attention";
             },
+            .gelu_mul => "gelu_mul",
             else => @tagName(node.op_type),
         };
     }
@@ -485,12 +590,6 @@ pub const Dispatcher = struct {
             .c = 0,
         };
 
-        if (node.op_type == .matmul_q and node.p1 <= 1) {
-            pc.p1 = node.p2;
-            pc.p2 = node.p3;
-            pc.p3 = 0;
-        }
-
         switch (node.op_type) {
             .kv_write => {
                 pc.a = self.tensorAddr(node.input_names[0]);
@@ -515,9 +614,8 @@ pub const Dispatcher = struct {
                 pc.b = self.tensorAddr(node.input_names[1]);
                 pc.c = self.tensorAddr(node.output_name);
             },
-            .topk => {
+            .copy => {
                 pc.a = self.tensorAddr(node.input_names[0]);
-                pc.b = self.tensorAddr(node.input_names[1]);
                 pc.c = self.tensorAddr(node.output_name);
             },
             else => {

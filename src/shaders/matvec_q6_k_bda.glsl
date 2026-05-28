@@ -10,9 +10,9 @@ layout(buffer_reference, std430, buffer_reference_align = 4) buffer UIntBuffer {
 };
 
 layout(push_constant) uniform PC {
-    uint n;
-    uint k;
-    uint p3;
+    uint m; // p1
+    uint n; // p2
+    uint k; // p3
     uint p4;
     uint p5;
     uint p6;

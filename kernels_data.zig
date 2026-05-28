@@ -19,3 +19,5 @@ pub const kernels_silu_mul_spv = @embedFile("silu_mul_bda.spv");
 pub const kernels_attention_spv = @embedFile("attention_bda.spv");
 pub const kernels_kv_write_spv = @embedFile("kv_write_bda.spv");
 pub const kernels_scaled_add_spv = @embedFile("scaled_add_bda.spv");
+pub const kernels_gelu_mul_spv = @embedFile("gelu_mul_bda.spv");
+pub const kernels_copy_spv = @embedFile("copy_bda.spv");
