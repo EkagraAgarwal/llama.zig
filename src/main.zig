@@ -52,6 +52,8 @@ pub fn main(init: std.process.Init) !void {
     var inspect_block: bool = false;
     var prefill_chunk: u32 = 0;
     var gpu_embed: bool = true;
+    var report_json: bool = false;
+    var enable_q4q8_native: bool = false;
 
     while (args_it.next()) |arg| {
         if (std.mem.eql(u8, arg, "--model")) {
@@ -84,6 +86,10 @@ pub fn main(init: std.process.Init) !void {
             prefill_chunk = std.fmt.parseInt(u32, args_it.next() orelse "512", 10) catch 512;
         } else if (std.mem.eql(u8, arg, "--no-gpu-embed")) {
             gpu_embed = false;
+        } else if (std.mem.eql(u8, arg, "--report-json")) {
+            report_json = true;
+        } else if (std.mem.eql(u8, arg, "--enable-q4q8-native")) {
+            enable_q4q8_native = true;
         }
     }
 
@@ -114,11 +120,9 @@ pub fn main(init: std.process.Init) !void {
 
     if (cfg.arch == .unknown) {
         try writer.print(
-            "Unsupported architecture '{s}'. Supported architectures: llama, granite. Please use a compatible GGUF or extend model dispatch.\n",
+            "Warning: unrecognized architecture '{s}'. Proceeding with shared lowering path and llama-compatible metadata fallbacks.\n",
             .{cfg.arch_prefix},
         );
-        try writer_streaming.interface.flush();
-        return error.UnsupportedArchitecture;
     }
 
     try writer.print("Config: arch={s} L={} D={} H={} KV={} FF={} ctx={} rope={d:.0}\n", .{
@@ -127,6 +131,9 @@ pub fn main(init: std.process.Init) !void {
     try writer.print("Scales: emb={d} attn={d} res={d} logit={d}\n", .{
         cfg.embedding_scale, cfg.attention_scale, cfg.residual_scale, cfg.logit_scale,
     });
+    validateModelLayout(&ctx) catch |err| {
+        try writer.print("Warning: model layout check failed ({s}); continuing with dynamic graph assumptions.\n", .{@errorName(err)});
+    };
 
     // Dump GGUF metadata for debugging
     if (verbose) {
@@ -194,15 +201,19 @@ pub fn main(init: std.process.Init) !void {
     try registry.register(&vk_ctx, "scaled_add", kernels_data.kernels_scaled_add_spv, "main");
     try registry.register(&vk_ctx, "matmul_q4_k", kernels_data.kernels_matmul_q4_k_spv, "main");
     try registry.register(&vk_ctx, "matmul_q6_k", kernels_data.kernels_matmul_q6_k_spv, "main");
+    try registry.register(&vk_ctx, "matmul_q4_0", kernels_data.kernels_matmul_q4_0_spv, "main");
+    try registry.register(&vk_ctx, "matmul_q8_0", kernels_data.kernels_matmul_q8_0_spv, "main");
     try registry.register(&vk_ctx, "matvec_q4_k", kernels_data.kernels_matvec_q4_k_spv, "main");
     try registry.register(&vk_ctx, "matvec_q6_k", kernels_data.kernels_matvec_q6_k_spv, "main");
+    try registry.register(&vk_ctx, "matvec_q4_0", kernels_data.kernels_matvec_q4_0_spv, "main");
+    try registry.register(&vk_ctx, "matvec_q8_0", kernels_data.kernels_matvec_q8_0_spv, "main");
     try registry.register(&vk_ctx, "get_rows_q", kernels_data.kernels_get_rows_q_spv, "main");
     try registry.register(&vk_ctx, "topk", kernels_data.kernels_topk_spv, "main");
     try registry.register(&vk_ctx, "attention_flash", kernels_data.kernels_flash_attn_spv, "main");
 
     var graph = compute_graph.Graph.init(allocator);
     defer graph.deinit();
-    var builder = compute_graph.GraphBuilder.init(&graph, &cfg);
+    var builder = compute_graph.GraphBuilder.init(&graph, &cfg, &ctx.tensors);
 
     try builder.addTensor("input", model.f32Bytes(cfg.n_embd), .input);
     try builder.initKvCaches();
@@ -227,13 +238,15 @@ pub fn main(init: std.process.Init) !void {
     try builder.addTensor("output_norm.weight", model.f32Bytes(cfg.n_embd), .weight);
     try builder.buildLmHead(prev_out, "logits", has_output);
     builder.finalize();
+    try graph.verify();
+    const graph_cost = compute_graph.estimateGraphCost(&graph);
 
     // Convert eligible matmul nodes to quantized matmul path.
     for (graph.nodes.items) |*node| {
         if (node.op_type != .matmul or node.input_names.len < 2) continue;
         const w_name = node.input_names[1];
         const w_t = ctx.tensors.get(w_name) orelse continue;
-        if (w_t.type == .q4_k or w_t.type == .q6_k) {
+        if (isNativeQuantType(w_t.type, enable_q4q8_native)) {
             node.op_type = .matmul_q;
             node.p5 = @intFromEnum(w_t.type);
         }
@@ -251,7 +264,7 @@ pub fn main(init: std.process.Init) !void {
     while (t_it.next()) |entry| {
         if (entry.value_ptr.role == .weight) {
             if (ctx.tensors.get(entry.key_ptr.*)) |gt| {
-                max_staging = @max(max_staging, model.weightF32Size(gt));
+                max_staging = @max(max_staging, if (isNativeQuantType(gt.type, enable_q4q8_native)) gt.size() else model.weightF32Size(gt));
             } else {
                 max_staging = @max(max_staging, entry.value_ptr.size);
             }
@@ -269,7 +282,7 @@ pub fn main(init: std.process.Init) !void {
             try writer.print("[verbose] weight not in GGUF: {s}\n", .{entry.key_ptr.*});
         }
         const upload_size = if (gt) |t|
-            if (t.type == .q4_k or t.type == .q6_k) t.size() else model.weightF32Size(t)
+            if (isNativeQuantType(t.type, enable_q4q8_native)) t.size() else model.weightF32Size(t)
         else
             entry.value_ptr.size;
         const buf = try vulkan.Buffer.init(&vk_ctx, upload_size, .{ .storage_buffer_bit = true, .shader_device_address_bit = true, .transfer_dst_bit = true }, .{ .device_local_bit = true });
@@ -278,7 +291,7 @@ pub fn main(init: std.process.Init) !void {
         try weight_buffers.append(allocator, buf);
 
         if (gt) |t| {
-            if (t.type == .q4_k or t.type == .q6_k) {
+            if (isNativeQuantType(t.type, enable_q4q8_native)) {
                 const raw_size = t.size();
                 const raw = try allocator.alloc(u8, raw_size);
                 defer allocator.free(raw);
@@ -294,9 +307,10 @@ pub fn main(init: std.process.Init) !void {
                 weights.dequantToF32(&ctx, t, f32_data) catch |err| {
                     if (err == error.UnsupportedQuantType) {
                         try writer.print(
-                            "Unsupported tensor quantization type '{s}' for weight '{s}'. Supported now: f32, f16, bf16, q4_0, q5_0, q8_0, q4_k, q6_k (includes q4_k_m models like Llama 3.2 3B Instruct).\n",
+                            "Unsupported tensor quantization type '{s}' for weight '{s}'. Supported now: f32, f16, bf16, q4_0, q4_1, q5_0, q8_0, q4_k, q6_k (includes q4_k_m models like Llama 3.2 3B Instruct).\n",
                             .{ weights.typeName(t.type), entry.key_ptr.* },
                         );
+                        try writer_streaming.interface.flush();
                     }
                     return err;
                 };
@@ -313,7 +327,7 @@ pub fn main(init: std.process.Init) !void {
     if (!has_output) {
         if (graph.tensors.getPtr("token_embd.weight")) |gt_entry| {
             if (ctx.tensors.get("token_embd.weight")) |t| {
-                const upload_size = if (t.type == .q4_k or t.type == .q6_k) t.size() else model.weightF32Size(t);
+                const upload_size = if (isNativeQuantType(t.type, enable_q4q8_native)) t.size() else model.weightF32Size(t);
                 if (gt_entry.buffer == null) {
                     const buf = try vulkan.Buffer.init(&vk_ctx, upload_size, .{ .storage_buffer_bit = true, .shader_device_address_bit = true, .transfer_dst_bit = true }, .{ .device_local_bit = true });
                     gt_entry.buffer = try allocator.create(vulkan.Buffer);
@@ -321,7 +335,7 @@ pub fn main(init: std.process.Init) !void {
                     try weight_buffers.append(allocator, buf);
                 }
                 gt_entry.size = upload_size;
-                if (t.type == .q4_k or t.type == .q6_k) {
+                if (isNativeQuantType(t.type, enable_q4q8_native)) {
                     const raw_size = t.size();
                     const raw = try allocator.alloc(u8, raw_size);
                     defer allocator.free(raw);
@@ -407,19 +421,23 @@ pub fn main(init: std.process.Init) !void {
     }
 
     const embd_tensor = ctx.tensors.get("token_embd.weight") orelse return error.MissingEmbeddings;
+    const embd_standard_layout = embd_tensor.ne[0] == cfg.n_embd;
+    const embd_transposed_layout = embd_tensor.ne[1] == cfg.n_embd;
+    var embd_cache_transposed: ?[]f32 = null;
+    defer if (embd_cache_transposed) |buf| allocator.free(buf);
+    if (!embd_standard_layout and embd_transposed_layout) {
+        const n = embd_tensor.ne[0] * embd_tensor.ne[1] * embd_tensor.ne[2] * embd_tensor.ne[3];
+        const cache = try allocator.alloc(f32, n);
+        try weights.dequantToF32(&ctx, embd_tensor, cache);
+        embd_cache_transposed = cache;
+    }
 
-    const embd_quant_gpu = gpu_embed and (embd_tensor.type == .q4_k or embd_tensor.type == .q6_k);
-    var embd_gpu_buf: ?vulkan.Buffer = null;
-    defer if (embd_gpu_buf) |b| b.deinit(&vk_ctx);
-    const embd_row_bytes: u32 = if (embd_tensor.type == .q4_k)
-        @intCast((@as(u32, @intCast(embd_tensor.ne[0])) / 256) * 144)
-    else if (embd_tensor.type == .q6_k)
-        @intCast((@as(u32, @intCast(embd_tensor.ne[0])) / 256) * 210)
-    else
-        0;
+    const embd_quant_gpu = gpu_embed and embd_standard_layout and isNativeQuantType(embd_tensor.type, enable_q4q8_native);
+    var embd_gpu_buf: ?*vulkan.Buffer = null;
+    const embd_row_bytes: u32 = @intCast(weights.quantRowBytes(embd_tensor.type, embd_tensor.ne[0]) orelse 0);
     if (embd_quant_gpu) {
         if (graph.tensors.getPtr("token_embd.weight")) |gt| {
-            if (gt.buffer) |buf| embd_gpu_buf = buf.*;
+            if (gt.buffer) |buf| embd_gpu_buf = buf;
         }
     }
     const embd_scale_bits: u32 = @bitCast(cfg.embedding_scale);
@@ -476,7 +494,7 @@ pub fn main(init: std.process.Init) !void {
                 while (ti < chunk_len) : (ti += 1) {
                     try dispatcher.executeGetRowsQ(
                         embed_indices,
-                        embd_gpu_buf.?,
+                        embd_gpu_buf.?.*,
                         input_offset,
                         token_ids[chunk_start + ti],
                         cfg.n_embd,
@@ -496,7 +514,11 @@ pub fn main(init: std.process.Init) !void {
                 const prefill_f32 = @as([*]f32, @ptrCast(@alignCast(mapped_prefill)))[0 .. chunk_len * cfg.n_embd];
                 for (0..chunk_len) |i| {
                     const row = prefill_f32[i * cfg.n_embd .. (i + 1) * cfg.n_embd];
-                    try weights.readEmbeddingF32(&ctx, embd_tensor, token_ids[chunk_start + i], row, cfg.embedding_scale);
+                    if (embd_cache_transposed) |cache| {
+                        try loadEmbeddingFromTransposedCache(cache, embd_tensor, token_ids[chunk_start + i], cfg.n_embd, row, cfg.embedding_scale);
+                    } else {
+                        try weights.readEmbeddingF32(&ctx, embd_tensor, token_ids[chunk_start + i], row, cfg.n_embd, cfg.embedding_scale);
+                    }
                 }
                 vk_ctx.vkd.unmapMemory(vk_ctx.device, prefill_staging.memory);
                 try dispatcher.executePrefillBatch(pos, chunk_len, prefill_staging, embd_bytes);
@@ -589,9 +611,16 @@ pub fn main(init: std.process.Init) !void {
     const t_decode_start = nowNs();
     const logits_offset = graph.tensors.get("logits").?.offset;
     const logit_scale_bits: u32 = if (cfg.logit_scale != 1.0 and cfg.logit_scale != 0.0) @bitCast(cfg.logit_scale) else 0;
-    const use_gpu_topk = temperature <= 0.0 and top_k <= 1;
+    const use_gpu_topk = temperature <= 0.0 and top_k <= 1 and cfg.final_logit_softcapping <= 0.0;
     while (generated < max_tokens) : (generated += 1) {
         try vk_ctx.copyBufferOffset(scratchpad, logits_offset, logits_staging, 0, model.f32Bytes(cfg.vocab_size));
+
+        if (cfg.final_logit_softcapping > 0.0) {
+            const s = cfg.final_logit_softcapping;
+            for (logits_persistent) |*v| {
+                v.* = std.math.tanh(v.* / s) * s;
+            }
+        }
 
         if (use_gpu_topk) {
             current_token = try dispatcher.executeTopK(logits_offset, cfg.vocab_size, topk_indices, topk_values, logit_scale_bits);
@@ -648,7 +677,7 @@ pub fn main(init: std.process.Init) !void {
         if (embd_quant_gpu and embd_gpu_buf != null) {
             try dispatcher.executeGetRowsQ(
                 embed_indices,
-                embd_gpu_buf.?,
+                embd_gpu_buf.?.*,
                 input_offset,
                 current_token,
                 cfg.n_embd,
@@ -657,7 +686,11 @@ pub fn main(init: std.process.Init) !void {
                 embd_scale_bits,
             );
         } else {
-            try loadEmbedding(&ctx, embd_tensor, current_token, cfg.n_embd, &vk_ctx, &input_staging, &scratchpad, &graph, cfg.embedding_scale);
+            if (embd_cache_transposed) |cache| {
+                try loadEmbeddingCached(cache, embd_tensor, current_token, cfg.n_embd, &vk_ctx, &input_staging, &scratchpad, &graph, cfg.embedding_scale);
+            } else {
+                try loadEmbedding(&ctx, embd_tensor, current_token, cfg.n_embd, &vk_ctx, &input_staging, &scratchpad, &graph, cfg.embedding_scale);
+            }
         }
 
         // Debug: verify input embedding actually changed
@@ -689,7 +722,39 @@ pub fn main(init: std.process.Init) !void {
     const decode_tps = if (decode_s > 0 and generated > 0) @as(f64, @floatFromInt(generated)) / decode_s else 0.0;
     try writer.print("[ Load: {d:.2}s ]\n", .{load_s});
     try writer.print("[ Prompt: {d:.1} t/s | Generation: {d:.1} t/s ]\n", .{ prefill_tps, decode_tps });
+    if (report_json) {
+        try writer.print("{{\"load_s\":{d:.6},\"prefill_s\":{d:.6},\"decode_s\":{d:.6},\"prompt_tps\":{d:.4},\"generation_tps\":{d:.4},\"tokens_prompt\":{},\"tokens_generated\":{},\"graph_nodes\":{},\"graph_flops\":{},\"graph_bytes\":{}}}\n", .{
+            load_s, prefill_s, decode_s, prefill_tps, decode_tps, token_ids.len, generated, graph_cost.total_nodes, graph_cost.approx_flops, graph_cost.approx_bytes,
+        });
+    }
     try writer_streaming.interface.flush();
+}
+
+fn isNativeQuantType(tt: @import("tensor.zig").Type, enable_q4q8_native: bool) bool {
+    return switch (tt) {
+        .q4_k, .q6_k => true,
+        .q4_0, .q8_0 => enable_q4q8_native,
+        else => false,
+    };
+}
+
+fn validateModelLayout(ctx: *gguf.GGUFContext) !void {
+    const required = [_][]const u8{
+        "token_embd.weight",
+        "blk.0.attn_norm.weight",
+        "blk.0.attn_q.weight",
+        "blk.0.attn_k.weight",
+        "blk.0.attn_v.weight",
+        "blk.0.attn_output.weight",
+        "blk.0.ffn_norm.weight",
+        "blk.0.ffn_gate.weight",
+        "blk.0.ffn_up.weight",
+        "blk.0.ffn_down.weight",
+        "output_norm.weight",
+    };
+    for (required) |name| {
+        if (ctx.tensors.get(name) == null) return error.UnsupportedArchitectureLayout;
+    }
 }
 
 fn loadEmbedding(
@@ -705,7 +770,33 @@ fn loadEmbedding(
 ) !void {
     const mapped = try vk_ctx.vkd.mapMemory(vk_ctx.device, staging.memory, 0, model.f32Bytes(n_embd), .{});
     const dst = @as([*]f32, @ptrCast(@alignCast(mapped)))[0..n_embd];
-    try weights.readEmbeddingF32(ctx, embd, tid, dst, scale);
+    try weights.readEmbeddingF32(ctx, embd, tid, dst, n_embd, scale);
+    vk_ctx.vkd.unmapMemory(vk_ctx.device, staging.memory);
+    try vk_ctx.copyBufferOffset(staging.*, 0, scratch.*, graph.tensors.get("input").?.offset, model.f32Bytes(n_embd));
+}
+
+fn loadEmbeddingFromTransposedCache(cache: []const f32, embd: *@import("tensor.zig").Tensor, tid: tokenizer.TokenID, n_embd: u32, dst: []f32, scale: f32) !void {
+    const vocab_stride: usize = @intCast(embd.ne[0]);
+    if (tid >= vocab_stride) return error.TokenOutOfRange;
+    for (0..n_embd) |i| {
+        dst[i] = cache[i * vocab_stride + tid] * scale;
+    }
+}
+
+fn loadEmbeddingCached(
+    cache: []const f32,
+    embd: *@import("tensor.zig").Tensor,
+    tid: tokenizer.TokenID,
+    n_embd: u32,
+    vk_ctx: *vulkan.Context,
+    staging: *vulkan.Buffer,
+    scratch: *vulkan.Buffer,
+    graph: *compute_graph.Graph,
+    scale: f32,
+) !void {
+    const mapped = try vk_ctx.vkd.mapMemory(vk_ctx.device, staging.memory, 0, model.f32Bytes(n_embd), .{});
+    const dst = @as([*]f32, @ptrCast(@alignCast(mapped)))[0..n_embd];
+    try loadEmbeddingFromTransposedCache(cache, embd, tid, n_embd, dst, scale);
     vk_ctx.vkd.unmapMemory(vk_ctx.device, staging.memory);
     try vk_ctx.copyBufferOffset(staging.*, 0, scratch.*, graph.tensors.get("input").?.offset, model.f32Bytes(n_embd));
 }

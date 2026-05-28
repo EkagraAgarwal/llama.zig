@@ -1,0 +1,42 @@
+﻿[
+    {
+        "Name":  "granite_bf16",
+        "Family":  "granite",
+        "Prompt":  "The capital of france is",
+        "LoadS":  11.026318,
+        "PromptTPS":  36.741,
+        "GenerationTPS":  37.3189,
+        "GraphNodes":  450,
+        "OutputSnippet":  "llama.zig: High-Performance Vulkan Inference Loading model: D:\\llama.zig\\models\\granite-4.0-350m-BF16.gguf... Config: arch=granite L=28 D=1024 H=16 KV=4 FF=2048 ctx=8192 rope=10000000 Scales: emb=12 attn=0.015625 res=0.263 logit=4 Assistant: paris. [stop token 100257] [Inference Complete] [ Load: 11.03s ] [ Prompt: 36.7 t/s | Generation: 37.3 t/s ] {\"load_s\":11.026318,\"prefill_s\":0.136088,\"decode_s\":0.053592,\"prompt_tps\":36.7410,\"generation_tps\":37.3189,\"tokens_prompt\":5,\"tokens_generated\":2,\"graph_nodes\":450,\"graph_flops\":1174519808,\"graph_bytes\":447842520496}"
+    },
+    {
+        "Name":  "llama32_q4km",
+        "Family":  "llama",
+        "Prompt":  "The capital of france is",
+        "LoadS":  12.194101,
+        "PromptTPS":  4.1158,
+        "GenerationTPS":  4.1156,
+        "GraphNodes":  450,
+        "OutputSnippet":  "llama.zig: High-Performance Vulkan Inference Loading model: D:\\llama.zig\\models\\Llama-3.2-3B-Instruct-Q4_K_M.gguf... Config: arch=llama L=28 D=3072 H=24 KV=8 FF=8192 ctx=8192 rope=500000 Scales: emb=1 attn=0 res=1 logit=1 Assistant: Mein Mein Mein Mein Mein Mein Mein Mein [Inference Complete] [ Load: 12.19s ] [ Prompt: 4.1 t/s | Generation: 4.1 t/s ] {\"load_s\":12.194101,\"prefill_s\":1.457785,\"decode_s\":1.700844,\"prompt_tps\":4.1158,\"generation_tps\":4.1156,\"tokens_prompt\":6,\"tokens_generated\":7,\"graph_nodes\":450,\"graph_flops\":7834779648,\"graph_bytes\":225251076784}"
+    },
+    {
+        "Name":  "gemma",
+        "Family":  "gemma",
+        "Prompt":  "The capital of france is",
+        "LoadS":  21.913165,
+        "PromptTPS":  2.9392,
+        "GenerationTPS":  1.8536,
+        "GraphNodes":  562,
+        "OutputSnippet":  "llama.zig: High-Performance Vulkan Inference Loading model: D:\\llama.zig\\models\\gemma-4-E2B.Q8_0.gguf... Config: arch=gemma4 L=35 D=1536 H=8 KV=1 FF=4096 ctx=8192 rope=1000000 Scales: emb=1 attn=0 res=1 logit=1 Assistant: tabloα«┐α«⌐α«░α»ìTQ tabloVHior tabloα«┐α«⌐α«░α»ì [Inference Complete] [ Load: 21.91s ] [ Prompt: 2.9 t/s | Generation: 1.9 t/s ] {\"load_s\":21.913165,\"prefill_s\":3.062039,\"decode_s\":3.776495,\"prompt_tps\":2.9392,\"generation_tps\":1.8536,\"tokens_prompt\":9,\"tokens_generated\":7,\"graph_nodes\":562,\"graph_flops\":4587864064,\"graph_bytes\":264142050084}"
+    },
+    {
+        "Name":  "qwen",
+        "Family":  "qwen",
+        "Prompt":  "The capital of france is",
+        "LoadS":  16.351423,
+        "PromptTPS":  3.8159,
+        "GenerationTPS":  3.788,
+        "GraphNodes":  514,
+        "OutputSnippet":  "llama.zig: High-Performance Vulkan Inference Loading model: D:\\llama.zig\\models\\Qwen3.5-4B-Q4_0.gguf... Config: arch=qwen35 L=32 D=2560 H=16 KV=4 FF=9216 ctx=8192 rope=10000000 Scales: emb=1 attn=0 res=1 logit=1 Warning: model layout check failed (UnsupportedArchitectureLayout); continuing with dynamic graph assumptions. Assistant: ╨Æ╨ƒ╨Æ╨ƒ╨Æ╨ƒobilobilobilobilobil [Inference Complete] [ Load: 16.35s ] [ Prompt: 3.8 t/s | Generation: 3.8 t/s ] {\"load_s\":16.351423,\"prefill_s\":1.310323,\"decode_s\":1.847956,\"prompt_tps\":3.8159,\"generation_tps\":3.7880,\"tokens_prompt\":5,\"tokens_generated\":7,\"graph_nodes\":514,\"graph_flops\":7712129024,\"graph_bytes\":248376237044}"
+    }
+]

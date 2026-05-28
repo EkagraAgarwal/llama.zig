@@ -26,6 +26,8 @@ pub const Tokenizer = struct {
     add_bos_token: bool = true,
     special: SpecialTokens = .{},
     chat_template: ?[]const u8 = null,
+    model_name: []const u8 = "unknown",
+    use_byte_to_unicode: bool = true,
 
     pub fn init(allocator: std.mem.Allocator, ctx: *GGUFContext) !Tokenizer {
         var tokenizer = Tokenizer{
@@ -80,6 +82,12 @@ pub const Tokenizer = struct {
                 tokenizer.chat_template = try allocator.dupe(u8, val.string);
             }
         }
+        if (ctx.kvs.get("tokenizer.ggml.model")) |val| {
+            if (val == .string) {
+                tokenizer.model_name = try allocator.dupe(u8, val.string);
+                tokenizer.use_byte_to_unicode = std.mem.eql(u8, tokenizer.model_name, "gpt2");
+            }
+        }
 
         // 4. Load Granite/Chat special tokens by scanning the vocab
         for (tokens_array, 0..) |tok_str, i| {
@@ -104,6 +112,9 @@ pub const Tokenizer = struct {
         self.allocator.free(self.id_to_token);
         if (self.chat_template) |tpl| {
             self.allocator.free(tpl);
+        }
+        if (!std.mem.eql(u8, self.model_name, "unknown")) {
+            self.allocator.free(self.model_name);
         }
 
         var merges_it = self.merges.iterator();
@@ -134,20 +145,36 @@ pub const Tokenizer = struct {
                 cursor += m.len;
                 continue;
             }
+            const chunk = if (self.use_byte_to_unicode) blk: {
+                var it = PreTokenizerIterator{ .text = text[cursor..] };
+                const c = it.next() orelse break;
+                cursor += c.len;
+                break :blk c;
+            } else blk: {
+                const c = text[cursor..];
+                cursor = text.len;
+                break :blk c;
+            };
 
-            var it = PreTokenizerIterator{ .text = text[cursor..] };
-            const chunk = it.next() orelse break;
-            cursor += chunk.len;
-
-            // Apply byte-to-unicode mapping to chunk
+            // GPT-2 style BPE uses byte-to-unicode remap. SentencePiece-style models
+            // (gemma/llama/qwen variants) should merge directly on unicode pieces.
             var symbols: std.ArrayList([]const u8) = .empty;
             defer symbols.deinit(arena);
-            for (chunk) |byte| {
-                var buf: [4]u8 = undefined;
-                const cp = byteToCodepoint(byte);
-                const len = std.unicode.utf8Encode(@as(u21, @intCast(cp)), &buf) catch unreachable;
-                const utf8_str = try arena.dupe(u8, buf[0..len]);
-                try symbols.append(arena, utf8_str);
+            if (self.use_byte_to_unicode) {
+                for (chunk) |byte| {
+                    var buf: [4]u8 = undefined;
+                    const cp = byteToCodepoint(byte);
+                    const len = std.unicode.utf8Encode(@as(u21, @intCast(cp)), &buf) catch unreachable;
+                    const utf8_str = try arena.dupe(u8, buf[0..len]);
+                    try symbols.append(arena, utf8_str);
+                }
+            } else {
+                var utf8 = try std.unicode.Utf8View.init(chunk);
+                var it_chars = utf8.iterator();
+                while (it_chars.nextCodepointSlice()) |cp_slice| {
+                    const s = try arena.dupe(u8, cp_slice);
+                    try symbols.append(arena, s);
+                }
             }
 
             // BPE Merge Loop
@@ -177,11 +204,18 @@ pub const Tokenizer = struct {
                 }
             }
 
-            // Map symbols to Token IDs
-            for (symbols.items) |sym| {
+            // Map symbols to Token IDs. For sentencepiece-style vocabularies, handle
+            // leading whitespace as U+2581 marker fallback.
+            for (symbols.items, 0..) |sym, idx| {
                 if (self.vocab.get(sym)) |id| {
                     try token_ids.append(out_allocator, id);
                 } else {
+                    if (!self.use_byte_to_unicode and idx == 0 and sym.len == 1 and sym[0] == ' ') {
+                        if (self.vocab.get("▁")) |space_id| {
+                            try token_ids.append(out_allocator, space_id);
+                            continue;
+                        }
+                    }
                     if (self.unk_token_id) |unk| {
                         try token_ids.append(out_allocator, unk);
                     }
@@ -200,12 +234,27 @@ pub const Tokenizer = struct {
             if (id >= self.id_to_token.len) continue;
             const token_str = self.id_to_token[id];
 
-            // Revert byte-to-unicode mapping
-            var it = std.unicode.Utf8View.init(token_str) catch continue;
-            var cp_it = it.iterator();
-            while (cp_it.nextCodepoint()) |cp| {
-                if (codepointToByte(cp)) |byte| {
-                    try writer.writeByte(byte);
+            if (self.use_byte_to_unicode) {
+                // Revert byte-to-unicode mapping
+                var it = std.unicode.Utf8View.init(token_str) catch continue;
+                var cp_it = it.iterator();
+                while (cp_it.nextCodepoint()) |cp| {
+                    if (codepointToByte(cp)) |byte| {
+                        try writer.writeByte(byte);
+                    }
+                }
+            } else {
+                // SentencePiece-style marker for whitespace.
+                var it = std.unicode.Utf8View.init(token_str) catch continue;
+                var cp_it = it.iterator();
+                while (cp_it.nextCodepoint()) |cp| {
+                    if (cp == 0x2581) {
+                        try writer.writeByte(' ');
+                    } else {
+                        var buf: [4]u8 = undefined;
+                        const len = std.unicode.utf8Encode(@as(u21, @intCast(cp)), &buf) catch continue;
+                        try writer.writeAll(buf[0..len]);
+                    }
                 }
             }
         }

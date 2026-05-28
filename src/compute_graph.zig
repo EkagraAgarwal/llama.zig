@@ -83,18 +83,71 @@ pub const Graph = struct {
         }
         self.tensors.deinit();
     }
+
+    pub fn verify(self: *const Graph) !void {
+        for (self.nodes.items) |node| {
+            if (!self.tensors.contains(node.output_name)) return error.MissingOutputTensor;
+            for (node.input_names) |input_name| {
+                if (!self.tensors.contains(input_name)) return error.MissingInputTensor;
+            }
+        }
+    }
 };
+
+pub const GraphCostSummary = struct {
+    total_nodes: u32 = 0,
+    approx_flops: u64 = 0,
+    approx_bytes: u64 = 0,
+    matmul_nodes: u32 = 0,
+    attention_nodes: u32 = 0,
+    other_nodes: u32 = 0,
+};
+
+pub fn estimateGraphCost(graph: *const Graph) GraphCostSummary {
+    var out = GraphCostSummary{
+        .total_nodes = @intCast(graph.nodes.items.len),
+    };
+    for (graph.nodes.items) |node| {
+        switch (node.op_type) {
+            .matmul, .matmul_q => {
+                out.matmul_nodes += 1;
+                out.approx_flops += @as(u64, node.p1) * @as(u64, node.p2) * @as(u64, node.p3) * 2;
+                out.approx_bytes += (@as(u64, node.p1) * @as(u64, node.p3) + @as(u64, node.p2) * @as(u64, node.p3) + @as(u64, node.p1) * @as(u64, node.p2)) * 4;
+            },
+            .attention, .attention_flash => {
+                out.attention_nodes += 1;
+                out.approx_flops += @as(u64, node.p1) * @as(u64, node.p2) * 4;
+                out.approx_bytes += @as(u64, node.p1) * @as(u64, node.p2) * 4;
+            },
+            else => {
+                out.other_nodes += 1;
+                out.approx_bytes += (@as(u64, node.p1) + @as(u64, node.p2) + @as(u64, node.p3)) * 4;
+            },
+        }
+    }
+    return out;
+}
 
 pub const GraphBuilder = struct {
     graph: *Graph,
     cfg: *const model.ModelConfig,
+    model_tensors: ?*const std.StringHashMap(*tensor.Tensor) = null,
 
-    pub fn init(graph: *Graph, cfg: *const model.ModelConfig) GraphBuilder {
-        return GraphBuilder{ .graph = graph, .cfg = cfg };
+    pub fn init(graph: *Graph, cfg: *const model.ModelConfig, model_tensors: ?*const std.StringHashMap(*tensor.Tensor)) GraphBuilder {
+        return GraphBuilder{ .graph = graph, .cfg = cfg, .model_tensors = model_tensors };
     }
 
     fn f32Size(n: u32) u64 {
         return @as(u64, n) * 4;
+    }
+
+    fn matmulDims(self: *GraphBuilder, weight_name: []const u8, fallback_out: u32, fallback_in: u32) struct { out: u32, in: u32 } {
+        if (self.model_tensors) |tbl| {
+            if (tbl.get(weight_name)) |wt| {
+                return .{ .out = @intCast(wt.ne[1]), .in = @intCast(wt.ne[0]) };
+            }
+        }
+        return .{ .out = fallback_out, .in = fallback_in };
     }
 
     pub fn addTensor(self: *GraphBuilder, name: []const u8, size: u64, role: TensorRole) !void {
@@ -173,27 +226,31 @@ pub const GraphBuilder = struct {
         var attn_buf: [64]u8 = undefined;
         const attn = try std.fmt.bufPrint(&attn_buf, "{s}.attn", .{ln});
 
-        const qkv_w = n_embd * n_embd;
-        try self.addTensor(qw, f32Size(@intCast(qkv_w)), .weight);
-        try self.addTensor(kw, f32Size(@intCast(n_embd * n_kv * head_dim)), .weight);
-        try self.addTensor(vw, f32Size(@intCast(n_embd * n_kv * head_dim)), .weight);
-        try self.addTensor(qn, f32Size(n_embd), .activation);
-        try self.addTensor(kn, f32Size(n_kv * head_dim), .activation);
-        try self.addTensor(vn, f32Size(n_kv * head_dim), .activation);
-        try self.addTensor(attn, f32Size(n_embd), .activation);
+        const q_dims = self.matmulDims(qw, n_embd, n_embd);
+        const k_dims = self.matmulDims(kw, n_kv * head_dim, n_embd);
+        const v_dims = self.matmulDims(vw, n_kv * head_dim, n_embd);
 
-        const mat_dx = (n_embd + 15) / 16;
-        try self.addNode(.matmul, &.{ normed, qw }, qn, mat_dx, 1, 1, n_embd, n_embd, 0);
-        try self.addNode(.matmul, &.{ normed, kw }, kn, ((n_kv * head_dim) + 15) / 16, 1, 1, n_kv * head_dim, n_embd, 0);
-        try self.addNode(.matmul, &.{ normed, vw }, vn, ((n_kv * head_dim) + 15) / 16, 1, 1, n_kv * head_dim, n_embd, 0);
+        try self.addTensor(qw, f32Size(q_dims.out * q_dims.in), .weight);
+        try self.addTensor(kw, f32Size(k_dims.out * k_dims.in), .weight);
+        try self.addTensor(vw, f32Size(v_dims.out * v_dims.in), .weight);
+        try self.addTensor(qn, f32Size(q_dims.out), .activation);
+        try self.addTensor(kn, f32Size(k_dims.out), .activation);
+        try self.addTensor(vn, f32Size(v_dims.out), .activation);
+        try self.addTensor(attn, f32Size(q_dims.out), .activation);
 
-        try self.addNode(.rope, &.{qn}, qn, (n_embd + 63) / 64, 1, n_heads, head_dim, pos, rope_bits);
-        try self.addNode(.rope, &.{kn}, kn, (n_kv * head_dim + 63) / 64, 1, n_kv, head_dim, pos, rope_bits);
+        try self.addNode(.matmul, &.{ normed, qw }, qn, (q_dims.out + 15) / 16, 1, 1, q_dims.out, q_dims.in, 0);
+        try self.addNode(.matmul, &.{ normed, kw }, kn, (k_dims.out + 15) / 16, 1, 1, k_dims.out, k_dims.in, 0);
+        try self.addNode(.matmul, &.{ normed, vw }, vn, (v_dims.out + 15) / 16, 1, 1, v_dims.out, v_dims.in, 0);
+
+        const q_head_dim = if (n_heads > 0) q_dims.out / n_heads else head_dim;
+        const k_head_dim = if (n_kv > 0) k_dims.out / n_kv else head_dim;
+        try self.addNode(.rope, &.{qn}, qn, (q_dims.out + 63) / 64, 1, n_heads, q_head_dim, pos, rope_bits);
+        try self.addNode(.rope, &.{kn}, kn, (k_dims.out + 63) / 64, 1, n_kv, k_head_dim, pos, rope_bits);
 
         var kv_name_buf: [16]u8 = undefined;
         const kv_name = try std.fmt.bufPrint(&kv_name_buf, "kv.{d}", .{layer});
-        try self.addNode(.kv_write, &.{ kn, vn, kv_name }, kn, (n_kv * head_dim + 63) / 64, 1, n_kv, head_dim, cfg.max_ctx, pos);
-        const attn_p2 = head_dim | (n_kv << 16);
+        try self.addNode(.kv_write, &.{ kn, vn, kv_name }, kn, (k_dims.out + 63) / 64, 1, n_kv, k_head_dim, cfg.max_ctx, pos);
+        const attn_p2 = k_head_dim | (n_kv << 16);
         const attn_scale_bits: u32 = @bitCast(cfg.attention_scale);
         try self.addNodeP(.attention, &.{ qn, kv_name }, attn, n_heads, 1, n_heads, attn_p2, cfg.max_ctx, pos, attn_scale_bits);
 
@@ -201,18 +258,19 @@ pub const GraphBuilder = struct {
         const ow = try std.fmt.bufPrint(&ow_buf, "{s}.attn_output.weight", .{ln});
         var attn_out_buf: [64]u8 = undefined;
         const attn_out = try std.fmt.bufPrint(&attn_out_buf, "{s}.attn_out", .{ln});
-        try self.addTensor(ow, f32Size(@intCast(qkv_w)), .weight);
-        try self.addTensor(attn_out, f32Size(n_embd), .activation);
-        try self.addNode(.matmul, &.{ attn, ow }, attn_out, mat_dx, 1, 1, n_embd, n_embd, 0);
+        const o_dims = self.matmulDims(ow, n_embd, q_dims.out);
+        try self.addTensor(ow, f32Size(o_dims.out * o_dims.in), .weight);
+        try self.addTensor(attn_out, f32Size(o_dims.out), .activation);
+        try self.addNode(.matmul, &.{ attn, ow }, attn_out, (o_dims.out + 15) / 16, 1, 1, o_dims.out, o_dims.in, 0);
 
         var res1_buf: [64]u8 = undefined;
         const res1 = try std.fmt.bufPrint(&res1_buf, "{s}.res1", .{ln});
-        try self.addTensor(res1, f32Size(n_embd), .activation);
+        try self.addTensor(res1, f32Size(o_dims.out), .activation);
         const res_scale_bits: u32 = @bitCast(cfg.residual_scale);
         if (cfg.residual_scale != 1.0) {
-            try self.addNode(.scaled_add, &.{ in_name, attn_out }, res1, (n_embd + 63) / 64, 1, n_embd, res_scale_bits, 0, 0);
+            try self.addNode(.scaled_add, &.{ in_name, attn_out }, res1, (o_dims.out + 63) / 64, 1, o_dims.out, res_scale_bits, 0, 0);
         } else {
-            try self.addNode(.add, &.{ in_name, attn_out }, res1, (n_embd + 63) / 64, 1, n_embd, 0, 0, 0);
+            try self.addNode(.add, &.{ in_name, attn_out }, res1, (o_dims.out + 63) / 64, 1, o_dims.out, 0, 0, 0);
         }
 
         var fnw_buf: [64]u8 = undefined;
@@ -220,8 +278,8 @@ pub const GraphBuilder = struct {
         var ffn_normed_buf: [64]u8 = undefined;
         const ffn_normed = try std.fmt.bufPrint(&ffn_normed_buf, "{s}.ffn_normed", .{ln});
         try self.addTensor(fnw, f32Size(n_embd), .weight);
-        try self.addTensor(ffn_normed, f32Size(n_embd), .activation);
-        try self.addNode(.rms_norm, &.{ res1, fnw }, ffn_normed, (n_embd + 63) / 64, 1, n_embd, n_embd, eps_bits, 0);
+        try self.addTensor(ffn_normed, f32Size(o_dims.out), .activation);
+        try self.addNode(.rms_norm, &.{ res1, fnw }, ffn_normed, (o_dims.out + 63) / 64, 1, o_dims.out, o_dims.out, eps_bits, 0);
 
         var gw_buf: [64]u8 = undefined;
         const gw = try std.fmt.bufPrint(&gw_buf, "{s}.ffn_gate.weight", .{ln});
@@ -231,28 +289,30 @@ pub const GraphBuilder = struct {
         const gate = try std.fmt.bufPrint(&gate_buf, "{s}.gate", .{ln});
         var up_buf: [64]u8 = undefined;
         const up = try std.fmt.bufPrint(&up_buf, "{s}.up", .{ln});
-        try self.addTensor(gw, f32Size(n_embd * n_ff), .weight);
-        try self.addTensor(uw, f32Size(n_embd * n_ff), .weight);
-        try self.addTensor(gate, f32Size(n_ff), .activation);
-        try self.addTensor(up, f32Size(n_ff), .activation);
-        const ff_dx = (n_ff + 15) / 16;
-        try self.addNode(.matmul, &.{ ffn_normed, gw }, gate, ff_dx, 1, 1, n_ff, n_embd, 0);
-        try self.addNode(.matmul, &.{ ffn_normed, uw }, up, ff_dx, 1, 1, n_ff, n_embd, 0);
-        try self.addNode(.silu_mul, &.{ gate, up }, gate, (n_ff + 63) / 64, 1, n_ff, 0, 0, 0);
+        const g_dims = self.matmulDims(gw, n_ff, o_dims.out);
+        const u_dims = self.matmulDims(uw, n_ff, o_dims.out);
+        try self.addTensor(gw, f32Size(g_dims.out * g_dims.in), .weight);
+        try self.addTensor(uw, f32Size(u_dims.out * u_dims.in), .weight);
+        try self.addTensor(gate, f32Size(g_dims.out), .activation);
+        try self.addTensor(up, f32Size(u_dims.out), .activation);
+        try self.addNode(.matmul, &.{ ffn_normed, gw }, gate, (g_dims.out + 15) / 16, 1, 1, g_dims.out, g_dims.in, 0);
+        try self.addNode(.matmul, &.{ ffn_normed, uw }, up, (u_dims.out + 15) / 16, 1, 1, u_dims.out, u_dims.in, 0);
+        try self.addNode(.silu_mul, &.{ gate, up }, gate, (g_dims.out + 63) / 64, 1, g_dims.out, 0, 0, 0);
 
         var dw_buf: [64]u8 = undefined;
         const dw = try std.fmt.bufPrint(&dw_buf, "{s}.ffn_down.weight", .{ln});
         var ffn_out_buf: [64]u8 = undefined;
         const ffn_out = try std.fmt.bufPrint(&ffn_out_buf, "{s}.ffn_out", .{ln});
-        try self.addTensor(dw, f32Size(n_ff * n_embd), .weight);
-        try self.addTensor(ffn_out, f32Size(n_embd), .activation);
-        try self.addNode(.matmul, &.{ gate, dw }, ffn_out, (n_embd + 15) / 16, 1, 1, n_embd, n_ff, 0);
+        const d_dims = self.matmulDims(dw, o_dims.out, g_dims.out);
+        try self.addTensor(dw, f32Size(d_dims.out * d_dims.in), .weight);
+        try self.addTensor(ffn_out, f32Size(d_dims.out), .activation);
+        try self.addNode(.matmul, &.{ gate, dw }, ffn_out, (d_dims.out + 15) / 16, 1, 1, d_dims.out, d_dims.in, 0);
 
-        try self.addTensor(out_name, f32Size(n_embd), .activation);
+        try self.addTensor(out_name, f32Size(d_dims.out), .activation);
         if (cfg.residual_scale != 1.0) {
-            try self.addNode(.scaled_add, &.{ res1, ffn_out }, out_name, (n_embd + 63) / 64, 1, n_embd, res_scale_bits, 0, 0);
+            try self.addNode(.scaled_add, &.{ res1, ffn_out }, out_name, (d_dims.out + 63) / 64, 1, d_dims.out, res_scale_bits, 0, 0);
         } else {
-            try self.addNode(.add, &.{ res1, ffn_out }, out_name, (n_embd + 63) / 64, 1, n_embd, 0, 0, 0);
+            try self.addNode(.add, &.{ res1, ffn_out }, out_name, (d_dims.out + 63) / 64, 1, d_dims.out, 0, 0, 0);
         }
     }
 
@@ -266,12 +326,13 @@ pub const GraphBuilder = struct {
         try self.addNode(.rms_norm, &.{ in_name, norm_w }, normed, (cfg.n_embd + 63) / 64, 1, cfg.n_embd, cfg.n_embd, eps_bits, 0);
 
         const out_w = if (has_output_weight) "output.weight" else "token_embd.weight";
+        const out_dims = self.matmulDims(out_w, cfg.vocab_size, cfg.n_embd);
         if (!has_output_weight) {
-            try self.addTensor("token_embd.weight", f32Size(cfg.n_embd) * cfg.vocab_size, .weight);
+            try self.addTensor("token_embd.weight", f32Size(out_dims.out * out_dims.in), .weight);
         }
-        try self.addTensor(logits_name, f32Size(cfg.vocab_size), .output);
-        const mat_dx = (cfg.vocab_size + 15) / 16;
-        try self.addNode(.matmul, &.{ normed, out_w }, logits_name, mat_dx, 1, 1, cfg.vocab_size, cfg.n_embd, 0);
+        try self.addTensor(logits_name, f32Size(out_dims.out), .output);
+        const mat_dx = (out_dims.out + 15) / 16;
+        try self.addNode(.matmul, &.{ normed, out_w }, logits_name, mat_dx, 1, 1, out_dims.out, out_dims.in, 0);
     }
 
     pub fn finalize(self: *GraphBuilder) void {
@@ -297,6 +358,7 @@ pub const Dispatcher = struct {
     cmd: vk.CommandBuffer = .null_handle,
     fence: vk.Fence = .null_handle,
     flash_attn_threshold: u32 = 64,
+    submit_count: u32 = 0,
 
     pub fn init(graph: *Graph, ctx: *vulkan.Context, registry: *vulkan.PipelineRegistry, scratch: vulkan.Buffer, kv: vulkan.Buffer, cfg: *const model.ModelConfig) !Dispatcher {
         var self = Dispatcher{
@@ -385,13 +447,7 @@ pub const Dispatcher = struct {
     fn pipelineNameForNode(self: *Dispatcher, node: GraphNode) ?[]const u8 {
         return switch (node.op_type) {
             .matmul_q => blk: {
-                const qtype = node.p5;
-                if (node.p1 <= 1) {
-                    if (qtype == @intFromEnum(tensor.Type.q6_k)) break :blk "matvec_q6_k";
-                    break :blk "matvec_q4_k";
-                }
-                if (qtype == @intFromEnum(tensor.Type.q6_k)) break :blk "matmul_q6_k";
-                break :blk "matmul_q4_k";
+                break :blk quantPipelineName(node.p5, node.p1 <= 1);
             },
             .attention => blk: {
                 if (node.p4 + 1 >= self.flash_attn_threshold) break :blk "attention_flash";
@@ -399,6 +455,19 @@ pub const Dispatcher = struct {
             },
             else => @tagName(node.op_type),
         };
+    }
+
+    fn quantPipelineName(qtype: u32, is_matvec: bool) []const u8 {
+        if (is_matvec) {
+            if (qtype == @intFromEnum(tensor.Type.q8_0)) return "matvec_q8_0";
+            if (qtype == @intFromEnum(tensor.Type.q4_0)) return "matvec_q4_0";
+            if (qtype == @intFromEnum(tensor.Type.q6_k)) return "matvec_q6_k";
+            return "matvec_q4_k";
+        }
+        if (qtype == @intFromEnum(tensor.Type.q8_0)) return "matmul_q8_0";
+        if (qtype == @intFromEnum(tensor.Type.q4_0)) return "matmul_q4_0";
+        if (qtype == @intFromEnum(tensor.Type.q6_k)) return "matmul_q6_k";
+        return "matmul_q4_k";
     }
 
     fn dispatchNode(self: *Dispatcher, cmd: vk.CommandBuffer, node: GraphNode, pos: u32) void {
@@ -484,18 +553,30 @@ pub const Dispatcher = struct {
         };
         _ = self.ctx.vkd.dispatch.vkQueueSubmit.?(self.ctx.compute_queue, 1, (&submit_info)[0..1], self.fence);
         _ = self.ctx.vkd.dispatch.vkWaitForFences.?(self.ctx.device, 1, (&self.fence)[0..1], @enumFromInt(1), std.math.maxInt(u64));
+        self.submit_count += 1;
+    }
+
+    fn needsBarrierAfter(node: GraphNode) bool {
+        return switch (node.op_type) {
+            .topk => false,
+            else => true,
+        };
     }
 
     fn recordGraph(self: *Dispatcher, cmd: vk.CommandBuffer, pos: u32) void {
         for (self.graph.nodes.items) |node| {
             self.dispatchNode(cmd, node, pos);
-            self.emitComputeBarrier(cmd);
+            if (needsBarrierAfter(node)) self.emitComputeBarrier(cmd);
         }
     }
 
     pub fn execute(self: *Dispatcher, pos: u32) !void {
         try self.ensureSubmitResources();
-        _ = self.ctx.vkd.dispatch.vkResetCommandBuffer.?(self.cmd, .{ .release_resources_bit = true });
+        const reset_flags = if ((self.submit_count & 63) == 63)
+            vk.CommandBufferResetFlags{ .release_resources_bit = true }
+        else
+            vk.CommandBufferResetFlags{};
+        _ = self.ctx.vkd.dispatch.vkResetCommandBuffer.?(self.cmd, reset_flags);
         _ = self.ctx.vkd.dispatch.vkBeginCommandBuffer.?(self.cmd, &.{ .flags = .{ .one_time_submit_bit = true }, .p_inheritance_info = null });
         self.recordGraph(self.cmd, pos);
         _ = self.ctx.vkd.dispatch.vkEndCommandBuffer.?(self.cmd);
@@ -505,7 +586,11 @@ pub const Dispatcher = struct {
     pub fn executePrefillBatch(self: *Dispatcher, pos_start: u32, n_tokens: u32, input_batch: vulkan.Buffer, input_stride: u64) !void {
         const input_tensor = self.graph.tensors.get("input") orelse return error.MissingInputTensor;
         try self.ensureSubmitResources();
-        _ = self.ctx.vkd.dispatch.vkResetCommandBuffer.?(self.cmd, .{ .release_resources_bit = true });
+        const reset_flags = if ((self.submit_count & 63) == 63)
+            vk.CommandBufferResetFlags{ .release_resources_bit = true }
+        else
+            vk.CommandBufferResetFlags{};
+        _ = self.ctx.vkd.dispatch.vkResetCommandBuffer.?(self.cmd, reset_flags);
         _ = self.ctx.vkd.dispatch.vkBeginCommandBuffer.?(self.cmd, &.{ .flags = .{ .one_time_submit_bit = true }, .p_inheritance_info = null });
 
         var i: u32 = 0;
@@ -551,7 +636,11 @@ pub const Dispatcher = struct {
         scale_bits: u32,
     ) !void {
         try self.ensureSubmitResources();
-        _ = self.ctx.vkd.dispatch.vkResetCommandBuffer.?(self.cmd, .{ .release_resources_bit = true });
+        const reset_flags = if ((self.submit_count & 63) == 63)
+            vk.CommandBufferResetFlags{ .release_resources_bit = true }
+        else
+            vk.CommandBufferResetFlags{};
+        _ = self.ctx.vkd.dispatch.vkResetCommandBuffer.?(self.cmd, reset_flags);
         _ = self.ctx.vkd.dispatch.vkBeginCommandBuffer.?(self.cmd, &.{ .flags = .{ .one_time_submit_bit = true }, .p_inheritance_info = null });
 
         const mapped = try self.ctx.vkd.mapMemory(self.ctx.device, indices_buf.memory, 0, 4, .{});
@@ -586,7 +675,11 @@ pub const Dispatcher = struct {
         logit_scale_bits: u32,
     ) !u32 {
         try self.ensureSubmitResources();
-        _ = self.ctx.vkd.dispatch.vkResetCommandBuffer.?(self.cmd, .{ .release_resources_bit = true });
+        const reset_flags = if ((self.submit_count & 63) == 63)
+            vk.CommandBufferResetFlags{ .release_resources_bit = true }
+        else
+            vk.CommandBufferResetFlags{};
+        _ = self.ctx.vkd.dispatch.vkResetCommandBuffer.?(self.cmd, reset_flags);
         _ = self.ctx.vkd.dispatch.vkBeginCommandBuffer.?(self.cmd, &.{ .flags = .{ .one_time_submit_bit = true }, .p_inheritance_info = null });
 
         const pipe = self.registry.get("topk") orelse return error.MissingPipeline;
@@ -611,3 +704,15 @@ pub const Dispatcher = struct {
         return id;
     }
 };
+
+test "quantized kernel selection is architecture independent" {
+    const t = std.testing;
+    try t.expectEqualStrings("matvec_q4_0", Dispatcher.quantPipelineName(@intFromEnum(tensor.Type.q4_0), true));
+    try t.expectEqualStrings("matvec_q8_0", Dispatcher.quantPipelineName(@intFromEnum(tensor.Type.q8_0), true));
+    try t.expectEqualStrings("matvec_q4_k", Dispatcher.quantPipelineName(@intFromEnum(tensor.Type.q4_k), true));
+    try t.expectEqualStrings("matvec_q6_k", Dispatcher.quantPipelineName(@intFromEnum(tensor.Type.q6_k), true));
+    try t.expectEqualStrings("matmul_q4_0", Dispatcher.quantPipelineName(@intFromEnum(tensor.Type.q4_0), false));
+    try t.expectEqualStrings("matmul_q8_0", Dispatcher.quantPipelineName(@intFromEnum(tensor.Type.q8_0), false));
+    try t.expectEqualStrings("matmul_q4_k", Dispatcher.quantPipelineName(@intFromEnum(tensor.Type.q4_k), false));
+    try t.expectEqualStrings("matmul_q6_k", Dispatcher.quantPipelineName(@intFromEnum(tensor.Type.q6_k), false));
+}

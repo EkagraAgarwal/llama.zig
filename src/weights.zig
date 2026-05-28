@@ -4,7 +4,7 @@ const tensor = @import("tensor.zig");
 
 pub fn isSupportedType(tt: tensor.Type) bool {
     return switch (tt) {
-        .f32, .f16, .bf16, .q4_0, .q5_0, .q8_0, .q4_k, .q6_k => true,
+        .f32, .f16, .bf16, .q4_0, .q4_1, .q5_0, .q8_0, .q4_k, .q6_k => true,
         else => false,
     };
 }
@@ -56,6 +56,7 @@ pub fn dequantToF32(ctx: *gguf.GGUFContext, t: *tensor.Tensor, dst: []f32) !void
             for (src, 0..) |bits, i| dst[i] = bf16ToF32(bits);
         },
         .q4_0 => try dequantQ40(ctx, t, dst[0..n]),
+        .q4_1 => try dequantQ41(ctx, t, dst[0..n]),
         .q5_0 => try dequantQ50(ctx, t, dst[0..n]),
         .q8_0 => try dequantQ80(ctx, t, dst[0..n]),
         .q4_k => try dequantQ4K(ctx, t, dst[0..n]),
@@ -107,6 +108,30 @@ fn dequantQ50(ctx: *gguf.GGUFContext, t: *tensor.Tensor, dst: []f32) !void {
             const hi: u8 = (qh[j / 8] >> @as(u3, @intCast(j & 7))) & 1;
             const qv: i32 = @as(i32, (lo | (hi << 4))) - 16;
             dst[out] = d * @as(f32, @floatFromInt(qv));
+            out += 1;
+        }
+    }
+}
+
+fn dequantQ41(ctx: *gguf.GGUFContext, t: *tensor.Tensor, dst: []f32) !void {
+    const QK: usize = 32;
+    const raw = try ctx.allocator.alloc(u8, t.size());
+    defer ctx.allocator.free(raw);
+    try ctx.readTensorData(t, raw);
+
+    var out: usize = 0;
+    var ib: usize = 0;
+    while (out < dst.len and ib + 20 <= raw.len) {
+        const d = f16ToF32(std.mem.readInt(u16, raw[ib..][0..2], .little));
+        const m = f16ToF32(std.mem.readInt(u16, raw[ib + 2 ..][0..2], .little));
+        const qs = raw[ib + 4 .. ib + 20];
+        ib += 20;
+
+        var j: usize = 0;
+        while (j < QK and out < dst.len) : (j += 1) {
+            const q = qs[j / 2];
+            const nib: i32 = if ((j & 1) == 0) @as(i32, q & 0x0F) else @as(i32, q >> 4);
+            dst[out] = d * @as(f32, @floatFromInt(nib)) + m;
             out += 1;
         }
     }
@@ -221,9 +246,9 @@ fn dequantQ6KRaw(raw: []const u8, dst: []f32) void {
     }
 }
 
-pub fn readEmbeddingF32(ctx: *gguf.GGUFContext, t: *tensor.Tensor, token_id: u32, dst: []f32, scale: f32) !void {
-    const n_embd = t.ne[0];
+pub fn readEmbeddingF32(ctx: *gguf.GGUFContext, t: *tensor.Tensor, token_id: u32, dst: []f32, n_embd: u32, scale: f32) !void {
     if (dst.len < n_embd) return error.BufferTooSmall;
+    if (t.ne[0] != n_embd) return error.UnsupportedEmbeddingLayout;
 
     switch (t.type) {
         .f32 => {
@@ -251,7 +276,7 @@ pub fn readEmbeddingF32(ctx: *gguf.GGUFContext, t: *tensor.Tensor, token_id: u32
             for (src, 0..) |bits, i| dst[i] = bf16ToF32(bits);
         },
         .q4_k => {
-            const row_bytes = (@as(usize, @intCast(n_embd)) / 256) * 144;
+            const row_bytes = quantRowBytes(t.type, n_embd) orelse return error.UnsupportedQuantType;
             const raw = try ctx.allocator.alloc(u8, row_bytes);
             defer ctx.allocator.free(raw);
             const off = t.offset + @as(u64, token_id) * row_bytes;
@@ -259,12 +284,36 @@ pub fn readEmbeddingF32(ctx: *gguf.GGUFContext, t: *tensor.Tensor, token_id: u32
             dequantQ4KRaw(raw, dst[0..n_embd]);
         },
         .q6_k => {
-            const row_bytes = (@as(usize, @intCast(n_embd)) / 256) * 210;
+            const row_bytes = quantRowBytes(t.type, n_embd) orelse return error.UnsupportedQuantType;
             const raw = try ctx.allocator.alloc(u8, row_bytes);
             defer ctx.allocator.free(raw);
             const off = t.offset + @as(u64, token_id) * row_bytes;
             _ = try ctx.file.readPositionalAll(std.Io.Threaded.global_single_threaded.io(), raw, ctx.data_offset + off);
             dequantQ6KRaw(raw, dst[0..n_embd]);
+        },
+        .q4_0 => {
+            const row_bytes = quantRowBytes(t.type, n_embd) orelse return error.UnsupportedQuantType;
+            const raw = try ctx.allocator.alloc(u8, row_bytes);
+            defer ctx.allocator.free(raw);
+            const off = t.offset + @as(u64, token_id) * row_bytes;
+            _ = try ctx.file.readPositionalAll(std.Io.Threaded.global_single_threaded.io(), raw, ctx.data_offset + off);
+            dequantQ40Raw(raw, dst[0..n_embd]);
+        },
+        .q4_1 => {
+            const row_bytes = quantRowBytes(t.type, n_embd) orelse return error.UnsupportedQuantType;
+            const raw = try ctx.allocator.alloc(u8, row_bytes);
+            defer ctx.allocator.free(raw);
+            const off = t.offset + @as(u64, token_id) * row_bytes;
+            _ = try ctx.file.readPositionalAll(std.Io.Threaded.global_single_threaded.io(), raw, ctx.data_offset + off);
+            dequantQ41Raw(raw, dst[0..n_embd]);
+        },
+        .q8_0 => {
+            const row_bytes = quantRowBytes(t.type, n_embd) orelse return error.UnsupportedQuantType;
+            const raw = try ctx.allocator.alloc(u8, row_bytes);
+            defer ctx.allocator.free(raw);
+            const off = t.offset + @as(u64, token_id) * row_bytes;
+            _ = try ctx.file.readPositionalAll(std.Io.Threaded.global_single_threaded.io(), raw, ctx.data_offset + off);
+            dequantQ80Raw(raw, dst[0..n_embd]);
         },
         else => {
             const full_row = try ctx.allocator.alloc(f32, n_embd);
@@ -283,10 +332,72 @@ pub fn readEmbeddingF32(ctx: *gguf.GGUFContext, t: *tensor.Tensor, token_id: u32
     }
 }
 
+pub fn quantRowBytes(tt: tensor.Type, n_embd: u64) ?usize {
+    const blk = tt.blockSize();
+    if (blk <= 1) return null;
+    const blocks = (n_embd + blk - 1) / blk;
+    return @intCast(blocks * tt.bytesPerBlock());
+}
+
+fn dequantQ40Raw(raw: []const u8, dst: []f32) void {
+    const QK: usize = 32;
+    var out: usize = 0;
+    var ib: usize = 0;
+    while (out < dst.len and ib + 18 <= raw.len) {
+        const d = f16ToF32(std.mem.readInt(u16, raw[ib..][0..2], .little));
+        const qs = raw[ib + 2 .. ib + 18];
+        ib += 18;
+        var j: usize = 0;
+        while (j < QK and out < dst.len) : (j += 1) {
+            const q = qs[j / 2];
+            const nib: i32 = if ((j & 1) == 0) @as(i32, q & 0x0F) else @as(i32, q >> 4);
+            dst[out] = d * @as(f32, @floatFromInt(nib - 8));
+            out += 1;
+        }
+    }
+}
+
+fn dequantQ80Raw(raw: []const u8, dst: []f32) void {
+    const QK: usize = 32;
+    var out: usize = 0;
+    var ib: usize = 0;
+    while (out < dst.len and ib + 34 <= raw.len) {
+        const d = f16ToF32(std.mem.readInt(u16, raw[ib..][0..2], .little));
+        const qs = raw[ib + 2 .. ib + 34];
+        ib += 34;
+        var j: usize = 0;
+        while (j < QK and out < dst.len) : (j += 1) {
+            const v: i8 = @bitCast(qs[j]);
+            dst[out] = d * @as(f32, @floatFromInt(v));
+            out += 1;
+        }
+    }
+}
+
+fn dequantQ41Raw(raw: []const u8, dst: []f32) void {
+    const QK: usize = 32;
+    var out: usize = 0;
+    var ib: usize = 0;
+    while (out < dst.len and ib + 20 <= raw.len) {
+        const d = f16ToF32(std.mem.readInt(u16, raw[ib..][0..2], .little));
+        const m = f16ToF32(std.mem.readInt(u16, raw[ib + 2 ..][0..2], .little));
+        const qs = raw[ib + 4 .. ib + 20];
+        ib += 20;
+        var j: usize = 0;
+        while (j < QK and out < dst.len) : (j += 1) {
+            const q = qs[j / 2];
+            const nib: i32 = if ((j & 1) == 0) @as(i32, q & 0x0F) else @as(i32, q >> 4);
+            dst[out] = d * @as(f32, @floatFromInt(nib)) + m;
+            out += 1;
+        }
+    }
+}
+
 test "supported quant type matrix includes q4_k for q4_k_m models" {
     try std.testing.expect(isSupportedType(.q4_k));
     try std.testing.expect(isSupportedType(.q6_k));
     try std.testing.expect(isSupportedType(.q4_0));
+    try std.testing.expect(isSupportedType(.q4_1));
     try std.testing.expect(isSupportedType(.q5_0));
     try std.testing.expect(isSupportedType(.q8_0));
 }

@@ -35,6 +35,8 @@ pub const Context = struct {
     mem_props: vk.PhysicalDeviceMemoryProperties,
     cmd_pool: vk.CommandPool,
     transfer_fence: vk.Fence = .null_handle,
+    transfer_cmd: vk.CommandBuffer = .null_handle,
+    transfer_submit_count: u32 = 0,
 
     vki: vk.InstanceWrapper,
     vkd: *vk.DeviceWrapper,
@@ -160,6 +162,10 @@ pub const Context = struct {
         if (self.transfer_fence != .null_handle) {
             self.vkd.dispatch.vkDestroyFence.?(self.device, self.transfer_fence, null);
         }
+        if (self.transfer_cmd != .null_handle) {
+            self.vkd.dispatch.vkFreeCommandBuffers.?(self.device, self.cmd_pool, 1, (&self.transfer_cmd)[0..1]);
+            self.transfer_cmd = .null_handle;
+        }
         self.vkd.dispatch.vkDestroyCommandPool.?(self.device, self.cmd_pool, null);
         self.vkd.dispatch.vkDestroyDevice.?(self.device, null);
         self.allocator.destroy(self.vkd);
@@ -188,10 +194,24 @@ pub const Context = struct {
         return self.transfer_fence;
     }
 
+    fn ensureTransferCmd(self: *Context) !vk.CommandBuffer {
+        if (self.transfer_cmd == .null_handle) {
+            _ = self.vkd.dispatch.vkAllocateCommandBuffers.?(
+                self.device,
+                &.{ .command_pool = self.cmd_pool, .level = .primary, .command_buffer_count = 1 },
+                (&self.transfer_cmd)[0..1],
+            );
+        }
+        return self.transfer_cmd;
+    }
+
     pub fn copyBufferOffset(self: *Context, src: Buffer, src_off: u64, dst: Buffer, dst_off: u64, size: u64) !void {
-        var cmd: vk.CommandBuffer = undefined;
-        _ = self.vkd.dispatch.vkAllocateCommandBuffers.?(self.device, &.{ .command_pool = self.cmd_pool, .level = .primary, .command_buffer_count = 1 }, (&cmd)[0..1]);
-        defer self.vkd.dispatch.vkFreeCommandBuffers.?(self.device, self.cmd_pool, 1, (&cmd)[0..1]);
+        const cmd = try self.ensureTransferCmd();
+        const reset_flags = if ((self.transfer_submit_count & 63) == 63)
+            vk.CommandBufferResetFlags{ .release_resources_bit = true }
+        else
+            vk.CommandBufferResetFlags{};
+        _ = self.vkd.dispatch.vkResetCommandBuffer.?(cmd, reset_flags);
         _ = self.vkd.dispatch.vkBeginCommandBuffer.?(cmd, &.{ .flags = .{ .one_time_submit_bit = true }, .p_inheritance_info = null });
         self.vkd.dispatch.vkCmdCopyBuffer.?(cmd, src.buffer, dst.buffer, 1, &[_]vk.BufferCopy{.{ .src_offset = src_off, .dst_offset = dst_off, .size = size }});
         _ = self.vkd.dispatch.vkEndCommandBuffer.?(cmd);
@@ -199,6 +219,7 @@ pub const Context = struct {
         _ = self.vkd.dispatch.vkResetFences.?(self.device, 1, (&fence)[0..1]);
         _ = self.vkd.dispatch.vkQueueSubmit.?(self.compute_queue, 1, &[_]vk.SubmitInfo{.{ .wait_semaphore_count = 0, .p_wait_semaphores = null, .p_wait_dst_stage_mask = null, .command_buffer_count = 1, .p_command_buffers = (&cmd)[0..1], .signal_semaphore_count = 0, .p_signal_semaphores = null }}, fence);
         _ = self.vkd.dispatch.vkWaitForFences.?(self.device, 1, (&fence)[0..1], @enumFromInt(1), std.math.maxInt(u64));
+        self.transfer_submit_count += 1;
     }
     
     pub fn copyBuffer(self: *Context, src: Buffer, dst: Buffer, size: u64) !void {

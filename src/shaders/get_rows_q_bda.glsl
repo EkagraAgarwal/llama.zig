@@ -97,6 +97,25 @@ float q6kAt(uint row_base, uint kidx) {
     return d * float(sc) * float(qv);
 }
 
+float q40At(uint row_base, uint kidx) {
+    uint b = kidx / 32u;
+    uint i = kidx % 32u;
+    uint base = row_base + b * 18u;
+    float d = f16ToF32(getU16(pc.weights, base + 0u));
+    uint qbyte = getByte(pc.weights, base + 2u + (i / 2u));
+    int qv = int((i & 1u) == 0u ? (qbyte & 0xFu) : (qbyte >> 4u)) - 8;
+    return d * float(qv);
+}
+
+float q80At(uint row_base, uint kidx) {
+    uint b = kidx / 32u;
+    uint i = kidx % 32u;
+    uint base = row_base + b * 34u;
+    float d = f16ToF32(getU16(pc.weights, base + 0u));
+    int qv = int(int(getByte(pc.weights, base + 2u + i) << 24u) >> 24u);
+    return d * float(qv);
+}
+
 void main() {
     uint tid = gl_GlobalInvocationID.x;
     if (tid >= pc.n_embd) return;
@@ -105,7 +124,11 @@ void main() {
     uint row_base = token * pc.row_bytes;
 
     float v = 0.0;
-    if (pc.qtype == 12u) {
+    if (pc.qtype == 2u) {
+        v = q40At(row_base, tid);
+    } else if (pc.qtype == 8u) {
+        v = q80At(row_base, tid);
+    } else if (pc.qtype == 12u) {
         v = q4kAt(row_base, tid);
     } else if (pc.qtype == 14u) {
         v = q6kAt(row_base, tid);
