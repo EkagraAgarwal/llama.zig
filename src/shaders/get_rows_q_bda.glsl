@@ -50,63 +50,6 @@ float bf16ToF32(uint h) {
     return uintBitsToFloat(h << 16u);
 }
 
-float q4kAt(uint row_base, uint kidx) {
-    const uint BS = 144u;
-    uint b = kidx / 256u;
-    uint i = kidx % 256u;
-    uint base = row_base + b * BS;
-
-    float d = f16ToF32(getU16(pc.weights, base + 0u));
-    float dmin = f16ToF32(getU16(pc.weights, base + 2u));
-    uint is = i / 64u;
-    uint sub = i % 64u;
-    uint j = sub % 32u;
-    uint hi = sub / 32u;
-    uint sc = getByte(pc.weights, base + 4u + is);
-    float dl = d * float(int(sc & 0xFu) - 8);
-    float ml = dmin * float(int((sc >> 4u) & 0xFu) - 8);
-    uint qbyte = getByte(pc.weights, base + 16u + is * 32u + j);
-    uint qv = (hi == 0u) ? (qbyte & 0xFu) : (qbyte >> 4u);
-    return dl * float(qv) - ml;
-}
-
-float q6kAt(uint row_base, uint kidx) {
-    const uint BS = 210u;
-    uint b = kidx / 256u;
-    uint i = kidx % 256u;
-    uint base = row_base + b * BS;
-
-    uint hsel = i / 128u;
-    uint local = i % 128u;
-    uint l = local % 32u;
-    uint quarter = local / 32u;
-    uint group = l / 16u;
-    uint scale_index = hsel * 8u + group + quarter * 2u;
-    int sc = int(int(getByte(pc.weights, base + 192u + scale_index) << 24) >> 24);
-
-    uint qh = getByte(pc.weights, base + 128u + hsel * 32u + l);
-    uint ql0 = getByte(pc.weights, base + hsel * 64u + l);
-    uint ql1 = getByte(pc.weights, base + hsel * 64u + l + 32u);
-    int qv = 0;
-    if (quarter == 0u) qv = int((ql0 & 0xFu) | (((qh >> 0u) & 0x3u) << 4u)) - 32;
-    if (quarter == 1u) qv = int((ql1 & 0xFu) | (((qh >> 2u) & 0x3u) << 4u)) - 32;
-    if (quarter == 2u) qv = int(((ql0 >> 4u) & 0xFu) | (((qh >> 4u) & 0x3u) << 4u)) - 32;
-    if (quarter == 3u) qv = int(((ql1 >> 4u) & 0xFu) | (((qh >> 6u) & 0x3u) << 4u)) - 32;
-
-    float d = f16ToF32(getU16(pc.weights, base + 208u));
-    return d * float(sc) * float(qv);
-}
-
-float q40At(uint row_base, uint kidx) {
-    uint b = kidx / 32u;
-    uint i = kidx % 32u;
-    uint base = row_base + b * 18u;
-    float d = f16ToF32(getU16(pc.weights, base + 0u));
-    uint qbyte = getByte(pc.weights, base + 2u + (i / 2u));
-    int qv = int((i & 1u) == 0u ? (qbyte & 0xFu) : (qbyte >> 4u)) - 8;
-    return d * float(qv);
-}
-
 float q80At(uint row_base, uint kidx) {
     uint b = kidx / 32u;
     uint i = kidx % 32u;
@@ -124,14 +67,8 @@ void main() {
     uint row_base = token * pc.row_bytes;
 
     float v = 0.0;
-    if (pc.qtype == 2u) {
-        v = q40At(row_base, tid);
-    } else if (pc.qtype == 8u) {
+    if (pc.qtype == 8u) {
         v = q80At(row_base, tid);
-    } else if (pc.qtype == 12u) {
-        v = q4kAt(row_base, tid);
-    } else if (pc.qtype == 14u) {
-        v = q6kAt(row_base, tid);
     } else {
         uint byte_idx = row_base + tid * 4u;
         uint w = pc.weights.data[byte_idx >> 2];

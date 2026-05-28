@@ -141,10 +141,10 @@ pub fn main(init: std.process.Init) !void {
             const tag_name = @tagName(entry.value_ptr.*);
             if (entry.value_ptr.* == .array) {
                 const arr = entry.value_ptr.array;
-                try writer.print("  {s} [array len={}]\n", .{key, arr.len});
+                try writer.print("  {s} [array len={}]\n", .{ key, arr.len });
                 if (arr.len <= 32) {
                     for (arr, 0..) |item, ai| {
-                        try writer.print("    [{d}] tag={s} ", .{ai, @tagName(item)});
+                        try writer.print("    [{d}] tag={s} ", .{ ai, @tagName(item) });
                         switch (item) {
                             .u8 => |v| try writer.print("{}\n", .{v}),
                             .u16 => |v| try writer.print("{}\n", .{v}),
@@ -159,7 +159,7 @@ pub fn main(init: std.process.Init) !void {
                     }
                 }
             } else {
-                try writer.print("  {s} [{s}] = ", .{key, tag_name});
+                try writer.print("  {s} [{s}] = ", .{ key, tag_name });
                 switch (entry.value_ptr.*) {
                     .u8 => |v| try writer.print("{}\n", .{v}),
                     .u16 => |v| try writer.print("{}\n", .{v}),
@@ -205,13 +205,7 @@ pub fn main(init: std.process.Init) !void {
     try registry.register(&vk_ctx, "attention", kernels_data.kernels_attention_spv, "main");
     try registry.register(&vk_ctx, "kv_write", kernels_data.kernels_kv_write_spv, "main");
     try registry.register(&vk_ctx, "scaled_add", kernels_data.kernels_scaled_add_spv, "main");
-    try registry.register(&vk_ctx, "matmul_q4_k", kernels_data.kernels_matmul_q4_k_spv, "main");
-    try registry.register(&vk_ctx, "matmul_q6_k", kernels_data.kernels_matmul_q6_k_spv, "main");
-    try registry.register(&vk_ctx, "matmul_q4_0", kernels_data.kernels_matmul_q4_0_spv, "main");
     try registry.register(&vk_ctx, "matmul_q8_0", kernels_data.kernels_matmul_q8_0_spv, "main");
-    try registry.register(&vk_ctx, "matvec_q4_k", kernels_data.kernels_matvec_q4_k_spv, "main");
-    try registry.register(&vk_ctx, "matvec_q6_k", kernels_data.kernels_matvec_q6_k_spv, "main");
-    try registry.register(&vk_ctx, "matvec_q4_0", kernels_data.kernels_matvec_q4_0_spv, "main");
     try registry.register(&vk_ctx, "matvec_q8_0", kernels_data.kernels_matvec_q8_0_spv, "main");
     try registry.register(&vk_ctx, "get_rows_q", kernels_data.kernels_get_rows_q_spv, "main");
     try registry.register(&vk_ctx, "topk", kernels_data.kernels_topk_spv, "main");
@@ -315,7 +309,7 @@ pub fn main(init: std.process.Init) !void {
                 weights.dequantToF32(&ctx, t, f32_data) catch |err| {
                     if (err == error.UnsupportedQuantType) {
                         try writer.print(
-                            "Unsupported tensor quantization type '{s}' for weight '{s}'. Supported now: f32, f16, bf16, q4_0, q4_1, q5_0, q8_0, q4_k, q6_k (includes q4_k_m models like Llama 3.2 3B Instruct).\n",
+                            "Unsupported tensor quantization type '{s}' for weight '{s}'. Supported types: f32, f16, bf16, q8_0.\n",
                             .{ weights.typeName(t.type), entry.key_ptr.* },
                         );
                         try writer_streaming.interface.flush();
@@ -394,7 +388,7 @@ pub fn main(init: std.process.Init) !void {
     var dispatcher = try compute_graph.Dispatcher.init(&graph, &vk_ctx, &registry, scratchpad, kv_cache, &cfg);
     defer dispatcher.deinit();
     if (verbose) {
-        try writer.print("[verbose] graph: {} nodes, {} tensors\n", .{graph.nodes.items.len, graph.tensors.count()});
+        try writer.print("[verbose] graph: {} nodes, {} tensors\n", .{ graph.nodes.items.len, graph.tensors.count() });
         try writer_streaming.interface.flush();
     }
 
@@ -466,10 +460,22 @@ pub fn main(init: std.process.Init) !void {
     const extra_stops = blk: {
         var stops: [6]tokenizer.TokenID = undefined;
         var n: usize = 0;
-        if (tok.eos_token_id) |id| { stops[n] = id; n += 1; }
-        if (tok.special.end_of_text) |id| { stops[n] = id; n += 1; }
-        if (tok.special.end_of_role) |id| { stops[n] = id; n += 1; }
-        if (tok.special.eot_id) |id| { stops[n] = id; n += 1; }
+        if (tok.eos_token_id) |id| {
+            stops[n] = id;
+            n += 1;
+        }
+        if (tok.special.end_of_text) |id| {
+            stops[n] = id;
+            n += 1;
+        }
+        if (tok.special.end_of_role) |id| {
+            stops[n] = id;
+            n += 1;
+        }
+        if (tok.special.eot_id) |id| {
+            stops[n] = id;
+            n += 1;
+        }
         break :blk stops[0..n];
     };
 
@@ -740,7 +746,7 @@ pub fn main(init: std.process.Init) !void {
 
 fn isNativeQuantType(tt: @import("tensor.zig").Type) bool {
     return switch (tt) {
-        .q4_k, .q6_k, .q4_0, .q8_0 => true,
+        .q8_0 => true,
         else => false,
     };
 }

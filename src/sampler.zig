@@ -40,11 +40,6 @@ pub fn sampleArgmax(logits: []const f32) tokenizer.TokenID {
     return @intCast(best);
 }
 
-pub fn sampleTopP(allocator: std.mem.Allocator, logits: []const f32, cfg: SamplerConfig, prev_tokens: []const tokenizer.TokenID) !tokenizer.TokenID {
-    var s = Sampler.init(cfg);
-    return s.sample(allocator, logits, prev_tokens);
-}
-
 fn sampleWithRandom(
     allocator: std.mem.Allocator,
     logits: []const f32,

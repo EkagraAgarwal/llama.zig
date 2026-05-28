@@ -267,10 +267,10 @@ test "ModelConfig dynamic activation and scaling" {
     try ctx.kvs.put(try allocator.dupe(u8, "general.architecture"), .{ .string = try allocator.dupe(u8, "llama") });
     try ctx.kvs.put(try allocator.dupe(u8, "llama.embedding_length"), .{ .u32 = 4096 });
     try ctx.kvs.put(try allocator.dupe(u8, "llama.block_count"), .{ .u32 = 32 });
-    
+
     var cfg = try ModelConfig.init(allocator, &ctx, 32000);
     defer cfg.deinit(allocator);
-    
+
     try t.expectEqual(Architecture.llama, cfg.arch);
     try t.expectEqual(Activation.silu, cfg.activation);
     try t.expectEqual(@as(f32, 1.0), cfg.embedding_scale);
@@ -278,10 +278,10 @@ test "ModelConfig dynamic activation and scaling" {
     // Test Gemma
     try ctx.kvs.put(try allocator.dupe(u8, "general.architecture"), .{ .string = try allocator.dupe(u8, "gemma") });
     try ctx.kvs.put(try allocator.dupe(u8, "gemma.embedding_length"), .{ .u32 = 2048 });
-    
+
     var cfg_gemma = try ModelConfig.init(allocator, &ctx, 256000);
     defer cfg_gemma.deinit(allocator);
-    
+
     try t.expectEqual(Architecture.gemma, cfg_gemma.arch);
     try t.expectEqual(Activation.gelu, cfg_gemma.activation);
     try t.expectEqual(@sqrt(@as(f32, 2048.0)), cfg_gemma.embedding_scale);

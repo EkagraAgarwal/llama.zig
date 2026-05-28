@@ -125,7 +125,7 @@ pub const Context = struct {
             .p_queue_priorities = &queue_priority,
         };
 
-        const device_extensions = [_][*:0]const u8{ vk.extensions.khr_buffer_device_address.name };
+        const device_extensions = [_][*:0]const u8{vk.extensions.khr_buffer_device_address.name};
         const device = try vki.createDevice(pdev, &.{
             .p_next = &features2,
             .queue_create_info_count = 1,
@@ -136,7 +136,7 @@ pub const Context = struct {
 
         const vkd = try allocator.create(vk.DeviceWrapper);
         vkd.* = vk.DeviceWrapper.load(device, vki.dispatch.vkGetDeviceProcAddr.?);
-        
+
         var compute_queue: vk.Queue = undefined;
         vkd.dispatch.vkGetDeviceQueue.?(device, best_compute_index, 0, &compute_queue);
 
@@ -221,7 +221,7 @@ pub const Context = struct {
         _ = self.vkd.dispatch.vkWaitForFences.?(self.device, 1, (&fence)[0..1], @enumFromInt(1), std.math.maxInt(u64));
         self.transfer_submit_count += 1;
     }
-    
+
     pub fn copyBuffer(self: *Context, src: Buffer, dst: Buffer, size: u64) !void {
         try self.copyBufferOffset(src, 0, dst, 0, size);
     }
@@ -241,7 +241,7 @@ pub const Buffer = struct {
         var reqs: vk.MemoryRequirements = undefined;
         ctx.vkd.dispatch.vkGetBufferMemoryRequirements.?(ctx.device, b, &reqs);
         const mem_type = try ctx.findMemoryType(reqs.memory_type_bits, props);
-        
+
         var flags = vk.MemoryAllocateFlagsInfo{ .flags = .{ .device_address_bit = true }, .device_mask = 0 };
         const alloc_info = vk.MemoryAllocateInfo{ .p_next = if (usage.shader_device_address_bit) &flags else null, .allocation_size = reqs.size, .memory_type_index = mem_type };
         var memory: vk.DeviceMemory = undefined;
@@ -276,13 +276,7 @@ pub const Pipeline = struct {
         if (res1 != .success) return error.PipelineLayoutCreationFailed;
 
         var pipeline: vk.Pipeline = undefined;
-        const res2 = ctx.vkd.dispatch.vkCreateComputePipelines.?(ctx.device, .null_handle, 1, &[_]vk.ComputePipelineCreateInfo{.{ 
-            .flags = .{},
-            .stage = .{ .flags = .{}, .stage = .{ .compute_bit = true }, .module = shader, .p_name = entry, .p_specialization_info = null }, 
-            .layout = layout, 
-            .base_pipeline_handle = .null_handle, 
-            .base_pipeline_index = -1 
-        }}, null, (&pipeline)[0..1]);
+        const res2 = ctx.vkd.dispatch.vkCreateComputePipelines.?(ctx.device, .null_handle, 1, &[_]vk.ComputePipelineCreateInfo{.{ .flags = .{}, .stage = .{ .flags = .{}, .stage = .{ .compute_bit = true }, .module = shader, .p_name = entry, .p_specialization_info = null }, .layout = layout, .base_pipeline_handle = .null_handle, .base_pipeline_index = -1 }}, null, (&pipeline)[0..1]);
         if (res2 != .success) return error.PipelineCreationFailed;
 
         return Pipeline{ .pipeline = pipeline, .layout = layout };

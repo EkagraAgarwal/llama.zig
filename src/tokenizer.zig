@@ -41,7 +41,7 @@ pub const Tokenizer = struct {
         // 1. Load Vocabulary
         const tokens_val = ctx.kvs.get("tokenizer.ggml.tokens") orelse return error.TokenizerTokensNotFound;
         const tokens_array = tokens_val.array;
-        
+
         tokenizer.id_to_token = try allocator.alloc([]const u8, tokens_array.len);
         for (tokens_array, 0..) |tok, i| {
             const tok_str = try allocator.dupe(u8, tok.string);
@@ -92,7 +92,7 @@ pub const Tokenizer = struct {
                 if (arch_val == .string) {
                     const arch = arch_val.string;
                     tokenizer.use_byte_to_unicode = std.ascii.eqlIgnoreCase(arch, "llama") or
-                                                    std.ascii.eqlIgnoreCase(arch, "granite");
+                        std.ascii.eqlIgnoreCase(arch, "granite");
                 }
             }
         }
@@ -324,7 +324,7 @@ const PreTokenizerIterator = struct {
     pub fn next(self: *PreTokenizerIterator) ?[]const u8 {
         if (self.index >= self.text.len) return null;
         const start = self.index;
-        
+
         var has_space = false;
         var ptr = start;
         if (self.text[ptr] == ' ') {

@@ -253,7 +253,7 @@ pub const GraphBuilder = struct {
             try self.addTensor(qn, f32Size(q_out), .activation);
             try self.addTensor(kn, f32Size(kv_out), .activation);
             try self.addTensor(vn, f32Size(kv_out), .activation);
-            
+
             try self.addNodeP(.copy, &.{qkvn}, qn, (q_out + 63) / 64, 1, q_out, 0, 0, 0, 0);
             try self.addNodeP(.copy, &.{qkvn}, kn, (kv_out + 63) / 64, 1, kv_out, 0, q_out, 0, 0);
             try self.addNodeP(.copy, &.{qkvn}, vn, (kv_out + 63) / 64, 1, kv_out, 0, q_out + kv_out, 0, 0);
@@ -272,7 +272,6 @@ pub const GraphBuilder = struct {
             try self.addNodeP(.matmul, &.{ normed, qw }, qn, (q_out + 15) / 16, 1, 1, q_out, n_embd, 0, 0);
             try self.addNodeP(.matmul, &.{ normed, kw }, kn, (kv_out + 15) / 16, 1, 1, kv_out, n_embd, 0, 0);
             try self.addNodeP(.matmul, &.{ normed, vw }, vn, (kv_out + 15) / 16, 1, 1, kv_out, n_embd, 0, 0);
-
         }
 
         // 3. Optional QKV Biases (Qwen2)
@@ -384,7 +383,7 @@ pub const GraphBuilder = struct {
         try self.addTensor(up, f32Size(u_dims.out), .activation);
         try self.addNodeP(.matmul, &.{ ffn_normed, gw }, gate, (g_dims.out + 15) / 16, 1, 1, g_dims.out, g_dims.in, 0, 0);
         try self.addNodeP(.matmul, &.{ ffn_normed, uw }, up, (u_dims.out + 15) / 16, 1, 1, u_dims.out, u_dims.in, 0, 0);
-        
+
         const activation_op: OpType = if (cfg.activation == .gelu) .gelu_mul else .silu_mul;
         try self.addNode(activation_op, &.{ gate, up }, gate, (g_dims.out + 63) / 64, 1, g_dims.out, 0, 0, 0);
 
@@ -427,7 +426,7 @@ pub const GraphBuilder = struct {
         const out_w = if (has_output_weight) "output.weight" else "token_embd.weight";
         const out_dims = self.matmulDims(out_w, cfg.vocab_size, cfg.n_embd);
         try self.addTensor(out_w, f32Size(out_dims.out * out_dims.in), .weight);
-        
+
         try self.addTensor(logits_name, f32Size(out_dims.out), .activation);
         try self.addNodeP(.matmul, &.{ normed, out_w }, logits_name, (out_dims.out + 15) / 16, 1, 1, out_dims.out, out_dims.in, 0, 0);
 
@@ -515,20 +514,6 @@ pub const Dispatcher = struct {
         return self.kv_cache.address + per_layer * layer;
     }
 
-    fn nodeLayerKey(node: GraphNode) u32 {
-        if (std.mem.startsWith(u8, node.output_name, "blk.")) {
-            var i: usize = 4;
-            var layer: u32 = 0;
-            while (i < node.output_name.len and node.output_name[i] >= '0' and node.output_name[i] <= '9') : (i += 1) {
-                layer = layer * 10 + (node.output_name[i] - '0');
-            }
-            return layer + 1;
-        }
-        if (std.mem.eql(u8, node.output_name, "hidden")) return 0xFFFFFFFE;
-        if (std.mem.eql(u8, node.output_name, "logits")) return 0xFFFFFFFF;
-        return 0;
-    }
-
     fn emitComputeBarrier(self: *Dispatcher, cmd: vk.CommandBuffer) void {
         const barrier = vk.MemoryBarrier{
             .src_access_mask = .{ .shader_write_bit = true },
@@ -562,17 +547,8 @@ pub const Dispatcher = struct {
         };
     }
 
-    fn quantPipelineName(qtype: u32, is_matvec: bool) []const u8 {
-        if (is_matvec) {
-            if (qtype == @intFromEnum(tensor.Type.q8_0)) return "matvec_q8_0";
-            if (qtype == @intFromEnum(tensor.Type.q4_0)) return "matvec_q4_0";
-            if (qtype == @intFromEnum(tensor.Type.q6_k)) return "matvec_q6_k";
-            return "matvec_q4_k";
-        }
-        if (qtype == @intFromEnum(tensor.Type.q8_0)) return "matmul_q8_0";
-        if (qtype == @intFromEnum(tensor.Type.q4_0)) return "matmul_q4_0";
-        if (qtype == @intFromEnum(tensor.Type.q6_k)) return "matmul_q6_k";
-        return "matmul_q4_k";
+    fn quantPipelineName(_: u32, is_matvec: bool) []const u8 {
+        return if (is_matvec) "matvec_q8_0" else "matmul_q8_0";
     }
 
     fn dispatchNode(self: *Dispatcher, cmd: vk.CommandBuffer, node: GraphNode, pos: u32) void {
@@ -805,12 +781,6 @@ pub const Dispatcher = struct {
 
 test "quantized kernel selection is architecture independent" {
     const t = std.testing;
-    try t.expectEqualStrings("matvec_q4_0", Dispatcher.quantPipelineName(@intFromEnum(tensor.Type.q4_0), true));
     try t.expectEqualStrings("matvec_q8_0", Dispatcher.quantPipelineName(@intFromEnum(tensor.Type.q8_0), true));
-    try t.expectEqualStrings("matvec_q4_k", Dispatcher.quantPipelineName(@intFromEnum(tensor.Type.q4_k), true));
-    try t.expectEqualStrings("matvec_q6_k", Dispatcher.quantPipelineName(@intFromEnum(tensor.Type.q6_k), true));
-    try t.expectEqualStrings("matmul_q4_0", Dispatcher.quantPipelineName(@intFromEnum(tensor.Type.q4_0), false));
     try t.expectEqualStrings("matmul_q8_0", Dispatcher.quantPipelineName(@intFromEnum(tensor.Type.q8_0), false));
-    try t.expectEqualStrings("matmul_q4_k", Dispatcher.quantPipelineName(@intFromEnum(tensor.Type.q4_k), false));
-    try t.expectEqualStrings("matmul_q6_k", Dispatcher.quantPipelineName(@intFromEnum(tensor.Type.q6_k), false));
 }

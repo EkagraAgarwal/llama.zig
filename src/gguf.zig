@@ -50,7 +50,7 @@ pub const GGUFContext = struct {
     kvs: std.StringHashMap(MetadataValue),
     tensors: std.StringHashMap(*Tensor),
     data_offset: u64,
-    
+
     pub fn init(allocator: std.mem.Allocator, file: std.Io.File) GGUFContext {
         return GGUFContext{
             .allocator = allocator,
@@ -106,14 +106,14 @@ pub fn loadModel(allocator: std.mem.Allocator, path: []const u8) !GGUFContext {
     const cwd = std.Io.Dir.cwd();
     const io = std.Io.Threaded.global_single_threaded.io();
     const file = try cwd.openFile(io, path, .{ .mode = .read_only });
-    
+
     var ctx = GGUFContext.init(allocator, file);
     errdefer ctx.deinit();
 
     var read_buffer: [8192]u8 = undefined;
     var file_reader = file.readerStreaming(io, &read_buffer);
     const reader = &file_reader.interface;
-    
+
     const magic = try readInt(u32, reader);
     if (magic != GGUFMagic) return error.InvalidMagic;
 
