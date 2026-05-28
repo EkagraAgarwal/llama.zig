@@ -27,7 +27,7 @@ pub const Tokenizer = struct {
     special: SpecialTokens = .{},
     chat_template: ?[]const u8 = null,
     model_name: []const u8 = "unknown",
-    use_byte_to_unicode: bool = true,
+    use_byte_to_unicode: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, ctx: *GGUFContext) !Tokenizer {
         var tokenizer = Tokenizer{
@@ -86,6 +86,14 @@ pub const Tokenizer = struct {
             if (val == .string) {
                 tokenizer.model_name = try allocator.dupe(u8, val.string);
                 tokenizer.use_byte_to_unicode = std.mem.eql(u8, tokenizer.model_name, "gpt2");
+            }
+        } else {
+            if (ctx.kvs.get("general.architecture")) |arch_val| {
+                if (arch_val == .string) {
+                    const arch = arch_val.string;
+                    tokenizer.use_byte_to_unicode = std.ascii.eqlIgnoreCase(arch, "llama") or
+                                                    std.ascii.eqlIgnoreCase(arch, "granite");
+                }
             }
         }
 
