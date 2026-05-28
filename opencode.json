@@ -1,0 +1,27 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "tools": {
+    "websearch": true,
+    "codesearch": true,
+    "grep": true,
+    "glob": true
+  },
+  "agent": {
+    "plan": {
+      "mode": "primary",
+      "model": "deepseek/deepseek-v4-pro"
+    },
+    "build": {
+      "mode": "primary",
+      "model": "minimax-coding-plan/MiniMax-M2.7"
+    },
+    "general": {
+      "mode": "subagent",
+      "model": "deepseek/deepseek-v4-pro"
+    },
+    "explore": {
+      "mode": "subagent",
+      "model": "minimax-coding-plan/MiniMax-M2.7"
+    }
+  }
+}

@@ -239,14 +239,15 @@ fn dequantQ6KRaw(raw: []const u8, dst: []f32) void {
             var l: usize = 0;
             while (l < 32) : (l += 1) {
                 if (out + l + 128 >= dst.len) return;
-                const iss: usize = l / 16;
+                const is: usize = (l / 16) * 4;
+                const scale_base: usize = sc_off + is;
 
-                const sc0: f32 = @as(f32, @floatFromInt(@as(i8, @bitCast(raw[sc_off + iss * 2 + 0]))));
-                const sc1: f32 = @as(f32, @floatFromInt(@as(i8, @bitCast(raw[sc_off + iss * 2 + 1]))));
-                const sc2: f32 = @as(f32, @floatFromInt(@as(i8, @bitCast(raw[sc_off + iss * 2 + 2]))));
-                const sc3: f32 = @as(f32, @floatFromInt(@as(i8, @bitCast(raw[sc_off + iss * 2 + 3]))));
+                const sc0: f32 = @as(f32, @floatFromInt(@as(i8, @bitCast(raw[scale_base + 0]))));
+                const sc1: f32 = @as(f32, @floatFromInt(@as(i8, @bitCast(raw[scale_base + 2]))));
+                const sc2: f32 = @as(f32, @floatFromInt(@as(i8, @bitCast(raw[scale_base + 1]))));
+                const sc3: f32 = @as(f32, @floatFromInt(@as(i8, @bitCast(raw[scale_base + 3]))));
 
-                const qb0: u8 = raw[ql_off + l + 0];
+                const qb0: u8 = raw[ql_off + l];
                 const qb1: u8 = raw[ql_off + l + 32];
                 const qh_b: u8 = raw[qh_off + l];
 
