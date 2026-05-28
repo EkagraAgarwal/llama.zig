@@ -5,7 +5,7 @@ A high-performance port of the `llama.cpp` inference engine to Zig, featuring a 
 ## Features
 
 - **GGUF v3** parser with architecture detection (`llama`, `granite`)
-- **BF16 / F32 / Q4_0 / Q5_0 / Q8_0 / Q4_K** host-side dequantization to FP32 VRAM weights
+- **BF16 / F32 / Q8_0** host-side dequantization to FP32 VRAM weights
 - **Full transformer forward pass**: RMSNorm, Q/K/V projections, RoPE, KV cache, scaled dot-product attention, SwiGLU FFN, LM head
 - **Autoregressive generation** with temperature + top-p sampling
 - **Deterministic sampler RNG lifecycle** with top-k, top-p, min-p, and typical-p filtering
@@ -62,16 +62,13 @@ main.zig
 
 ## Compatibility Matrix
 
-### GGUF quantization ingest/dequant
+### Supported Model Types
 
-| Capability | llama.zig | llama.cpp Vulkan reference parity | Notes |
-|------|------|------|------|
-| `f32` / `f16` / `bf16` | Supported | Matched | Baseline scalar paths |
-| `q4_0` | Supported | Matched | 32-element block dequant on host |
-| `q5_0` | Supported | Matched | 32-element block dequant on host |
-| `q8_0` | Supported | Matched | 32-element block dequant on host |
-| `q4_k` (`q4_k_m` models) | Supported | Matched | Explicitly validated target for Llama 3.2 3B Instruct `q4_k_m` |
-| `q2_k` / `q3_k` / `q5_k` / `q6_k` / `q8_k` | Not yet supported | Not yet matched | Runtime emits actionable unsupported-quant diagnostics |
+Only the following model types are currently supported:
+- **BF16 / F32 / F16** (native precision)
+- **Q8_0** (8-bit quantization)
+
+All other quantization types (`q4_0`, `q5_0`, `q2_k`, `q3_k`, `q4_k`, `q5_k`, `q6_k`, `q8_k`) are not supported.
 
 ### Model architecture and tokenizer/sampler parity
 
@@ -79,11 +76,5 @@ main.zig
 |------|------|------|------|
 | `llama` architecture | Supported | Matched | Base decoder graph path |
 | `granite` architecture | Supported | Matched | BOS metadata + Granite role token handling |
-| Llama 3.2 3B Instruct (`q4_k_m`) | Supported | Matched | Covered by `q4_k` block dequant path |
 | Special token passthrough (`<|...|>`) | Supported | Matched | Encoder preserves known special tokens |
 | Sampler: `top_k`, `top_p`, `min_p`, `typical_p` | Supported | Matched | Stateful deterministic RNG across decode steps |
-
-## Runtime Diagnostics
-
-- Unsupported quantized tensors fail fast with a targeted message that includes the tensor name, quant type, and currently supported dequant paths.
-- Compatibility messaging explicitly calls out `q4_k_m` support (via `q4_k`) for Llama 3.2 3B Instruct models.
