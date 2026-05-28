@@ -296,6 +296,17 @@ test "q6_k dequant raw block shape" {
     try std.testing.expectApproxEqAbs(@as(f32, -32.0), out[96], 0.001);
 }
 
+test "q4_1 dequant raw block shape" {
+    var raw: [20]u8 = [_]u8{0} ** 20;
+    std.mem.writeInt(u16, raw[0..2], @as(u16, 0x3c00), .little);
+    std.mem.writeInt(u16, raw[2..4], @as(u16, 0x0000), .little);
+    raw[4] = 0xF0;
+    var out: [32]f32 = undefined;
+    dequantQ41Raw(&raw, &out);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out[0], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 15.0), out[1], 0.001);
+}
+
 test "q4_0 dequant raw block shape" {
     var raw: [18]u8 = [_]u8{0} ** 18;
     std.mem.writeInt(u16, raw[0..2], @as(u16, 0x3c00), .little);
