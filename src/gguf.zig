@@ -140,8 +140,20 @@ pub fn loadModel(allocator: std.mem.Allocator, path: []const u8) !GGUFContext {
         for (0..n_dims) |i| dims[i] = try readInt(u64, reader);
 
         const tensor_type_int = try readInt(u32, reader);
-        const tensor_type = @as(Type, @enumFromInt(tensor_type_int));
         const offset = try readInt(u64, reader);
+        const tensor_type: Type = switch (tensor_type_int) {
+            0 => .f32,
+            1 => .f16,
+            2 => .q4_0,
+            3 => .q4_1,
+            8 => .q8_0,
+            14 => .q6_k,
+            30 => .bf16,
+            else => {
+                allocator.free(name);
+                continue;
+            },
+        };
 
         var tensor = try Tensor.init(allocator, name, tensor_type, dims);
         tensor.offset = offset;

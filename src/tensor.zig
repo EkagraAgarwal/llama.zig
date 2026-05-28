@@ -3,20 +3,24 @@ const std = @import("std");
 pub const Type = enum(u32) {
     f32 = 0,
     f16 = 1,
+    q4_0 = 2,
+    q4_1 = 3,
     q8_0 = 8,
+    q6_k = 14,
     bf16 = 30,
 
     pub fn sizeOf(self: Type) usize {
         return switch (self) {
             .f32 => 4,
             .f16, .bf16 => 2,
-            else => 1,
+            .q4_0, .q4_1, .q8_0, .q6_k => 1,
         };
     }
 
     pub fn blockSize(self: Type) usize {
         return switch (self) {
-            .q8_0 => 32,
+            .q4_0, .q4_1, .q8_0 => 32,
+            .q6_k => 256,
             else => 1,
         };
     }
@@ -26,6 +30,9 @@ pub const Type = enum(u32) {
             .f32 => 4,
             .f16, .bf16 => 2,
             .q8_0 => 34,
+            .q4_0 => 18,
+            .q4_1 => 20,
+            .q6_k => 210,
         };
     }
 };
@@ -34,9 +41,9 @@ pub const Tensor = struct {
     name: []const u8,
     type: Type,
     n_dims: u32,
-    ne: [4]u64, // number of elements in each dimension
-    nb: [4]u64, // stride in bytes
-    offset: u64, // offset in the data section
+    ne: [4]u64,
+    nb: [4]u64,
+    offset: u64,
     data: ?*anyopaque,
 
     pub fn init(allocator: std.mem.Allocator, name: []const u8, tensor_type: Type, dims: []const u64) !*Tensor {
@@ -70,7 +77,6 @@ pub const Tensor = struct {
         const n_elems = self.ne[0] * self.ne[1] * self.ne[2] * self.ne[3];
         const blk = self.type.blockSize();
         if (blk > 1) {
-            // Quantized: size = ceil(n_elems / blockSize) * bytesPerBlock
             const n_blocks = (n_elems + blk - 1) / blk;
             return n_blocks * self.type.bytesPerBlock();
         }

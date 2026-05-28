@@ -547,8 +547,12 @@ pub const Dispatcher = struct {
         };
     }
 
-    fn quantPipelineName(_: u32, is_matvec: bool) []const u8 {
-        return if (is_matvec) "matvec_q8_0" else "matmul_q8_0";
+    fn quantPipelineName(qtype: u32, is_matvec: bool) []const u8 {
+        const qt: tensor.Type = @enumFromInt(qtype);
+        return if (is_matvec)
+            switch (qt) { .q4_0 => "matvec_q4_0", else => "matvec_q8_0" }
+        else
+            switch (qt) { .q4_0 => "matmul_q4_0", else => "matmul_q8_0" };
     }
 
     fn dispatchNode(self: *Dispatcher, cmd: vk.CommandBuffer, node: GraphNode, pos: u32) void {
