@@ -212,6 +212,8 @@ pub fn main(init: std.process.Init) !void {
     try registry.register(&vk_ctx, "matmul_q4_0", kernels_data.kernels_matmul_q4_0_spv, "main");
     try registry.register(&vk_ctx, "matvec_q4_0", kernels_data.kernels_matvec_q4_0_spv, "main");
     try registry.register(&vk_ctx, "get_rows_q4_0", kernels_data.kernels_get_rows_q4_0_spv, "main");
+    try registry.register(&vk_ctx, "get_rows_q6_k", kernels_data.kernels_get_rows_q6_k_spv, "main");
+    try registry.register(&vk_ctx, "matvec_q6_k", kernels_data.kernels_matvec_q6_k_spv, "main");
     try registry.register(&vk_ctx, "topk", kernels_data.kernels_topk_spv, "main");
     try registry.register(&vk_ctx, "attention_flash", kernels_data.kernels_flash_attn_spv, "main");
     try registry.register(&vk_ctx, "gelu_mul", kernels_data.kernels_gelu_mul_spv, "main");
@@ -750,7 +752,7 @@ pub fn main(init: std.process.Init) !void {
 
 fn isNativeQuantType(tt: @import("tensor.zig").Type) bool {
     return switch (tt) {
-        .q8_0, .q4_0 => true,
+        .q8_0, .q4_0, .q6_k => true,
         else => false,
     };
 }

@@ -538,6 +538,15 @@ pub const Dispatcher = struct {
             .matmul_q => blk: {
                 break :blk quantPipelineName(node.p5, node.p1 <= 1);
             },
+            .get_rows_q => blk: {
+                const qtype = @as(u32, node.p5);
+                const qt: tensor.Type = @enumFromInt(qtype);
+                break :blk switch (qt) {
+                    .q4_0 => "get_rows_q4_0",
+                    .q6_k => "get_rows_q6_k",
+                    else => "get_rows_q",
+                };
+            },
             .attention => blk: {
                 if (node.p4 + 1 >= self.flash_attn_threshold) break :blk "attention_flash";
                 break :blk "attention";
@@ -550,9 +559,9 @@ pub const Dispatcher = struct {
     fn quantPipelineName(qtype: u32, is_matvec: bool) []const u8 {
         const qt: tensor.Type = @enumFromInt(qtype);
         return if (is_matvec)
-            switch (qt) { .q4_0 => "matvec_q4_0", else => "matvec_q8_0" }
+            switch (qt) { .q4_0 => "matvec_q4_0", .q6_k => "matvec_q6_k", else => "matvec_q8_0" }
         else
-            switch (qt) { .q4_0 => "matmul_q4_0", else => "matmul_q8_0" };
+            switch (qt) { .q4_0 => "matmul_q4_0", .q6_k => "matmul_q8_0", else => "matmul_q8_0" };
     }
 
     fn dispatchNode(self: *Dispatcher, cmd: vk.CommandBuffer, node: GraphNode, pos: u32) void {

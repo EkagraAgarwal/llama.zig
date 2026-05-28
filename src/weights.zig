@@ -229,10 +229,10 @@ fn dequantQ6KRaw(raw: []const u8, dst: []f32) void {
     var out: usize = 0;
     var ib: usize = 0;
     while (out < dst.len and ib + BPR <= raw.len) {
-        const d = f16ToF32(std.mem.readInt(u16, raw[ib..][0..2], .little));
-        var sc_off: usize = ib + 2;
-        var ql_off: usize = ib + 18;
-        var qh_off: usize = ib + 146;
+        const d = f16ToF32(std.mem.readInt(u16, raw[ib + 208 ..][0..2], .little));
+        var ql_off: usize = ib;
+        var qh_off: usize = ib + 128;
+        var sc_off: usize = ib + 192;
 
         var n: usize = 0;
         while (n < QK and out < dst.len) : (n += 128) {
@@ -281,6 +281,19 @@ test "q8_0 dequant raw block shape" {
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), out[0], 0.001);
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), out[1], 0.001);
     try std.testing.expectApproxEqAbs(@as(f32, -1.0), out[2], 0.001);
+}
+
+test "q6_k dequant raw block shape" {
+    var raw: [210]u8 = [_]u8{0} ** 210;
+    std.mem.writeInt(u16, raw[208..][0..2], @as(u16, 0x3c00), .little);
+    for (192..208) |i| raw[i] = 1;
+    var out: [256]f32 = undefined;
+    dequantQ6KRaw(&raw, &out);
+    try std.testing.expectApproxEqAbs(@as(f32, -32.0), out[0], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, -32.0), out[1], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, -32.0), out[32], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, -32.0), out[64], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, -32.0), out[96], 0.001);
 }
 
 test "q4_0 dequant raw block shape" {
