@@ -734,7 +734,12 @@ pub const Dispatcher = struct {
         @as(*u32, @ptrCast(@alignCast(mapped))).* = token_id;
         self.ctx.vkd.unmapMemory(self.ctx.device, indices_buf.memory);
 
-        const pipe = self.registry.get("get_rows_q") orelse return error.MissingPipeline;
+                const pipe_name = switch (qtype) {
+            @intFromEnum(tensor.Type.q4_0) => "get_rows_q4_0",
+            @intFromEnum(tensor.Type.q6_k) => "get_rows_q6_k",
+            else => "get_rows_q",
+        };
+        const pipe = self.registry.get(pipe_name) orelse return error.MissingPipeline;
         var pc = vulkan.PushConstants{
             .p1 = n_embd,
             .p2 = 1,
