@@ -194,8 +194,8 @@ fn dequantQ40Raw(raw: []const u8, dst: []f32) void {
         var j: usize = 0;
         while (j < QK and out < dst.len) : (j += 1) {
             const qb: u8 = raw[ib + j / 2];
-            const shifted: u4 = @truncate(qb >> (4 * @as(u3, @intCast(j & 1))));
-            const qv: i8 = @bitCast(@as(u8, shifted) | @as(u8, if (shifted & 0x8 != 0) 0xF0 else 0));
+            const nibble: u4 = @truncate(qb >> (4 * @as(u3, @intCast(j & 1))));
+            const qv: i32 = @as(i32, @intCast(nibble)) - 8;
             dst[out] = d * @as(f32, @floatFromInt(qv));
             out += 1;
         }
@@ -238,12 +238,13 @@ fn dequantQ6KRaw(raw: []const u8, dst: []f32) void {
         while (n < QK and out < dst.len) : (n += 128) {
             var l: usize = 0;
             while (l < 32) : (l += 1) {
-                if (out + l >= dst.len) return;
-                const iss: u8 = @intCast(l / 16);
-                const sc0: f32 = @as(f32, @floatFromInt(@as(i8, @bitCast(raw[sc_off + @as(usize, iss) * 2 + 0]))));
-                const sc1: f32 = @as(f32, @floatFromInt(@as(i8, @bitCast(raw[sc_off + @as(usize, iss) * 2 + 2]))));
-                const sc2: f32 = @as(f32, @floatFromInt(@as(i8, @bitCast(raw[sc_off + @as(usize, iss) * 2 + 4]))));
-                const sc3: f32 = @as(f32, @floatFromInt(@as(i8, @bitCast(raw[sc_off + @as(usize, iss) * 2 + 6]))));
+                if (out + l + 128 >= dst.len) return;
+                const iss: usize = l / 16;
+
+                const sc0: f32 = @as(f32, @floatFromInt(@as(i8, @bitCast(raw[sc_off + iss * 2 + 0]))));
+                const sc1: f32 = @as(f32, @floatFromInt(@as(i8, @bitCast(raw[sc_off + iss * 2 + 1]))));
+                const sc2: f32 = @as(f32, @floatFromInt(@as(i8, @bitCast(raw[sc_off + iss * 2 + 2]))));
+                const sc3: f32 = @as(f32, @floatFromInt(@as(i8, @bitCast(raw[sc_off + iss * 2 + 3]))));
 
                 const qb0: u8 = raw[ql_off + l + 0];
                 const qb1: u8 = raw[ql_off + l + 32];
@@ -288,6 +289,6 @@ test "q4_0 dequant raw block shape" {
     raw[3] = 0x01;
     var out: [32]f32 = undefined;
     dequantQ40Raw(&raw, &out);
-    try std.testing.expectApproxEqAbs(@as(f32, -8.0), out[0], 0.001);
-    try std.testing.expectApproxEqAbs(@as(f32, 7.0), out[1], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out[0], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, -1.0), out[1], 0.001);
 }

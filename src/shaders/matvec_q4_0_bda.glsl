@@ -43,7 +43,7 @@ float f16ToF32(uint h) {
 }
 
 int extendSign4(uint v) {
-    return (int(v) << 28) >> 28;
+    return int(v) - 8;
 }
 
 float q40BlockDot(uint row, uint block, uint k_rem) {
