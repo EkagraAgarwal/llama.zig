@@ -147,6 +147,7 @@ pub fn loadModel(allocator: std.mem.Allocator, path: []const u8) !GGUFContext {
             2 => .q4_0,
             3 => .q4_1,
             8 => .q8_0,
+            12 => .q4_k,
             14 => .q6_k,
             30 => .bf16,
             else => {

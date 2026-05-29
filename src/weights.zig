@@ -4,7 +4,7 @@ const tensor = @import("tensor.zig");
 
 pub fn isSupportedType(tt: tensor.Type) bool {
     return switch (tt) {
-        .f32, .f16, .bf16, .q8_0, .q4_0, .q4_1, .q6_k => true,
+        .f32, .f16, .bf16, .q8_0, .q4_0, .q4_1, .q4_k, .q6_k => true,
         else => false,
     };
 }
@@ -49,6 +49,7 @@ pub fn dequantToF32(ctx: *gguf.GGUFContext, t: *tensor.Tensor, dst: []f32) !void
         .q8_0 => try dequantQ80(ctx, t, dst[0..n]),
         .q4_0 => try dequantQ40(ctx, t, dst[0..n]),
         .q4_1 => try dequantQ41(ctx, t, dst[0..n]),
+        .q4_k => try dequantQ4K(ctx, t, dst[0..n]),
         .q6_k => try dequantQ6K(ctx, t, dst[0..n]),
     }
 }
@@ -79,6 +80,67 @@ fn dequantQ6K(ctx: *gguf.GGUFContext, t: *tensor.Tensor, dst: []f32) !void {
     defer ctx.allocator.free(raw);
     try ctx.readTensorData(t, raw);
     dequantQ6KRaw(raw, dst);
+}
+
+fn dequantQ4K(ctx: *gguf.GGUFContext, t: *tensor.Tensor, dst: []f32) !void {
+    const raw = try ctx.allocator.alloc(u8, t.size());
+    defer ctx.allocator.free(raw);
+    try ctx.readTensorData(t, raw);
+    dequantQ4KRaw(raw, dst);
+}
+
+fn dequantQ4KRaw(raw: []const u8, dst: []f32) void {
+    const QK: usize = 256;
+    const BPR: usize = 144;
+    var out: usize = 0;
+    var ib: usize = 0;
+    while (out < dst.len and ib + BPR <= raw.len) {
+        const d = f16ToF32(std.mem.readInt(u16, raw[ib..][0..2], .little));
+        const min = f16ToF32(std.mem.readInt(u16, raw[ib + 2 ..][0..2], .little));
+        const scales = raw[ib + 4 .. ib + 16];
+        const qs = raw[ib + 16 .. ib + 144];
+
+        var is: usize = 0;
+        var j: usize = 0;
+        while (j < QK and out < dst.len) : (j += 64) {
+            var sc: [2]f32 = undefined;
+            var mn: [2]f32 = undefined;
+            for (0..2) |k| {
+                const idx = is + k;
+                const sc_raw: u8 = if (idx < 4) scales[idx] & 63 else (scales[idx + 4] & 0xF) | ((scales[idx - 4] >> 6) << 4);
+                const mn_raw: u8 = if (idx < 4) scales[idx + 4] & 63 else (scales[idx + 4] >> 4) | ((scales[idx - 0] >> 6) << 4);
+                sc[k] = d * @as(f32, @floatFromInt(sc_raw));
+                mn[k] = min * @as(f32, @floatFromInt(mn_raw));
+            }
+            const qbase = j / 2;
+            var l: usize = 0;
+            while (l < 32) : (l += 1) {
+                if (out >= dst.len) break;
+                dst[out] = sc[0] * @as(f32, @floatFromInt(qs[qbase + l] & 0xF)) - mn[0];
+                out += 1;
+            }
+            l = 0;
+            while (l < 32) : (l += 1) {
+                if (out >= dst.len) break;
+                dst[out] = sc[1] * @as(f32, @floatFromInt(qs[qbase + l] >> 4)) - mn[1];
+                out += 1;
+            }
+            is += 2;
+        }
+        ib += BPR;
+    }
+}
+
+fn unpack6Bit(scales: []const u8, idx: usize) u8 {
+    const bit_offset: usize = idx * 6;
+    const byte_idx = bit_offset / 8;
+    const shift = @as(u3, @intCast(bit_offset % 8));
+    if (shift <= 2) {
+        return @truncate(scales[byte_idx] >> shift);
+    }
+    const lo: u16 = scales[byte_idx];
+    const hi: u16 = @as(u16, scales[byte_idx + 1]) << 8;
+    return @truncate((lo | hi) >> shift);
 }
 
 pub fn readEmbeddingF32(ctx: *gguf.GGUFContext, t: *tensor.Tensor, token_id: u32, dst: []f32, n_embd: u32, scale: f32) !void {
@@ -141,6 +203,14 @@ pub fn readEmbeddingF32(ctx: *gguf.GGUFContext, t: *tensor.Tensor, token_id: u32
             const off = t.offset + @as(u64, token_id) * row_bytes;
             _ = try ctx.file.readPositionalAll(std.Io.Threaded.global_single_threaded.io(), raw, ctx.data_offset + off);
             dequantQ6KRaw(raw, dst[0..n_embd]);
+        },
+        .q4_k => {
+            const row_bytes = quantRowBytes(t.type, n_embd) orelse return error.UnsupportedQuantType;
+            const raw = try ctx.allocator.alloc(u8, row_bytes);
+            defer ctx.allocator.free(raw);
+            const off = t.offset + @as(u64, token_id) * row_bytes;
+            _ = try ctx.file.readPositionalAll(std.Io.Threaded.global_single_threaded.io(), raw, ctx.data_offset + off);
+            dequantQ4KRaw(raw, dst[0..n_embd]);
         },
         else => return error.UnsupportedQuantType,
     }
@@ -258,28 +328,31 @@ fn dequantQ6KRaw(raw: []const u8, dst: []f32) void {
         while (n < QK and out < dst.len) : (n += 128) {
             var l: usize = 0;
             while (l < 32) : (l += 1) {
-                if (out + l + 128 >= dst.len) return;
-                const is: usize = (l / 16) * 4;
-                const scale_base: usize = sc_off + is;
+                if (out + l + 96 >= dst.len) break;
+                const is = l / 16;
+                const ql_lo = raw[ql_off + l];
+                const ql_hi = raw[ql_off + l + 32];
+                const qh_v = raw[qh_off + l];
 
-                const sc0: f32 = @as(f32, @floatFromInt(@as(i8, @bitCast(raw[scale_base + 0]))));
-                const sc1: f32 = @as(f32, @floatFromInt(@as(i8, @bitCast(raw[scale_base + 2]))));
-                const sc2: f32 = @as(f32, @floatFromInt(@as(i8, @bitCast(raw[scale_base + 1]))));
-                const sc3: f32 = @as(f32, @floatFromInt(@as(i8, @bitCast(raw[scale_base + 3]))));
+                const rq1 = (ql_lo & 0xF) | ((qh_v & 3) << 4);
+                const rq2 = (ql_hi & 0xF) | (((qh_v >> 2) & 3) << 4);
+                const rq3 = (ql_lo >> 4) | (((qh_v >> 4) & 3) << 4);
+                const rq4 = (ql_hi >> 4) | (((qh_v >> 6) & 3) << 4);
 
-                const qb0: u8 = raw[ql_off + l];
-                const qb1: u8 = raw[ql_off + l + 32];
-                const qh_b: u8 = raw[qh_off + l];
+                const q1: f32 = @floatFromInt(@as(i16, @intCast(rq1)) - 32);
+                const q2: f32 = @floatFromInt(@as(i16, @intCast(rq2)) - 32);
+                const q3: f32 = @floatFromInt(@as(i16, @intCast(rq3)) - 32);
+                const q4: f32 = @floatFromInt(@as(i16, @intCast(rq4)) - 32);
 
-                const q1: i8 = @as(i8, @bitCast((qb0 & 0xF) | ((qh_b & 0x03) << 4))) - 32;
-                const q2: i8 = @as(i8, @bitCast((qb0 >> 4) | (((qh_b >> 2) & 0x03) << 4))) - 32;
-                const q3: i8 = @as(i8, @bitCast((qb1 & 0xF) | (((qh_b >> 4) & 0x03) << 4))) - 32;
-                const q4: i8 = @as(i8, @bitCast((qb1 >> 4) | (((qh_b >> 6) & 0x03) << 4))) - 32;
+                const s0: f32 = @floatFromInt(@as(i8, @bitCast(raw[sc_off + is])));
+                const s2: f32 = @floatFromInt(@as(i8, @bitCast(raw[sc_off + is + 2])));
+                const s4: f32 = @floatFromInt(@as(i8, @bitCast(raw[sc_off + is + 4])));
+                const s6: f32 = @floatFromInt(@as(i8, @bitCast(raw[sc_off + is + 6])));
 
-                dst[out + l + 0] = d * sc0 * @as(f32, @floatFromInt(q1));
-                dst[out + l + 32] = d * sc1 * @as(f32, @floatFromInt(q2));
-                dst[out + l + 64] = d * sc2 * @as(f32, @floatFromInt(q3));
-                dst[out + l + 96] = d * sc3 * @as(f32, @floatFromInt(q4));
+                dst[out + l + 0] = d * s0 * q1;
+                dst[out + l + 32] = d * s2 * q2;
+                dst[out + l + 64] = d * s4 * q3;
+                dst[out + l + 96] = d * s6 * q4;
             }
             out += 128;
             sc_off += 8;
@@ -390,4 +463,56 @@ test "q4_0 row dot matches dequantized row dot across rows" {
         const actual = try dotQ40RowRaw(&raw, row_index, cols, &input);
         try std.testing.expectApproxEqAbs(expected, actual, 0.0001);
     }
+}
+
+test "q4_k dequant raw block shape" {
+    var raw: [144]u8 = [_]u8{0} ** 144;
+    std.mem.writeInt(u16, raw[0..2], @as(u16, 0x3c00), .little);
+    std.mem.writeInt(u16, raw[2..4], @as(u16, 0x0000), .little);
+    for (0..16) |i| raw[4 + i] = 0xFF;
+    raw[16] = 0x11;
+    var out: [256]f32 = undefined;
+    dequantQ4KRaw(&raw, &out);
+    try std.testing.expect(out[0] != 0.0);
+}
+
+test "q4_k dequant raw with non-trivial scale and min" {
+    var raw: [144]u8 = [_]u8{0} ** 144;
+    std.mem.writeInt(u16, raw[0..2], @as(u16, 0x4000), .little);
+    std.mem.writeInt(u16, raw[2..4], @as(u16, 0x0000), .little);
+    raw[4] = 0x02;
+    raw[16] = 0x11;
+    var out: [256]f32 = undefined;
+    dequantQ4KRaw(&raw, &out);
+    try std.testing.expectApproxEqAbs(@as(f32, 4.0), out[0], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out[32], 0.001);
+}
+
+test "q4_k quantRowBytes" {
+    const row_bytes = quantRowBytes(.q4_k, 4096);
+    try std.testing.expectEqual(@as(usize, 2304), row_bytes);
+}
+
+test "q4_k dequant output is non-zero and finite" {
+    var raw: [144]u8 = [_]u8{0} ** 144;
+    std.mem.writeInt(u16, raw[0..2], @as(u16, 0x3c00), .little);
+    std.mem.writeInt(u16, raw[2..4], @as(u16, 0x0000), .little);
+    for (0..12) |i| raw[4 + i] = 0x20;
+    raw[16] = 0x11;
+    var out: [256]f32 = undefined;
+    dequantQ4KRaw(&raw, &out);
+    try std.testing.expect(out[0] != 0.0);
+    try std.testing.expect(std.math.isFinite(out[0]));
+}
+
+test "q4_k dequant matches expected non-zero output" {
+    var raw: [144]u8 = [_]u8{0} ** 144;
+    std.mem.writeInt(u16, raw[0..2], @as(u16, 0x3c00), .little);
+    std.mem.writeInt(u16, raw[2..4], @as(u16, 0x0000), .little);
+    raw[4] = 0xFF;
+    raw[8] = 0xFF;
+    raw[16] = 0x11;
+    var out: [256]f32 = undefined;
+    dequantQ4KRaw(&raw, &out);
+    try std.testing.expect(out[0] > 0.0);
 }

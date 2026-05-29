@@ -218,6 +218,9 @@ pub fn main(init: std.process.Init) !void {
     try registry.register(&vk_ctx, "matvec_q4_1", kernels_data.kernels_matvec_q4_1_spv, "main");
     try registry.register(&vk_ctx, "matmul_q4_1", kernels_data.kernels_matmul_q4_1_spv, "main");
     try registry.register(&vk_ctx, "get_rows_q4_1", kernels_data.kernels_get_rows_q4_1_spv, "main");
+    try registry.register(&vk_ctx, "get_rows_q4_k", kernels_data.kernels_get_rows_q4_k_spv, "main");
+    try registry.register(&vk_ctx, "matvec_q4_k", kernels_data.kernels_matvec_q4_k_spv, "main");
+    try registry.register(&vk_ctx, "matmul_q4_k", kernels_data.kernels_matmul_q4_k_spv, "main");
     try registry.register(&vk_ctx, "get_rows_q6_k", kernels_data.kernels_get_rows_q6_k_spv, "main");
     try registry.register(&vk_ctx, "matvec_q6_k", kernels_data.kernels_matvec_q6_k_spv, "main");
     try registry.register(&vk_ctx, "topk", kernels_data.kernels_topk_spv, "main");
@@ -303,8 +306,8 @@ pub fn main(init: std.process.Init) !void {
         const upload_size = if (gt) |t|
             if (isNativeQuantType(t.type))
                 t.size()
-            else if (t.type == .q4_0)
-                (t.ne[0] * t.ne[1] * t.ne[2] * t.ne[3]) * 2
+            else if (t.type == .q4_0 or t.type == .q4_k)
+                model.weightF32Size(t)
             else
                 model.weightF32Size(t)
         else
@@ -366,7 +369,7 @@ pub fn main(init: std.process.Init) !void {
             if (ctx.tensors.get("token_embd.weight")) |t| {
                 const upload_size = if (isNativeQuantType(t.type))
                     t.size()
-                else if (t.type == .q4_0)
+                else if (t.type == .q4_0 or t.type == .q4_k)
                     (t.ne[0] * t.ne[1] * t.ne[2] * t.ne[3]) * 2
                 else
                     model.weightF32Size(t);
@@ -386,27 +389,29 @@ pub fn main(init: std.process.Init) !void {
                     @memcpy(@as([*]u8, @ptrCast(mapped))[0..raw_size], raw);
                     vk_ctx.vkd.unmapMemory(vk_ctx.device, weight_staging.memory);
                     try vk_ctx.copyBuffer(weight_staging, gt_entry.buffer.?.*, raw_size);
+                } else if (t.type == .q4_0 or t.type == .q4_k) {
+                    const n = t.ne[0] * t.ne[1] * t.ne[2] * t.ne[3];
+                    const f32_data = try allocator.alloc(f32, n);
+                    defer allocator.free(f32_data);
+                    try weights.dequantToF32(&ctx, t, f32_data);
+                    const f16_size = n * 2;
+                    const f16_data = try allocator.alloc(u16, n);
+                    defer allocator.free(f16_data);
+                    for (f32_data, 0..) |v, i| f16_data[i] = @bitCast(@as(f16, @floatCast(v)));
+                    const mapped = try vk_ctx.vkd.mapMemory(vk_ctx.device, weight_staging.memory, 0, f16_size, .{});
+                    @memcpy(@as([*]u8, @ptrCast(mapped))[0..f16_size], std.mem.sliceAsBytes(f16_data));
+                    vk_ctx.vkd.unmapMemory(vk_ctx.device, weight_staging.memory);
+                    try vk_ctx.copyBuffer(weight_staging, gt_entry.buffer.?.*, f16_size);
                 } else {
                     const n = t.ne[0] * t.ne[1] * t.ne[2] * t.ne[3];
                     const f32_data = try allocator.alloc(f32, n);
                     defer allocator.free(f32_data);
                     try weights.dequantToF32(&ctx, t, f32_data);
-                    if (t.type == .q4_0) {
-                        const f16_size = n * 2;
-                        const f16_data = try allocator.alloc(u16, n);
-                        defer allocator.free(f16_data);
-                        for (f32_data, 0..) |v, i| f16_data[i] = @bitCast(@as(f16, @floatCast(v)));
-                        const mapped = try vk_ctx.vkd.mapMemory(vk_ctx.device, weight_staging.memory, 0, f16_size, .{});
-                        @memcpy(@as([*]u8, @ptrCast(mapped))[0..f16_size], std.mem.sliceAsBytes(f16_data));
-                        vk_ctx.vkd.unmapMemory(vk_ctx.device, weight_staging.memory);
-                        try vk_ctx.copyBuffer(weight_staging, gt_entry.buffer.?.*, f16_size);
-                    } else {
-                        const f32_size = model.weightF32Size(t);
-                        const mapped = try vk_ctx.vkd.mapMemory(vk_ctx.device, weight_staging.memory, 0, f32_size, .{});
-                        @memcpy(@as([*]u8, @ptrCast(mapped))[0..f32_size], std.mem.sliceAsBytes(f32_data));
-                        vk_ctx.vkd.unmapMemory(vk_ctx.device, weight_staging.memory);
-                        try vk_ctx.copyBuffer(weight_staging, gt_entry.buffer.?.*, f32_size);
-                    }
+                    const f32_size = model.weightF32Size(t);
+                    const mapped = try vk_ctx.vkd.mapMemory(vk_ctx.device, weight_staging.memory, 0, f32_size, .{});
+                    @memcpy(@as([*]u8, @ptrCast(mapped))[0..f32_size], std.mem.sliceAsBytes(f32_data));
+                    vk_ctx.vkd.unmapMemory(vk_ctx.device, weight_staging.memory);
+                    try vk_ctx.copyBuffer(weight_staging, gt_entry.buffer.?.*, f32_size);
                 }
             }
         }
@@ -803,7 +808,7 @@ fn isNativeQuantType(tt: @import("tensor.zig").Type) bool {
     return switch (tt) {
         // Q4_0 remains on the host dequant path until the Vulkan kernels match
         // the CPU/Zinc reference numerically.
-        .q8_0, .q4_1, .q6_k => true,
+        .q8_0, .q4_1, .q4_k => true,
         else => false,
     };
 }
