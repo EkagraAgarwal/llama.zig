@@ -66,9 +66,11 @@ main.zig
 
 Only the following model types are currently supported:
 - **BF16 / F32 / F16** (native precision)
-- **Q8_0** (8-bit quantization)
+- **Q8_0** (native 8-bit quantization)
+- **Q4_K** (native K-quantization)
+- **Q6_K** (hybrid CPU-dequantization fallback)
 
-All other quantization types (`q4_0`, `q5_0`, `q2_k`, `q3_k`, `q4_k`, `q5_k`, `q6_k`, `q8_k`) are not supported.
+All other quantization types (`q4_0`, `q5_0`, `q2_k`, `q3_k`, `q5_k`, `q8_k`) are not supported.
 
 ### Model architecture and tokenizer/sampler parity
 
