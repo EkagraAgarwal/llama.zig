@@ -35,15 +35,7 @@ uint getU16(UIntBuffer buf, uint idx) {
 }
 
 float f16ToF32(uint h) {
-    uint s = (h >> 15u) & 1u;
-    uint e = (h >> 10u) & 0x1Fu;
-    uint m = h & 0x3FFu;
-    if (e == 0u) {
-        if (m == 0u) return uintBitsToFloat(s << 31u);
-        return uintBitsToFloat(s << 31u) + float(m) * exp2(-24.0);
-    }
-    if (e == 31u) return uintBitsToFloat((s << 31u) | 0x7F800000u | (m << 13u));
-    return uintBitsToFloat((s << 31u) | ((e + 112u) << 23u) | (m << 13u));
+    return unpackHalf2x16(h).x;
 }
 
 float bf16ToF32(uint h) {
@@ -59,9 +51,10 @@ float q40At(uint row_base, uint kidx) {
     uint i = kidx % 32u;
     uint base = row_base + b * 18u;
     float d = f16ToF32(getU16(pc.weights, base + 0u));
-    uint qb = getByte(pc.weights, base + 2u + i / 2u);
+    uint byte_idx = i % 16u;
+    uint qb = getByte(pc.weights, base + 2u + byte_idx);
     int qv;
-    if ((i & 1u) == 0u) {
+    if (i < 16u) {
         qv = extendSign4(qb & 0x0Fu);
     } else {
         qv = extendSign4(qb >> 4);

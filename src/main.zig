@@ -8,6 +8,7 @@ const model = @import("model.zig");
 const weights = @import("weights.zig");
 const sampler = @import("sampler.zig");
 const builtin = @import("builtin");
+const vk = @import("vulkan");
 const windows = if (builtin.os.tag == .windows) std.os.windows else struct {};
 
 fn nowNs() u64 {
@@ -208,6 +209,8 @@ pub fn main(init: std.process.Init) !void {
     try registry.register(&vk_ctx, "scaled_add", kernels_data.kernels_scaled_add_spv, "main");
     try registry.register(&vk_ctx, "matmul_q8_0", kernels_data.kernels_matmul_q8_0_spv, "main");
     try registry.register(&vk_ctx, "matvec_q8_0", kernels_data.kernels_matvec_q8_0_spv, "main");
+    try registry.register(&vk_ctx, "matmul_f16", kernels_data.kernels_matmul_f16_spv, "main");
+    try registry.register(&vk_ctx, "matvec_f16", kernels_data.kernels_matvec_f16_spv, "main");
     try registry.register(&vk_ctx, "get_rows_q", kernels_data.kernels_get_rows_q_spv, "main");
     try registry.register(&vk_ctx, "matmul_q4_0", kernels_data.kernels_matmul_q4_0_spv, "main");
     try registry.register(&vk_ctx, "matvec_q4_0", kernels_data.kernels_matvec_q4_0_spv, "main");
@@ -253,11 +256,16 @@ pub fn main(init: std.process.Init) !void {
     const graph_cost = compute_graph.estimateGraphCost(&graph);
 
     // Convert eligible matmul nodes to quantized matmul path.
+    var uses_q4_0_f16_fallback = false;
     for (graph.nodes.items) |*node| {
         if (node.op_type != .matmul or node.input_names.len < 2) continue;
         const w_name = node.input_names[1];
         const w_t = ctx.tensors.get(w_name) orelse continue;
-        if (isNativeQuantType(w_t.type)) {
+        if (w_t.type == .q4_0) {
+            node.op_type = .matmul_q;
+            node.p5 = compute_graph.q4_0_f16_fallback_qtype;
+            uses_q4_0_f16_fallback = true;
+        } else if (isNativeQuantType(w_t.type)) {
             node.op_type = .matmul_q;
             node.p5 = @intFromEnum(w_t.type);
         }
@@ -293,10 +301,17 @@ pub fn main(init: std.process.Init) !void {
             try writer.print("[verbose] weight not in GGUF: {s}\n", .{entry.key_ptr.*});
         }
         const upload_size = if (gt) |t|
-            if (isNativeQuantType(t.type)) t.size() else model.weightF32Size(t)
+            if (isNativeQuantType(t.type))
+                t.size()
+            else if (t.type == .q4_0)
+                (t.ne[0] * t.ne[1] * t.ne[2] * t.ne[3]) * 2
+            else
+                model.weightF32Size(t)
         else
             entry.value_ptr.size;
-        const buf = try vulkan.Buffer.init(&vk_ctx, upload_size, .{ .storage_buffer_bit = true, .shader_device_address_bit = true, .transfer_dst_bit = true }, .{ .device_local_bit = true });
+        const buf_usage = vk.BufferUsageFlags{ .storage_buffer_bit = true, .shader_device_address_bit = true, .transfer_dst_bit = true };
+        const buf_props: vk.MemoryPropertyFlags = .{ .device_local_bit = true };
+        const buf = try vulkan.Buffer.init(&vk_ctx, upload_size, buf_usage, buf_props);
         entry.value_ptr.buffer = try allocator.create(vulkan.Buffer);
         entry.value_ptr.buffer.?.* = buf;
         try weight_buffers.append(allocator, buf);
@@ -325,11 +340,22 @@ pub fn main(init: std.process.Init) !void {
                     }
                     return err;
                 };
-                const f32_size = model.weightF32Size(t);
-                const mapped = try vk_ctx.vkd.mapMemory(vk_ctx.device, weight_staging.memory, 0, f32_size, .{});
-                @memcpy(@as([*]u8, @ptrCast(mapped))[0..f32_size], std.mem.sliceAsBytes(f32_data));
-                vk_ctx.vkd.unmapMemory(vk_ctx.device, weight_staging.memory);
-                try vk_ctx.copyBuffer(weight_staging, buf, f32_size);
+                if (t.type == .q4_0) {
+                    const f16_size = n * 2;
+                    const f16_data = try allocator.alloc(u16, n);
+                    defer allocator.free(f16_data);
+                    for (f32_data, 0..) |v, i| f16_data[i] = @bitCast(@as(f16, @floatCast(v)));
+                    const mapped = try vk_ctx.vkd.mapMemory(vk_ctx.device, weight_staging.memory, 0, f16_size, .{});
+                    @memcpy(@as([*]u8, @ptrCast(mapped))[0..f16_size], std.mem.sliceAsBytes(f16_data));
+                    vk_ctx.vkd.unmapMemory(vk_ctx.device, weight_staging.memory);
+                    try vk_ctx.copyBuffer(weight_staging, buf, f16_size);
+                } else {
+                    const f32_size = model.weightF32Size(t);
+                    const mapped = try vk_ctx.vkd.mapMemory(vk_ctx.device, weight_staging.memory, 0, f32_size, .{});
+                    @memcpy(@as([*]u8, @ptrCast(mapped))[0..f32_size], std.mem.sliceAsBytes(f32_data));
+                    vk_ctx.vkd.unmapMemory(vk_ctx.device, weight_staging.memory);
+                    try vk_ctx.copyBuffer(weight_staging, buf, f32_size);
+                }
             }
         }
     }
@@ -338,7 +364,12 @@ pub fn main(init: std.process.Init) !void {
     if (!has_output) {
         if (graph.tensors.getPtr("token_embd.weight")) |gt_entry| {
             if (ctx.tensors.get("token_embd.weight")) |t| {
-                const upload_size = if (isNativeQuantType(t.type)) t.size() else model.weightF32Size(t);
+                const upload_size = if (isNativeQuantType(t.type))
+                    t.size()
+                else if (t.type == .q4_0)
+                    (t.ne[0] * t.ne[1] * t.ne[2] * t.ne[3]) * 2
+                else
+                    model.weightF32Size(t);
                 if (gt_entry.buffer == null) {
                     const buf = try vulkan.Buffer.init(&vk_ctx, upload_size, .{ .storage_buffer_bit = true, .shader_device_address_bit = true, .transfer_dst_bit = true }, .{ .device_local_bit = true });
                     gt_entry.buffer = try allocator.create(vulkan.Buffer);
@@ -360,11 +391,22 @@ pub fn main(init: std.process.Init) !void {
                     const f32_data = try allocator.alloc(f32, n);
                     defer allocator.free(f32_data);
                     try weights.dequantToF32(&ctx, t, f32_data);
-                    const f32_size = model.weightF32Size(t);
-                    const mapped = try vk_ctx.vkd.mapMemory(vk_ctx.device, weight_staging.memory, 0, f32_size, .{});
-                    @memcpy(@as([*]u8, @ptrCast(mapped))[0..f32_size], std.mem.sliceAsBytes(f32_data));
-                    vk_ctx.vkd.unmapMemory(vk_ctx.device, weight_staging.memory);
-                    try vk_ctx.copyBuffer(weight_staging, gt_entry.buffer.?.*, f32_size);
+                    if (t.type == .q4_0) {
+                        const f16_size = n * 2;
+                        const f16_data = try allocator.alloc(u16, n);
+                        defer allocator.free(f16_data);
+                        for (f32_data, 0..) |v, i| f16_data[i] = @bitCast(@as(f16, @floatCast(v)));
+                        const mapped = try vk_ctx.vkd.mapMemory(vk_ctx.device, weight_staging.memory, 0, f16_size, .{});
+                        @memcpy(@as([*]u8, @ptrCast(mapped))[0..f16_size], std.mem.sliceAsBytes(f16_data));
+                        vk_ctx.vkd.unmapMemory(vk_ctx.device, weight_staging.memory);
+                        try vk_ctx.copyBuffer(weight_staging, gt_entry.buffer.?.*, f16_size);
+                    } else {
+                        const f32_size = model.weightF32Size(t);
+                        const mapped = try vk_ctx.vkd.mapMemory(vk_ctx.device, weight_staging.memory, 0, f32_size, .{});
+                        @memcpy(@as([*]u8, @ptrCast(mapped))[0..f32_size], std.mem.sliceAsBytes(f32_data));
+                        vk_ctx.vkd.unmapMemory(vk_ctx.device, weight_staging.memory);
+                        try vk_ctx.copyBuffer(weight_staging, gt_entry.buffer.?.*, f32_size);
+                    }
                 }
             }
         }
@@ -373,7 +415,11 @@ pub fn main(init: std.process.Init) !void {
     var scratchpad = try vulkan.Buffer.init(&vk_ctx, graph.scratchpad_size, .{ .storage_buffer_bit = true, .shader_device_address_bit = true, .transfer_src_bit = true, .transfer_dst_bit = true }, .{ .device_local_bit = true });
     defer scratchpad.deinit(&vk_ctx);
 
-    var kv_cache = try vulkan.Buffer.init(&vk_ctx, graph.kv_cache_size, .{ .storage_buffer_bit = true, .shader_device_address_bit = true }, .{ .device_local_bit = true });
+    const kv_props: vk.MemoryPropertyFlags = if (uses_q4_0_f16_fallback)
+        .{ .host_visible_bit = true, .host_coherent_bit = true }
+    else
+        .{ .device_local_bit = true };
+    var kv_cache = try vulkan.Buffer.init(&vk_ctx, graph.kv_cache_size, .{ .storage_buffer_bit = true, .shader_device_address_bit = true }, kv_props);
     defer kv_cache.deinit(&vk_ctx);
 
     var input_staging = try vulkan.Buffer.init(&vk_ctx, model.f32Bytes(cfg.n_embd), .{ .transfer_src_bit = true }, .{ .host_visible_bit = true, .host_coherent_bit = true });
@@ -755,7 +801,9 @@ pub fn main(init: std.process.Init) !void {
 
 fn isNativeQuantType(tt: @import("tensor.zig").Type) bool {
     return switch (tt) {
-        .q8_0, .q4_0, .q4_1, .q6_k => true,
+        // Q4_0 remains on the host dequant path until the Vulkan kernels match
+        // the CPU/Zinc reference numerically.
+        .q8_0, .q4_1, .q6_k => true,
         else => false,
     };
 }

@@ -30,42 +30,17 @@ uint getU16(UIntBuffer buf, uint idx) {
     return getByte(buf, idx) | (getByte(buf, idx + 1u) << 8u);
 }
 
-float f16ToF32(uint h) {
-    return unpackHalf2x16(h).x;
-}
-
-int extendSign4(uint v) {
-    return int(v) - 8;
-}
-
-float q40BlockDot(uint row, uint block, uint k_rem) {
-    uint blocks = (pc.k + 31u) / 32u;
-    uint base = (row * blocks + block) * 18u;
-    float d = f16ToF32(getU16(pc.b, base + 0u));
-    float sum = 0.0;
-    uint k0 = block * 32u;
-    for (uint i = 0u; i < 32u; i += 1u) {
-        if (k0 + i >= pc.k) break;
-        uint byte_idx = i % 16u;
-        uint qb = getByte(pc.b, base + 2u + byte_idx);
-        int qv;
-        if (i < 16u) {
-            qv = extendSign4(qb & 0x0Fu);
-        } else {
-            qv = extendSign4(qb >> 4);
-        }
-        sum += pc.a.data[k0 + i] * (d * float(qv));
-    }
-    return sum;
+float f16At(uint row, uint kidx) {
+    uint base = (row * pc.k + kidx) * 2u;
+    return unpackHalf2x16(getU16(pc.b, base)).x;
 }
 
 void main() {
     uint col = gl_GlobalInvocationID.x;
     if (col >= pc.n) return;
     float sum = 0.0;
-    uint nblocks = (pc.k + 31u) / 32u;
-    for (uint bi = 0u; bi < nblocks; ++bi) {
-        sum += q40BlockDot(col, bi, pc.k);
+    for (uint i = 0u; i < pc.k; i += 1u) {
+        sum += pc.a.data[i] * f16At(col, i);
     }
     pc.c.data[col] = sum;
 }

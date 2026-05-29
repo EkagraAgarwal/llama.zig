@@ -32,29 +32,9 @@ uint getU16(UIntBuffer buf, uint idx) {
     return getByte(buf, idx) | (getByte(buf, idx + 1u) << 8u);
 }
 
-float f16ToF32(uint h) {
-    return unpackHalf2x16(h).x;
-}
-
-int extendSign4(uint v) {
-    return int(v) - 8;
-}
-
-float q40Weight(uint row, uint kidx) {
-    uint blocks = (pc.k + 31u) / 32u;
-    uint b = kidx / 32u;
-    uint i = kidx % 32u;
-    uint base = (row * blocks + b) * 18u;
-    float d = f16ToF32(getU16(pc.b, base + 0u));
-    uint byte_idx = i % 16u;
-    uint qb = getByte(pc.b, base + 2u + byte_idx);
-    if (i < 16u) {
-        int qv = extendSign4(qb & 0x0Fu);
-        return d * float(qv);
-    } else {
-        int qv = extendSign4(qb >> 4);
-        return d * float(qv);
-    }
+float f16Weight(uint row, uint kidx) {
+    uint base = (row * pc.k + kidx) * 2u;
+    return unpackHalf2x16(getU16(pc.b, base)).x;
 }
 
 void main() {
@@ -69,7 +49,7 @@ void main() {
         uint kx = t * 16u + lx;
         uint ky = t * 16u + ly;
         a_tile[ly][lx] = (row < pc.m && kx < pc.k) ? pc.a.data[row * pc.k + kx] : 0.0;
-        b_tile[ly][lx] = (col < pc.n && ky < pc.k) ? q40Weight(col, ky) : 0.0;
+        b_tile[ly][lx] = (col < pc.n && ky < pc.k) ? f16Weight(col, ky) : 0.0;
         barrier();
         for (uint kk = 0u; kk < 16u; ++kk) {
             sum += a_tile[ly][kk] * b_tile[kk][lx];

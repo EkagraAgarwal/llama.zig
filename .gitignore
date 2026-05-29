@@ -18,6 +18,9 @@ zig-pkg/
 .vscode/
 .idea/
 *.swp
+.cursor/
+.antigravitycli/
+AGENTS.md
 
 # Binaries
 *.o
@@ -31,6 +34,8 @@ zig-pkg/
 # Validation output (generated at runtime)
 output.txt
 *.log
+*_DEBUG_LOG.md
+*_DEBUG_DUMP.md
 
 # Editor temp files
 *.tmp

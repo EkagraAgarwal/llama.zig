@@ -81,15 +81,7 @@ void main() {
     uint token = pc.indices.data[0];
     uint row_base = token * pc.row_bytes;
 
-    uint qk = 256u;
-    uint blocks = (pc.n_embd + qk - 1u) / qk;
-    float v = 0.0;
-    for (uint b = 0u; b < blocks; ++b) {
-        uint kidx = b * qk + tid;
-        if (kidx < pc.n_embd) {
-            v += q6kAt(row_base, kidx);
-        }
-    }
+    float v = q6kAt(row_base, tid);
 
     float scale = (pc.scale_bits != 0u) ? uintBitsToFloat(pc.scale_bits) : 1.0;
     pc.out_buf.data[tid] = v * scale;

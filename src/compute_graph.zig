@@ -108,6 +108,8 @@ pub const GraphCostSummary = struct {
     other_nodes: u32 = 0,
 };
 
+pub const q4_0_f16_fallback_qtype: u32 = 0xffff_ff00;
+
 pub fn estimateGraphCost(graph: *const Graph) GraphCostSummary {
     var out = GraphCostSummary{
         .total_nodes = @intCast(graph.nodes.items.len),
@@ -558,6 +560,9 @@ pub const Dispatcher = struct {
     }
 
     fn quantPipelineName(qtype: u32, is_matvec: bool) []const u8 {
+        if (qtype == q4_0_f16_fallback_qtype) {
+            return if (is_matvec) "matvec_f16" else "matmul_f16";
+        }
         const qt: tensor.Type = @enumFromInt(qtype);
         return if (is_matvec)
             switch (qt) { .q4_0 => "matvec_q4_0", .q4_1 => "matvec_q4_1", .q6_k => "matvec_q6_k", else => "matvec_q8_0" }
@@ -803,4 +808,6 @@ test "quantized kernel selection is architecture independent" {
     const t = std.testing;
     try t.expectEqualStrings("matvec_q8_0", Dispatcher.quantPipelineName(@intFromEnum(tensor.Type.q8_0), true));
     try t.expectEqualStrings("matmul_q8_0", Dispatcher.quantPipelineName(@intFromEnum(tensor.Type.q8_0), false));
+    try t.expectEqualStrings("matvec_f16", Dispatcher.quantPipelineName(q4_0_f16_fallback_qtype, true));
+    try t.expectEqualStrings("matmul_f16", Dispatcher.quantPipelineName(q4_0_f16_fallback_qtype, false));
 }

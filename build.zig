@@ -79,6 +79,8 @@ fn compileShaders(b: *std.Build) ?*std.Build.Step {
         .{ .src = "src/shaders/matmul_bda.glsl", .out = "matmul_bda.spv" },
         .{ .src = "src/shaders/matmul_q8_0_bda.glsl", .out = "matmul_q8_0_bda.spv" },
         .{ .src = "src/shaders/matvec_q8_0_bda.glsl", .out = "matvec_q8_0_bda.spv" },
+        .{ .src = "src/shaders/matmul_f16_bda.glsl", .out = "matmul_f16_bda.spv" },
+        .{ .src = "src/shaders/matvec_f16_bda.glsl", .out = "matvec_f16_bda.spv" },
         .{ .src = "src/shaders/get_rows_q_bda.glsl", .out = "get_rows_q_bda.spv" },
         .{ .src = "src/shaders/matmul_q4_0_bda.glsl", .out = "matmul_q4_0_bda.spv" },
         .{ .src = "src/shaders/matvec_q4_0_bda.glsl", .out = "matvec_q4_0_bda.spv" },
