@@ -191,7 +191,7 @@ pub const GraphBuilder = struct {
     }
 
     pub fn initKvCaches(self: *GraphBuilder) !void {
-        const kv_per_layer = @as(u64, self.cfg.max_ctx) * self.cfg.n_kv_heads * self.cfg.head_dim * 4 * 2;
+        const kv_per_layer = @as(u64, self.cfg.max_ctx) * self.cfg.n_kv_heads * self.cfg.head_dim * 2 * 2;
         self.graph.kv_cache_size = kv_per_layer * self.cfg.n_layer;
         var l: u32 = 0;
         while (l < self.cfg.n_layer) : (l += 1) {
@@ -323,7 +323,7 @@ pub const GraphBuilder = struct {
 
         var kv_name_buf: [16]u8 = undefined;
         const kv_name = try std.fmt.bufPrint(&kv_name_buf, "kv.{d}", .{layer});
-        try self.addNode(.kv_write, &.{ kn, vn, kv_name }, kn, (kv_out + 63) / 64, 1, n_kv, k_head_dim, cfg.max_ctx, pos);
+        try self.addNode(.kv_write, &.{ kn, vn, kv_name }, kn, ((kv_out / 2) + 63) / 64, 1, n_kv, k_head_dim, cfg.max_ctx, pos);
         const attn_p2 = k_head_dim | (n_kv << 16);
         const attn_scale_bits: u32 = @bitCast(cfg.attention_scale);
         try self.addNodeP(.attention, &.{ qn, kv_name }, attn, n_heads, 1, n_heads, attn_p2, cfg.max_ctx, pos, attn_scale_bits);
@@ -512,7 +512,7 @@ pub const Dispatcher = struct {
     }
 
     fn kvCacheLayerOffset(self: *Dispatcher, layer: u32) u64 {
-        const per_layer = @as(u64, self.cfg.max_ctx) * self.cfg.n_kv_heads * self.cfg.head_dim * 4 * 2;
+        const per_layer = @as(u64, self.cfg.max_ctx) * self.cfg.n_kv_heads * self.cfg.head_dim * 2 * 2;
         return self.kv_cache.address + per_layer * layer;
     }
 

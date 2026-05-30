@@ -6,6 +6,10 @@ layout(buffer_reference, std430, buffer_reference_align = 4) buffer FloatBuffer 
     float data[];
 };
 
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer UIntBuffer {
+    uint data[];
+};
+
 layout(push_constant) uniform PC {
     uint n_heads;
     uint head_dim_packed;
@@ -16,7 +20,7 @@ layout(push_constant) uniform PC {
     uint p7;
     uint p8;
     FloatBuffer q;
-    FloatBuffer kv;
+    UIntBuffer kv;
     FloatBuffer attn_out;
 } pc;
 
@@ -31,8 +35,11 @@ void main() {
     uint n_rep = pc.n_heads / n_kv_heads;
     uint kv_head = head / n_rep;
     uint seq_len = pc.pos + 1u;
-    uint kv_stride = n_kv_heads * hd;
-    uint v_base = pc.max_ctx * kv_stride;
+    
+    uint hd_pairs = hd / 2u;
+    uint kv_stride_pairs = n_kv_heads * hd_pairs;
+    uint v_base_pairs = pc.max_ctx * kv_stride_pairs;
+    
     uint tile_sz = (pc.tile_size != 0u) ? pc.tile_size : 64u;
 
     float scale = (pc.attn_scale_bits != 0u) ? uintBitsToFloat(pc.attn_scale_bits) : (1.0 / sqrt(float(hd)));
@@ -48,16 +55,19 @@ void main() {
         uint t1 = min(t0 + tile_sz, seq_len);
         for (uint t = t0; t < t1; ++t) {
             float dot = 0.0;
-            for (uint d = 0u; d < hd; ++d) {
-                dot += pc.q.data[head * hd + d] * pc.kv.data[t * kv_stride + kv_head * hd + d];
+            for (uint d = 0u; d < hd_pairs; ++d) {
+                vec2 k_vec = unpackHalf2x16(pc.kv.data[t * kv_stride_pairs + kv_head * hd_pairs + d]);
+                dot += pc.q.data[head * hd + d * 2u] * k_vec.x;
+                dot += pc.q.data[head * hd + d * 2u + 1u] * k_vec.y;
             }
             float s = dot * scale;
             float m_new = max(m, s);
             float alpha = exp(m - m_new);
             float beta = exp(s - m_new);
-            for (uint d = 0u; d < hd; ++d) {
-                float v = pc.kv.data[v_base + t * kv_stride + kv_head * hd + d];
-                acc[d] = acc[d] * alpha + beta * v;
+            for (uint d = 0u; d < hd_pairs; ++d) {
+                vec2 v_vec = unpackHalf2x16(pc.kv.data[v_base_pairs + t * kv_stride_pairs + kv_head * hd_pairs + d]);
+                acc[d * 2u] = acc[d * 2u] * alpha + beta * v_vec.x;
+                acc[d * 2u + 1u] = acc[d * 2u + 1u] * alpha + beta * v_vec.y;
             }
             l = l * alpha + beta;
             m = m_new;

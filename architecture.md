@@ -365,8 +365,8 @@ The scratchpad stores all activations, residuals, and intermediate results. Size
 
 ### 9.2 KV Cache
 
-Flat buffer of size `max_ctx * n_kv_heads * head_dim * 4 * 2 * n_layer`:
-- K and V planes stored separately
+Flat buffer of size `max_ctx * n_kv_heads * head_dim * 2 * 2 * n_layer`:
+- K and V planes stored separately (using `f16` via GLSL packing)
 - Indexed by position during attention (flash attention tiles over `tile_sz` chunks)
 
 ### 9.3 Quantized Weight Storage
