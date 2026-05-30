@@ -106,6 +106,8 @@ pub const Context = struct {
         }
 
         const pdev = best_pdev orelse return error.NoSuitableDevice;
+        const props = vki.getPhysicalDeviceProperties(pdev);
+        std.debug.print("Selected GPU Device: {s}\n", .{std.mem.sliceTo(&props.device_name, 0)});
         const mem_props = vki.getPhysicalDeviceMemoryProperties(pdev);
 
         var bda_features = vk.PhysicalDeviceBufferDeviceAddressFeatures{

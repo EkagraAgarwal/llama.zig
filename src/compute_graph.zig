@@ -1,4 +1,28 @@
 const std = @import("std");
+const builtin = @import("builtin");
+
+const windows = if (builtin.os.tag == .windows) struct {
+    pub const HANDLE = *anyopaque;
+    pub const LARGE_INTEGER = i64;
+    pub const ntdll = struct {
+        pub extern "ntdll" fn RtlQueryPerformanceCounter(Counter: *LARGE_INTEGER) callconv(.winapi) std.os.windows.BOOL;
+        pub extern "ntdll" fn RtlQueryPerformanceFrequency(LinkTime: *LARGE_INTEGER) callconv(.winapi) std.os.windows.BOOL;
+    };
+} else struct {};
+
+fn nowNs() u64 {
+    if (builtin.os.tag == .windows) {
+        var counter: windows.LARGE_INTEGER = 0;
+        var freq: windows.LARGE_INTEGER = 0;
+        _ = windows.ntdll.RtlQueryPerformanceCounter(&counter);
+        _ = windows.ntdll.RtlQueryPerformanceFrequency(&freq);
+        const c: u64 = @intCast(counter);
+        const f: u64 = @intCast(freq);
+        if (f == 0) return 0;
+        return (c / f) * std.time.ns_per_s + ((c % f) * std.time.ns_per_s) / f;
+    }
+    return 0;
+}
 const vulkan = @import("vulkan_backend.zig");
 const model = @import("model.zig");
 const tensor = @import("tensor.zig");
@@ -462,8 +486,9 @@ pub const Dispatcher = struct {
     cfg: *const model.ModelConfig,
     cmd: vk.CommandBuffer = .null_handle,
     fence: vk.Fence = .null_handle,
-    flash_attn_threshold: u32 = 64,
+    flash_attn_threshold: u32 = 1,
     submit_count: u32 = 0,
+    reported_graph: bool = false,
 
     pub fn init(graph: *Graph, ctx: *vulkan.Context, registry: *vulkan.PipelineRegistry, scratch: vulkan.Buffer, kv: vulkan.Buffer, cfg: *const model.ModelConfig) !Dispatcher {
         var self = Dispatcher{
@@ -650,17 +675,41 @@ pub const Dispatcher = struct {
         self.submit_count += 1;
     }
 
-    fn needsBarrierAfter(node: GraphNode) bool {
-        return switch (node.op_type) {
-            .topk => false,
-            else => true,
-        };
+    fn hasDependency(node1: GraphNode, node2: GraphNode) bool {
+        for (node1.input_names) |in_name| {
+            if (std.mem.eql(u8, in_name, node2.output_name)) return true;
+        }
+        for (node2.input_names) |in_name| {
+            if (std.mem.eql(u8, node1.output_name, in_name)) return true;
+        }
+        if (std.mem.eql(u8, node1.output_name, node2.output_name)) return true;
+        return false;
     }
 
     pub fn recordGraph(self: *Dispatcher, cmd: vk.CommandBuffer, pos: u32) void {
-        for (self.graph.nodes.items) |node| {
+        var last_barrier_idx: usize = 0;
+        const nodes = self.graph.nodes.items;
+
+        for (nodes, 0..) |node, i| {
+            var need_barrier = false;
+            if (i > 0) {
+                var j = i - 1;
+                while (true) {
+                    if (hasDependency(node, nodes[j])) {
+                        need_barrier = true;
+                        break;
+                    }
+                    if (j == last_barrier_idx) break;
+                    j -= 1;
+                }
+            }
+
+            if (need_barrier) {
+                self.emitComputeBarrier(cmd);
+                last_barrier_idx = i;
+            }
+
             self.dispatchNode(cmd, node, pos);
-            if (needsBarrierAfter(node)) self.emitComputeBarrier(cmd);
         }
     }
 
