@@ -568,7 +568,7 @@ pub const Dispatcher = struct {
         return if (is_matvec)
             switch (qt) { .q4_0 => "matvec_q4_0", .q4_1 => "matvec_q4_1", .q4_k => "matvec_q4_k", .q6_k => "matvec_q6_k", else => "matvec_q8_0" }
         else
-            switch (qt) { .q4_0 => "matmul_q4_0", .q4_1 => "matmul_q4_1", .q4_k => "matmul_q4_k", .q6_k => "matmul_q8_0", else => "matmul_q8_0" };
+            switch (qt) { .q4_0 => "matmul_q4_0", .q4_1 => "matmul_q4_1", .q4_k => "matmul_q4_k", .q6_k => "matmul_q6_k", else => "matmul_q8_0" };
     }
 
     fn dispatchNode(self: *Dispatcher, cmd: vk.CommandBuffer, node: GraphNode, pos: u32) void {

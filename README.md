@@ -53,12 +53,15 @@ main.zig
   └── root.zig         (root comptime struct for all ops)
 ```
 
-## Remaining / Future Work
-
 - Fused GPU dequant matmul (avoid full FP32 weight VRAM)
 - Flash-attention style tiled attention kernel
 - Multi-GPU model splitting
 - Chat templates for instruct models
+
+## Optimizations
+
+- **Native Q6_K GPU path**: The `matmul_q6_k_bda.glsl` shader provides on-the-fly 6-bit block dequantization during matrix multiplication, keeping q6_k tensors compressed at ~6.5 bits/element in VRAM. This applies to both matvec (embedding lookup, attention projections) and full matmul (LM head).
+- **Compressed weight upload**: `isNativeQuantType` enables q6_k weights to upload as packed binary directly to GPU rather than dequantizing to f32 on CPU first.
 
 ## Compatibility Matrix
 
@@ -68,7 +71,7 @@ Only the following model types are currently supported:
 - **BF16 / F32 / F16** (native precision)
 - **Q8_0** (native 8-bit quantization)
 - **Q4_K** (native K-quantization)
-- **Q6_K** (hybrid CPU-dequantization fallback)
+- **Q6_K** (native K-quantization — 6-bit, ~6.5 bits/element)
 
 All other quantization types (`q4_0`, `q5_0`, `q2_k`, `q3_k`, `q5_k`, `q8_k`) are not supported.
 

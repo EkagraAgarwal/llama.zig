@@ -19,6 +19,7 @@ pub const kernels_matvec_q4_k_spv = @embedFile("matvec_q4_k_bda.spv");
 pub const kernels_matmul_q4_k_spv = @embedFile("matmul_q4_k_bda.spv");
 pub const kernels_get_rows_q6_k_spv = @embedFile("get_rows_q6_k_bda.spv");
 pub const kernels_matvec_q6_k_spv = @embedFile("matvec_q6_k_bda.spv");
+pub const kernels_matmul_q6_k_spv = @embedFile("matmul_q6_k_bda.spv");
 pub const kernels_topk_spv = @embedFile("topk_bda.spv");
 pub const kernels_flash_attn_spv = @embedFile("flash_attn_bda.spv");
 pub const kernels_rope_spv = @embedFile("rope_bda.spv");
