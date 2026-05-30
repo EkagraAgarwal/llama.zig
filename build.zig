@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -67,9 +68,46 @@ pub fn build(b: *std.Build) void {
     });
     const run_root_tests = b.addRunArtifact(root_tests);
 
-    const test_step = b.step("test", "Run CPU and parity-focused unit tests");
+    const mmap_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/mmap_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_mmap_tests = b.addRunArtifact(mmap_tests);
+    const test_mmap_step = b.step("test-mmap", "Run mmap unit tests");
+    test_mmap_step.dependOn(&run_mmap_tests.step);
+
+    const integration_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/integration_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_integration_tests = b.addRunArtifact(integration_tests);
+    const test_integration_step = b.step("test-integration", "Run model loading integration tests");
+    test_integration_step.dependOn(&run_integration_tests.step);
+
+const test_step = b.step("test", "Run CPU and parity-focused unit tests");
     test_step.dependOn(&run_ops_tests.step);
     test_step.dependOn(&run_root_tests.step);
+    test_step.dependOn(&run_mmap_tests.step);
+
+    const clean_step = b.step("clean", "Remove all build artifacts and caches");
+    const clean_cmd = b.addSystemCommand(&.{
+        switch (builtin.os.tag) {
+            .windows => "cmd",
+            else => "rm",
+        },
+    });
+    if (builtin.os.tag == .windows) {
+        clean_cmd.addArgs(&.{"/c", "rmdir /s /q .zig-cache zig-pkg 2>nul & del /q *.spv 2>nul & exit /b 0"});
+    } else {
+        clean_cmd.addArgs(&.{"-rf", ".zig-cache", "zig-pkg", "*.spv"});
+    }
+    clean_step.dependOn(&clean_cmd.step);
 }
 
 fn compileShaders(b: *std.Build) ?*std.Build.Step {

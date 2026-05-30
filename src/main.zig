@@ -100,7 +100,7 @@ pub fn main(init: std.process.Init) !void {
     const t_load_start = nowNs();
     try writer.print("Loading model: {s}...\n", .{model_path.?});
     try writer_streaming.interface.flush();
-    var ctx = try gguf.loadModel(allocator, model_path.?);
+    var ctx = try gguf.loadModelMmap(allocator, model_path.?);
     defer ctx.deinit();
 
     var tok = try tokenizer.Tokenizer.init(allocator, &ctx);
@@ -322,9 +322,15 @@ pub fn main(init: std.process.Init) !void {
         if (gt) |t| {
             if (isNativeQuantType(t.type)) {
                 const raw_size = t.size();
-                const raw = try allocator.alloc(u8, raw_size);
-                defer allocator.free(raw);
-                try ctx.readTensorData(t, raw);
+                const raw = if (ctx.mmap_file != null)
+                    try ctx.getTensorSlice(t)
+                else blk: {
+                    const temp = try allocator.alloc(u8, raw_size);
+                    try ctx.readTensorData(t, temp);
+                    break :blk temp;
+                };
+                defer if (ctx.mmap_file == null) allocator.free(raw);
+
                 const mapped = try vk_ctx.vkd.mapMemory(vk_ctx.device, weight_staging.memory, 0, raw_size, .{});
                 @memcpy(@as([*]u8, @ptrCast(mapped))[0..raw_size], raw);
                 vk_ctx.vkd.unmapMemory(vk_ctx.device, weight_staging.memory);
@@ -382,9 +388,15 @@ pub fn main(init: std.process.Init) !void {
                 gt_entry.size = upload_size;
                 if (isNativeQuantType(t.type)) {
                     const raw_size = t.size();
-                    const raw = try allocator.alloc(u8, raw_size);
-                    defer allocator.free(raw);
-                    try ctx.readTensorData(t, raw);
+                    const raw = if (ctx.mmap_file != null)
+                        try ctx.getTensorSlice(t)
+                    else blk: {
+                        const temp = try allocator.alloc(u8, raw_size);
+                        try ctx.readTensorData(t, temp);
+                        break :blk temp;
+                    };
+                    defer if (ctx.mmap_file == null) allocator.free(raw);
+
                     const mapped = try vk_ctx.vkd.mapMemory(vk_ctx.device, weight_staging.memory, 0, raw_size, .{});
                     @memcpy(@as([*]u8, @ptrCast(mapped))[0..raw_size], raw);
                     vk_ctx.vkd.unmapMemory(vk_ctx.device, weight_staging.memory);
@@ -416,6 +428,8 @@ pub fn main(init: std.process.Init) !void {
             }
         }
     }
+
+    ctx.discardMmap();
 
     var scratchpad = try vulkan.Buffer.init(&vk_ctx, graph.scratchpad_size, .{ .storage_buffer_bit = true, .shader_device_address_bit = true, .transfer_src_bit = true, .transfer_dst_bit = true }, .{ .device_local_bit = true });
     defer scratchpad.deinit(&vk_ctx);
@@ -809,6 +823,8 @@ fn isNativeQuantType(tt: @import("tensor.zig").Type) bool {
         // Q4_0 remains on the host dequant path until the Vulkan kernels match
         // the CPU/Zinc reference numerically.
         .q8_0, .q4_1, .q4_k => true,
+        // q6_k intentionally excluded: native GPU path produces garbled output.
+        // Falls back to CPU dequant -> f16 upload path.
         else => false,
     };
 }

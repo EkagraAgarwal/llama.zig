@@ -21,36 +21,65 @@ pub fn bf16ToF32(bits: u16) f32 {
     return @bitCast(@as(u32, bits) << 16);
 }
 
-pub fn dequantToF32(ctx: *gguf.GGUFContext, t: *tensor.Tensor, dst: []f32) !void {
+pub fn dequantToF32FromSlice(raw: []const u8, t: *tensor.Tensor, dst: []f32) !void {
     const n = t.ne[0] * t.ne[1] * t.ne[2] * t.ne[3];
     if (dst.len < n) return error.BufferTooSmall;
 
     switch (t.type) {
         .f32 => {
-            var raw = try ctx.allocator.alloc(u8, t.size());
-            defer ctx.allocator.free(raw);
-            try ctx.readTensorData(t, raw);
             @memcpy(std.mem.sliceAsBytes(dst[0..n]), raw[0 .. n * 4]);
         },
         .f16 => {
-            var raw = try ctx.allocator.alloc(u8, t.size());
-            defer ctx.allocator.free(raw);
-            try ctx.readTensorData(t, raw);
             const src = std.mem.bytesAsSlice(u16, raw[0 .. n * 2]);
             for (src, 0..) |bits, i| dst[i] = f16ToF32(bits);
         },
         .bf16 => {
-            var raw = try ctx.allocator.alloc(u8, t.size());
-            defer ctx.allocator.free(raw);
-            try ctx.readTensorData(t, raw);
             const src = std.mem.bytesAsSlice(u16, raw[0 .. n * 2]);
             for (src, 0..) |bits, i| dst[i] = bf16ToF32(bits);
         },
-        .q8_0 => try dequantQ80(ctx, t, dst[0..n]),
-        .q4_0 => try dequantQ40(ctx, t, dst[0..n]),
-        .q4_1 => try dequantQ41(ctx, t, dst[0..n]),
-        .q4_k => try dequantQ4K(ctx, t, dst[0..n]),
-        .q6_k => try dequantQ6K(ctx, t, dst[0..n]),
+        .q8_0 => dequantQ80Raw(raw, dst[0..n]),
+        .q4_0 => dequantQ40Raw(raw, dst[0..n]),
+        .q4_1 => dequantQ41Raw(raw, dst[0..n]),
+        .q4_k => dequantQ4KRaw(raw, dst[0..n]),
+        .q6_k => dequantQ6KRaw(raw, dst[0..n]),
+    }
+}
+
+pub fn dequantToF32(ctx: *gguf.GGUFContext, t: *tensor.Tensor, dst: []f32) !void {
+    if (ctx.mmap_file) |_| {
+        const raw = try ctx.getTensorSlice(t);
+        try dequantToF32FromSlice(raw, t, dst);
+    } else {
+        const n = t.ne[0] * t.ne[1] * t.ne[2] * t.ne[3];
+        if (dst.len < n) return error.BufferTooSmall;
+
+        switch (t.type) {
+            .f32 => {
+                var raw = try ctx.allocator.alloc(u8, t.size());
+                defer ctx.allocator.free(raw);
+                try ctx.readTensorData(t, raw);
+                @memcpy(std.mem.sliceAsBytes(dst[0..n]), raw[0 .. n * 4]);
+            },
+            .f16 => {
+                var raw = try ctx.allocator.alloc(u8, t.size());
+                defer ctx.allocator.free(raw);
+                try ctx.readTensorData(t, raw);
+                const src = std.mem.bytesAsSlice(u16, raw[0 .. n * 2]);
+                for (src, 0..) |bits, i| dst[i] = f16ToF32(bits);
+            },
+            .bf16 => {
+                var raw = try ctx.allocator.alloc(u8, t.size());
+                defer ctx.allocator.free(raw);
+                try ctx.readTensorData(t, raw);
+                const src = std.mem.bytesAsSlice(u16, raw[0 .. n * 2]);
+                for (src, 0..) |bits, i| dst[i] = bf16ToF32(bits);
+            },
+            .q8_0 => try dequantQ80(ctx, t, dst[0..n]),
+            .q4_0 => try dequantQ40(ctx, t, dst[0..n]),
+            .q4_1 => try dequantQ41(ctx, t, dst[0..n]),
+            .q4_k => try dequantQ4K(ctx, t, dst[0..n]),
+            .q6_k => try dequantQ6K(ctx, t, dst[0..n]),
+        }
     }
 }
 
@@ -147,72 +176,95 @@ pub fn readEmbeddingF32(ctx: *gguf.GGUFContext, t: *tensor.Tensor, token_id: u32
     if (dst.len < n_embd) return error.BufferTooSmall;
     if (t.ne[0] != n_embd) return error.UnsupportedEmbeddingLayout;
 
-    switch (t.type) {
-        .f32 => {
-            const row_bytes = n_embd * 4;
-            var raw: [8192]u8 = undefined;
-            if (row_bytes > raw.len) {
-                const heap = try ctx.allocator.alloc(u8, row_bytes);
-                defer ctx.allocator.free(heap);
+    if (ctx.mmap_file) |_| {
+        const slice = try ctx.getTensorSlice(t);
+        const row_bytes = switch (t.type) {
+            .f32 => n_embd * 4,
+            .bf16 => n_embd * 2,
+            else => quantRowBytes(t.type, n_embd) orelse return error.UnsupportedQuantType,
+        };
+        const row_slice = slice[@as(u64, token_id) * row_bytes .. (@as(u64, token_id) + 1) * row_bytes];
+        switch (t.type) {
+            .f32 => @memcpy(std.mem.sliceAsBytes(dst[0..n_embd]), row_slice),
+            .bf16 => {
+                const src = std.mem.bytesAsSlice(u16, row_slice);
+                for (src, 0..) |bits, i| dst[i] = bf16ToF32(bits);
+            },
+            .q8_0 => dequantQ80Raw(row_slice, dst[0..n_embd]),
+            .q4_0 => dequantQ40Raw(row_slice, dst[0..n_embd]),
+            .q4_1 => dequantQ41Raw(row_slice, dst[0..n_embd]),
+            .q6_k => dequantQ6KRaw(row_slice, dst[0..n_embd]),
+            .q4_k => dequantQ4KRaw(row_slice, dst[0..n_embd]),
+            else => return error.UnsupportedQuantType,
+        }
+    } else {
+        switch (t.type) {
+            .f32 => {
+                const row_bytes = n_embd * 4;
+                var raw: [8192]u8 = undefined;
+                if (row_bytes > raw.len) {
+                    const heap = try ctx.allocator.alloc(u8, row_bytes);
+                    defer ctx.allocator.free(heap);
+                    const off = t.offset + @as(u64, token_id) * row_bytes;
+                    _ = try ctx.file.readPositionalAll(std.Io.Threaded.global_single_threaded.io(), heap, ctx.data_offset + off);
+                    @memcpy(std.mem.sliceAsBytes(dst[0..n_embd]), heap);
+                } else {
+                    const off = t.offset + @as(u64, token_id) * row_bytes;
+                    _ = try ctx.file.readPositionalAll(std.Io.Threaded.global_single_threaded.io(), raw[0..row_bytes], ctx.data_offset + off);
+                    @memcpy(std.mem.sliceAsBytes(dst[0..n_embd]), raw[0..row_bytes]);
+                }
+            },
+            .bf16 => {
+                const row_bytes = n_embd * 2;
+                const raw = try ctx.allocator.alloc(u8, row_bytes);
+                defer ctx.allocator.free(raw);
                 const off = t.offset + @as(u64, token_id) * row_bytes;
-                _ = try ctx.file.readPositionalAll(std.Io.Threaded.global_single_threaded.io(), heap, ctx.data_offset + off);
-                @memcpy(std.mem.sliceAsBytes(dst[0..n_embd]), heap);
-            } else {
+                _ = try ctx.file.readPositionalAll(std.Io.Threaded.global_single_threaded.io(), raw, ctx.data_offset + off);
+                const src = std.mem.bytesAsSlice(u16, raw);
+                for (src, 0..) |bits, i| dst[i] = bf16ToF32(bits);
+            },
+            .q8_0 => {
+                const row_bytes = quantRowBytes(t.type, n_embd) orelse return error.UnsupportedQuantType;
+                const raw = try ctx.allocator.alloc(u8, row_bytes);
+                defer ctx.allocator.free(raw);
                 const off = t.offset + @as(u64, token_id) * row_bytes;
-                _ = try ctx.file.readPositionalAll(std.Io.Threaded.global_single_threaded.io(), raw[0..row_bytes], ctx.data_offset + off);
-                @memcpy(std.mem.sliceAsBytes(dst[0..n_embd]), raw[0..row_bytes]);
-            }
-        },
-        .bf16 => {
-            const row_bytes = n_embd * 2;
-            const raw = try ctx.allocator.alloc(u8, row_bytes);
-            defer ctx.allocator.free(raw);
-            const off = t.offset + @as(u64, token_id) * row_bytes;
-            _ = try ctx.file.readPositionalAll(std.Io.Threaded.global_single_threaded.io(), raw, ctx.data_offset + off);
-            const src = std.mem.bytesAsSlice(u16, raw);
-            for (src, 0..) |bits, i| dst[i] = bf16ToF32(bits);
-        },
-        .q8_0 => {
-            const row_bytes = quantRowBytes(t.type, n_embd) orelse return error.UnsupportedQuantType;
-            const raw = try ctx.allocator.alloc(u8, row_bytes);
-            defer ctx.allocator.free(raw);
-            const off = t.offset + @as(u64, token_id) * row_bytes;
-            _ = try ctx.file.readPositionalAll(std.Io.Threaded.global_single_threaded.io(), raw, ctx.data_offset + off);
-            dequantQ80Raw(raw, dst[0..n_embd]);
-        },
-        .q4_0 => {
-            const row_bytes = quantRowBytes(t.type, n_embd) orelse return error.UnsupportedQuantType;
-            const raw = try ctx.allocator.alloc(u8, row_bytes);
-            defer ctx.allocator.free(raw);
-            const off = t.offset + @as(u64, token_id) * row_bytes;
-            _ = try ctx.file.readPositionalAll(std.Io.Threaded.global_single_threaded.io(), raw, ctx.data_offset + off);
-            dequantQ40Raw(raw, dst[0..n_embd]);
-        },
-        .q4_1 => {
-            const row_bytes = quantRowBytes(t.type, n_embd) orelse return error.UnsupportedQuantType;
-            const raw = try ctx.allocator.alloc(u8, row_bytes);
-            defer ctx.allocator.free(raw);
-            const off = t.offset + @as(u64, token_id) * row_bytes;
-            _ = try ctx.file.readPositionalAll(std.Io.Threaded.global_single_threaded.io(), raw, ctx.data_offset + off);
-            dequantQ41Raw(raw, dst[0..n_embd]);
-        },
-        .q6_k => {
-            const row_bytes = quantRowBytes(t.type, n_embd) orelse return error.UnsupportedQuantType;
-            const raw = try ctx.allocator.alloc(u8, row_bytes);
-            defer ctx.allocator.free(raw);
-            const off = t.offset + @as(u64, token_id) * row_bytes;
-            _ = try ctx.file.readPositionalAll(std.Io.Threaded.global_single_threaded.io(), raw, ctx.data_offset + off);
-            dequantQ6KRaw(raw, dst[0..n_embd]);
-        },
-        .q4_k => {
-            const row_bytes = quantRowBytes(t.type, n_embd) orelse return error.UnsupportedQuantType;
-            const raw = try ctx.allocator.alloc(u8, row_bytes);
-            defer ctx.allocator.free(raw);
-            const off = t.offset + @as(u64, token_id) * row_bytes;
-            _ = try ctx.file.readPositionalAll(std.Io.Threaded.global_single_threaded.io(), raw, ctx.data_offset + off);
-            dequantQ4KRaw(raw, dst[0..n_embd]);
-        },
-        else => return error.UnsupportedQuantType,
+                _ = try ctx.file.readPositionalAll(std.Io.Threaded.global_single_threaded.io(), raw, ctx.data_offset + off);
+                dequantQ80Raw(raw, dst[0..n_embd]);
+            },
+            .q4_0 => {
+                const row_bytes = quantRowBytes(t.type, n_embd) orelse return error.UnsupportedQuantType;
+                const raw = try ctx.allocator.alloc(u8, row_bytes);
+                defer ctx.allocator.free(raw);
+                const off = t.offset + @as(u64, token_id) * row_bytes;
+                _ = try ctx.file.readPositionalAll(std.Io.Threaded.global_single_threaded.io(), raw, ctx.data_offset + off);
+                dequantQ40Raw(raw, dst[0..n_embd]);
+            },
+            .q4_1 => {
+                const row_bytes = quantRowBytes(t.type, n_embd) orelse return error.UnsupportedQuantType;
+                const raw = try ctx.allocator.alloc(u8, row_bytes);
+                defer ctx.allocator.free(raw);
+                const off = t.offset + @as(u64, token_id) * row_bytes;
+                _ = try ctx.file.readPositionalAll(std.Io.Threaded.global_single_threaded.io(), raw, ctx.data_offset + off);
+                dequantQ41Raw(raw, dst[0..n_embd]);
+            },
+            .q6_k => {
+                const row_bytes = quantRowBytes(t.type, n_embd) orelse return error.UnsupportedQuantType;
+                const raw = try ctx.allocator.alloc(u8, row_bytes);
+                defer ctx.allocator.free(raw);
+                const off = t.offset + @as(u64, token_id) * row_bytes;
+                _ = try ctx.file.readPositionalAll(std.Io.Threaded.global_single_threaded.io(), raw, ctx.data_offset + off);
+                dequantQ6KRaw(raw, dst[0..n_embd]);
+            },
+            .q4_k => {
+                const row_bytes = quantRowBytes(t.type, n_embd) orelse return error.UnsupportedQuantType;
+                const raw = try ctx.allocator.alloc(u8, row_bytes);
+                defer ctx.allocator.free(raw);
+                const off = t.offset + @as(u64, token_id) * row_bytes;
+                _ = try ctx.file.readPositionalAll(std.Io.Threaded.global_single_threaded.io(), raw, ctx.data_offset + off);
+                dequantQ4KRaw(raw, dst[0..n_embd]);
+            },
+            else => return error.UnsupportedQuantType,
+        }
     }
 
     if (scale != 1.0) {

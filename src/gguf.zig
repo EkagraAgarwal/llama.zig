@@ -1,6 +1,7 @@
 const std = @import("std");
 const Tensor = @import("tensor.zig").Tensor;
 const Type = @import("tensor.zig").Type;
+const mmap = @import("mmap.zig");
 
 pub const GGUFMagic = 0x46554747; // "GGUF" in little-endian
 
@@ -50,6 +51,7 @@ pub const GGUFContext = struct {
     kvs: std.StringHashMap(MetadataValue),
     tensors: std.StringHashMap(*Tensor),
     data_offset: u64,
+    mmap_file: ?mmap.MappedFile,
 
     pub fn init(allocator: std.mem.Allocator, file: std.Io.File) GGUFContext {
         return GGUFContext{
@@ -61,6 +63,7 @@ pub const GGUFContext = struct {
             .kvs = std.StringHashMap(MetadataValue).init(allocator),
             .tensors = std.StringHashMap(*Tensor).init(allocator),
             .data_offset = 0,
+            .mmap_file = null,
         };
     }
 
@@ -79,13 +82,39 @@ pub const GGUFContext = struct {
         }
         self.tensors.deinit();
 
+        if (self.mmap_file) |*mf| {
+            // Unmap and close handles
+            var mf_mut = mf.*;
+            mf_mut.deinit();
+        }
+
         const io = std.Io.Threaded.global_single_threaded.io();
         self.file.close(io);
     }
 
     pub fn readTensorData(self: *GGUFContext, t: *Tensor, buffer: []u8) !void {
-        const io = std.Io.Threaded.global_single_threaded.io();
-        _ = try self.file.readPositionalAll(io, buffer, self.data_offset + t.offset);
+        if (self.mmap_file) |*mf| {
+            const src = mf.slice(self.data_offset + t.offset, buffer.len);
+            @memcpy(buffer, src);
+        } else {
+            const io = std.Io.Threaded.global_single_threaded.io();
+            _ = try self.file.readPositionalAll(io, buffer, self.data_offset + t.offset);
+        }
+    }
+
+    pub fn getTensorSlice(self: *const GGUFContext, t: *const Tensor) ![]const u8 {
+        if (self.mmap_file) |*mf| {
+            return mf.slice(self.data_offset + t.offset, t.size());
+        }
+        return error.MmapNotAvailable;
+    }
+
+    pub fn discardMmap(self: *GGUFContext) void {
+        if (self.mmap_file) |*mf| {
+            var mf_mut = mf.*;
+            mf_mut.deinit();
+            self.mmap_file = null;
+        }
     }
 };
 
@@ -166,6 +195,15 @@ pub fn loadModel(allocator: std.mem.Allocator, path: []const u8) !GGUFContext {
     const remainder = current_pos % alignment;
     ctx.data_offset = if (remainder != 0) current_pos + (alignment - remainder) else current_pos;
 
+    return ctx;
+}
+
+pub fn loadModelMmap(allocator: std.mem.Allocator, path: []const u8) !GGUFContext {
+    var ctx = try loadModel(allocator, path);
+    errdefer ctx.deinit();
+
+    const mf = try mmap.MappedFile.init(path);
+    ctx.mmap_file = mf;
     return ctx;
 }
 
