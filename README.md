@@ -4,12 +4,13 @@ A high-performance port of the `llama.cpp` inference engine to Zig, featuring a 
 
 ## Features
 
-- **GGUF v3** parser with architecture detection (`llama`, `granite`)
+- **GGUF v3** parser with architecture detection (`llama`, `granite`, `gemma`, `qwen`)
 - **BF16 / F32 / Q8_0** host-side dequantization to FP32 VRAM weights
 - **Full transformer forward pass**: RMSNorm, Q/K/V projections, RoPE, KV cache, scaled dot-product attention, SwiGLU FFN, LM head
 - **Autoregressive generation** with temperature + top-p sampling
 - **Deterministic sampler RNG lifecycle** with top-k, top-p, min-p, and typical-p filtering
 - **GLSL → SPIR-V** kernels via `glslangValidator` (AMDVLK-safe)
+- **Automatic chat template detection** for instruct models: Llama 3, Granite, Gemma, Qwen (ChatML), Llama 2 (Mistral)
 
 ## Build Requirements
 
@@ -39,14 +40,21 @@ Shaders are compiled automatically when `glslangValidator` is on `PATH`; prebuil
 | `--prompt` | Input text |
 | `--max-tokens` | Tokens to generate after prompt (default 64) |
 | `--temperature` | Sampling temperature (default 0.8) |
+| `--ctx-size` | Context window size (default 8192) |
+| `--top-k` | Top-k sampling (default 0 = disabled) |
+| `--top-p` | Top-p nucleus sampling (default 0.9) |
+| `--seed` | RNG seed for reproducibility |
+
+**Note**: Chat mode is enabled by default — prompts are automatically formatted with the model's chat template so instruction-tuned models respond as assistants rather than raw text completions.
 
 ## Architecture
 
 ```
 main.zig
   ├── model.zig        (GGUF metadata + model config)
+  ├── chat.zig         (chat template detection + formatting)
   ├── sampler.zig      (temperature / top-p sampling)
-  ├── tokenizer.zig    (BPE encode/decode)
+  ├── tokenizer.zig    (BPE encode/decode, special token detection)
   ├── weights.zig      (dequant + upload to GPU)
   ├── vulkan_backend.zig (BDA buffers, pipelines)
   ├── compute_graph.zig (DAG + dispatcher)
@@ -56,7 +64,7 @@ main.zig
 - Fused GPU dequant matmul (avoid full FP32 weight VRAM)
 - Flash-attention style tiled attention kernel
 - Multi-GPU model splitting
-- Chat templates for instruct models
+- Architecture-aware chat templates for instruct models (Llama 3, Granite, Gemma, Qwen, Llama 2)
 
 ## Optimizations
 
@@ -82,5 +90,8 @@ All other quantization types (`q4_0`, `q5_0`, `q2_k`, `q3_k`, `q5_k`, `q8_k`) ar
 |------|------|------|------|
 | `llama` architecture | Supported | Matched | Base decoder graph path |
 | `granite` architecture | Supported | Matched | BOS metadata + Granite role token handling |
+| `gemma` architecture | Supported | Matched | Gemma 4 E2B and variants |
+| `qwen` architecture | Supported | Matched | Qwen 3.5 and ChatML format |
+| Chat template detection (Llama 3, Granite, Gemma, Qwen, Llama 2) | Supported | Matched | Auto-detected from GGUF metadata or architecture |
 | Special token passthrough (`<|...|>`) | Supported | Matched | Encoder preserves known special tokens |
 | Sampler: `top_k`, `top_p`, `min_p`, `typical_p` | Supported | Matched | Stateful deterministic RNG across decode steps |

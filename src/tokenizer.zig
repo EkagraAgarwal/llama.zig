@@ -12,6 +12,12 @@ pub const SpecialTokens = struct {
     eot_id: ?TokenID = null,
     start_header_id: ?TokenID = null,
     end_header_id: ?TokenID = null,
+    im_start: ?TokenID = null,
+    im_end: ?TokenID = null,
+    start_of_turn: ?TokenID = null,
+    end_of_turn: ?TokenID = null,
+    inst_start: ?TokenID = null,
+    inst_end: ?TokenID = null,
 };
 
 pub const Tokenizer = struct {
@@ -106,6 +112,12 @@ pub const Tokenizer = struct {
             if (std.mem.eql(u8, tok_str.string, "<|eot_id|>")) tokenizer.special.eot_id = @as(TokenID, @intCast(i));
             if (std.mem.eql(u8, tok_str.string, "<|start_header_id|>")) tokenizer.special.start_header_id = @as(TokenID, @intCast(i));
             if (std.mem.eql(u8, tok_str.string, "<|end_header_id|>")) tokenizer.special.end_header_id = @as(TokenID, @intCast(i));
+            if (std.mem.eql(u8, tok_str.string, "<|im_start|>")) tokenizer.special.im_start = @as(TokenID, @intCast(i));
+            if (std.mem.eql(u8, tok_str.string, "<|im_end|>")) tokenizer.special.im_end = @as(TokenID, @intCast(i));
+            if (std.mem.eql(u8, tok_str.string, "<start_of_turn>")) tokenizer.special.start_of_turn = @as(TokenID, @intCast(i));
+            if (std.mem.eql(u8, tok_str.string, "<end_of_turn>")) tokenizer.special.end_of_turn = @as(TokenID, @intCast(i));
+            if (std.mem.eql(u8, tok_str.string, "[INST]")) tokenizer.special.inst_start = @as(TokenID, @intCast(i));
+            if (std.mem.eql(u8, tok_str.string, "[/INST]")) tokenizer.special.inst_end = @as(TokenID, @intCast(i));
         }
 
         return tokenizer;
@@ -368,7 +380,9 @@ fn findSpecialTokenAt(self: *const Tokenizer, text: []const u8, at: usize) ?Toke
     var best: ?TokenMatch = null;
     for (self.id_to_token, 0..) |tok, i| {
         if (tok.len < 4) continue;
-        if (!(tok[0] == '<' and tok[tok.len - 1] == '>')) continue;
+        const is_bracket_token = (tok[0] == '<' and tok[tok.len - 1] == '>') or
+                                 (tok[0] == '[' and tok[tok.len - 1] == ']');
+        if (!is_bracket_token) continue;
         if (at + tok.len > text.len) continue;
         if (std.mem.eql(u8, text[at .. at + tok.len], tok)) {
             if (best == null or tok.len > best.?.len) {

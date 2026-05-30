@@ -7,6 +7,7 @@ const tokenizer = @import("tokenizer.zig");
 const model = @import("model.zig");
 const weights = @import("weights.zig");
 const sampler = @import("sampler.zig");
+const chat = @import("chat.zig");
 const builtin = @import("builtin");
 const vk = @import("vulkan");
 const windows = if (builtin.os.tag == .windows) std.os.windows else struct {};
@@ -48,7 +49,7 @@ pub fn main(init: std.process.Init) !void {
     var min_p: f32 = 0.0;
     var ctx_size_override: ?u32 = null;
     var debug_logits: u32 = 0;
-    var chat_mode: bool = false;
+    var chat_mode: bool = true;
     var verbose: bool = false;
     var inspect_block: bool = false;
     var prefill_chunk: u32 = 0;
@@ -467,35 +468,11 @@ pub fn main(init: std.process.Init) !void {
         try writer_streaming.interface.flush();
     }
 
-    // Build prompt: apply chat template for Granite if --chat is set.
-    // Format: <|start_of_role|>user<|end_of_role|>{prompt}<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>
-    var final_prompt: []const u8 = prompt_text.?;
-    var final_prompt_owned: bool = false;
-    if (chat_mode) {
-        if (cfg.arch == .llama and tok.special.begin_of_text != null and tok.special.start_header_id != null and tok.special.end_header_id != null and tok.special.eot_id != null) {
-            const bot = tok.id_to_token[tok.special.begin_of_text.?];
-            const sh = tok.id_to_token[tok.special.start_header_id.?];
-            const eh = tok.id_to_token[tok.special.end_header_id.?];
-            const eot = tok.id_to_token[tok.special.eot_id.?];
-            final_prompt = try std.fmt.allocPrint(allocator, "{s}{s}user{s}\n\n{s}{s}{s}assistant{s}\n\n", .{
-                bot, sh, eh, prompt_text.?, eot, sh, eh,
-            });
-        } else {
-            const sr_str: []const u8 = if (tok.special.start_of_role) |id| tok.id_to_token[id] else "<|start_of_role|>";
-            const er_str: []const u8 = if (tok.special.end_of_role) |id| tok.id_to_token[id] else "<|end_of_role|>";
-            const et_str: []const u8 = if (tok.special.end_of_text) |id| tok.id_to_token[id] else "<|end_of_text|>";
-            final_prompt = try std.fmt.allocPrint(allocator, "{s}user{s}{s}{s}\n{s}assistant{s}", .{
-                sr_str, er_str, et_str, prompt_text.?, sr_str, er_str,
-            });
-        }
-        final_prompt_owned = true;
-    }
-
-    const token_ids = try tok.encode(final_prompt, allocator);
+    // Build prompt: auto-detect chat format from template or architecture and apply
+    // appropriate control tokens so instruction-tuned models respond as assistants.
+    const format = chat.detectChatFormat(tok.chat_template, cfg.arch, &tok.special);
+    const token_ids = try chat.buildChatPrompt(&tok, format, prompt_text.?, allocator);
     defer allocator.free(token_ids);
-    if (final_prompt_owned) {
-        defer allocator.free(final_prompt);
-    }
 
     const embd_tensor = ctx.tensors.get("token_embd.weight") orelse return error.MissingEmbeddings;
     const embd_standard_layout = embd_tensor.ne[0] == cfg.n_embd;
