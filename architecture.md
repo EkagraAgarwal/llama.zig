@@ -140,16 +140,40 @@ while (generated < max_tokens) : (generated += 1) {
     // 6. Output token
     try tok.decode(&[_]tokenizer.TokenID{current_token}, writer);
 
-    // 7. Fetch next embedding (GPU dequant path or CPU path)
+    // 7. Fetch next embedding and execute graph (GPU dequant path)
     if (embd_quant_gpu) {
-        try dispatcher.executeGetRowsQ(...);  // GPU embedding lookup
-    } else { ... }  // CPU embedding lookup
+        // Write token_id to indices buffer
+        const mapped_idx = try vk_ctx.vkd.mapMemory(...);
+        @as(*u32, @ptrCast(@alignCast(mapped_idx))).* = current_token;
+        vk_ctx.vkd.unmapMemory(...);
 
-    // 8. Execute transformer forward pass
-    try dispatcher.execute(pos);
+        // Batched: embed lookup + graph dispatch in ONE command buffer
+        try dispatcher.ensureSubmitResources();
+        _ = vk_ctx.vkd.dispatch.vkResetCommandBuffer.?(dispatcher.cmd, ...);
+        _ = vk_ctx.vkd.dispatch.vkBeginCommandBuffer.?(dispatcher.cmd, ...);
+        dispatcher.recordEmbedAndGraph(dispatcher.cmd, pos, embed_indices, ...);
+        _ = vk_ctx.vkd.dispatch.vkEndCommandBuffer.?(dispatcher.cmd);
+        try dispatcher.submitAndWait(dispatcher.cmd);
+    } else { ... }  // CPU embedding path (separate calls)
+
     pos += 1;
 }
 ```
+
+### Batched GPU Path
+
+For quantized embeddings (`embd_quant_gpu`), the embedding lookup and graph execution are combined into a single command buffer submission per token:
+
+1. Write `token_id` to `embed_indices` buffer (host-visible,4 bytes)
+2. Reset and begin command buffer
+3. `recordEmbedAndGraph()` records:
+   - `get_rows_q` dispatch (GPU embedding lookup)
+   - Pipeline barrier (shader_write → shader_read)
+   - Full graph dispatch (all transformer layers)
+4. End and submit command buffer
+5. Wait for completion
+
+This reduces per-token CPU overhead from 2 submits/wait cycles to 1.
 
 ### Key Functions
 
@@ -159,6 +183,7 @@ while (generated < max_tokens) : (generated += 1) {
 | `token_sampler.sample()` | `src/sampler.zig` | CPU sampling with temperature/top-p/min-p |
 | `dispatcher.executeGetRowsQ()` | `src/compute_graph.zig:721-768` | GPU embedding lookup for quantized weights |
 | `dispatcher.execute()` | `src/compute_graph.zig:667-678` | Execute full DAG for single token |
+| `dispatcher.recordEmbedAndGraph()` | `src/compute_graph.zig:770+` | Batched GPU embedding lookup + graph dispatch |
 
 ### Sampling Paths
 

@@ -71,6 +71,15 @@ main.zig
 - **Native Q4_K and Q6_K GPU path**: The `matmul` and `matvec` shaders provide on-the-fly dequantization during matrix multiplication. The `matvec` shaders use a thread-per-column `BlockDot` loop that is hardware-independent and correctly handles different subgroup sizes (e.g., AMD vs. NVIDIA).
 - **F16 KV Cache**: The KV cache uses 16-bit floats (f16) packed into 32-bit integers, halving VRAM requirements for the context window while maintaining compatibility with all Vulkan 1.2 devices.
 - **Compressed weight upload**: `isNativeQuantType` enables q6_k weights to upload as packed binary directly to GPU rather than dequantizing to f32 on CPU first.
+- **Batched GPU submits**: The decode loop combines embedding lookup and graph execution into a single command buffer submission per token, reducing CPU-GPU synchronization overhead.
+
+### Performance
+
+| Model | Quant | Generation Speed |
+|-------|-------|-----------------|
+| Llama-3.2-3B-Instruct | Q4_K_M | ~8.3 t/s |
+| Llama-3.2-1B | Q4_K_M | ~14.3 t/s |
+| Granite-4.0-350m | BF16 | ~35 t/s |
 
 ## Compatibility Matrix
 

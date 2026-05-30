@@ -741,41 +741,55 @@ pub fn main(init: std.process.Init) !void {
 
         if (generated + 1 >= max_tokens) break;
         if (embd_quant_gpu and embd_gpu_buf != null) {
-            try dispatcher.executeGetRowsQ(
+            const mapped_idx = try vk_ctx.vkd.mapMemory(vk_ctx.device, embed_indices.memory, 0, 4, .{});
+            @as(*u32, @ptrCast(@alignCast(mapped_idx))).* = current_token;
+            vk_ctx.vkd.unmapMemory(vk_ctx.device, embed_indices.memory);
+
+            try dispatcher.ensureSubmitResources();
+            const reset_flags = if ((dispatcher.submit_count & 63) == 63)
+                vk.CommandBufferResetFlags{ .release_resources_bit = true }
+            else
+                vk.CommandBufferResetFlags{};
+            _ = vk_ctx.vkd.dispatch.vkResetCommandBuffer.?(dispatcher.cmd, reset_flags);
+            _ = vk_ctx.vkd.dispatch.vkBeginCommandBuffer.?(dispatcher.cmd, &.{ .flags = .{ .one_time_submit_bit = true }, .p_inheritance_info = null });
+            dispatcher.recordEmbedAndGraph(
+                dispatcher.cmd,
+                pos,
                 embed_indices,
                 embd_gpu_buf.?.*,
                 input_offset,
-                current_token,
                 cfg.n_embd,
                 @intFromEnum(embd_tensor.type),
                 embd_row_bytes,
                 embd_scale_bits,
             );
+            _ = vk_ctx.vkd.dispatch.vkEndCommandBuffer.?(dispatcher.cmd);
+            try dispatcher.submitAndWait(dispatcher.cmd);
         } else {
             if (embd_cache_transposed) |cache| {
-                try loadEmbeddingCached(cache, embd_tensor, current_token, cfg.n_embd, &vk_ctx, &input_staging, &scratchpad, &graph, cfg.embedding_scale);
+                try loadEmbeddingCached(cache, embd_tensor, current_token, cfg.n_embd,&vk_ctx, &input_staging, &scratchpad, &graph, cfg.embedding_scale);
             } else {
                 try loadEmbedding(&ctx, embd_tensor, current_token, cfg.n_embd, &vk_ctx, &input_staging, &scratchpad, &graph, cfg.embedding_scale);
             }
-        }
 
-        // Debug: verify input embedding actually changed
-        if (verbose) {
-            const inp_t = graph.tensors.get("input").?;
-            const inp_sz = @min(model.f32Bytes(8), inp_t.size);
-            var dbg_staging = try vulkan.Buffer.init(&vk_ctx, inp_sz, .{ .transfer_dst_bit = true }, .{ .host_visible_bit = true, .host_coherent_bit = true });
-            defer dbg_staging.deinit(&vk_ctx);
-            try vk_ctx.copyBufferOffset(scratchpad, inp_t.offset, dbg_staging, 0, inp_sz);
-            const dbg_mapped = try vk_ctx.vkd.mapMemory(vk_ctx.device, dbg_staging.memory, 0, inp_sz, .{});
-            const dbg_vals = @as([*]const f32, @ptrCast(@alignCast(dbg_mapped)))[0..8];
-            try writer.print("[debug] input[0..8] before execute({}): ", .{pos});
-            for (dbg_vals) |v| try writer.print("{d:.4} ", .{v});
-            try writer.print("(token={})\n", .{current_token});
-            vk_ctx.vkd.unmapMemory(vk_ctx.device, dbg_staging.memory);
-            try writer_streaming.interface.flush();
-        }
+            // Debug: verify input embedding actually changed
+            if (verbose) {
+                const inp_t = graph.tensors.get("input").?;
+                const inp_sz = @min(model.f32Bytes(8), inp_t.size);
+                var dbg_staging = try vulkan.Buffer.init(&vk_ctx, inp_sz, .{ .transfer_dst_bit = true }, .{ .host_visible_bit = true, .host_coherent_bit = true });
+                defer dbg_staging.deinit(&vk_ctx);
+                try vk_ctx.copyBufferOffset(scratchpad, inp_t.offset, dbg_staging, 0, inp_sz);
+                const dbg_mapped = try vk_ctx.vkd.mapMemory(vk_ctx.device, dbg_staging.memory, 0, inp_sz, .{});
+                const dbg_vals = @as([*]const f32, @ptrCast(@alignCast(dbg_mapped)))[0..8];
+                try writer.print("[debug] input[0..8] before execute({}): ", .{pos});
+                for (dbg_vals) |v| try writer.print("{d:.4} ", .{v});
+                try writer.print("(token={})\n", .{current_token});
+                vk_ctx.vkd.unmapMemory(vk_ctx.device, dbg_staging.memory);
+                try writer_streaming.interface.flush();
+            }
 
-        try dispatcher.execute(pos);
+            try dispatcher.execute(pos);
+        }
         pos += 1;
     }
     const t_decode_end = nowNs();

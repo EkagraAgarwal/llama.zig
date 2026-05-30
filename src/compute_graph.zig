@@ -489,7 +489,7 @@ pub const Dispatcher = struct {
         }
     }
 
-    fn ensureSubmitResources(self: *Dispatcher) !void {
+    pub fn ensureSubmitResources(self: *Dispatcher) !void {
         if (self.fence == .null_handle) {
             _ = self.ctx.vkd.dispatch.vkCreateFence.?(self.ctx.device, &.{ .flags = .{} }, null, &self.fence);
         }
@@ -633,7 +633,7 @@ pub const Dispatcher = struct {
         self.ctx.vkd.dispatch.vkCmdDispatch.?(cmd, dx, dy, node.dispatch_z);
     }
 
-    fn submitAndWait(self: *Dispatcher, cmd: vk.CommandBuffer) !void {
+    pub fn submitAndWait(self: *Dispatcher, cmd: vk.CommandBuffer) !void {
         try self.ensureSubmitResources();
         _ = self.ctx.vkd.dispatch.vkResetFences.?(self.ctx.device, 1, (&self.fence)[0..1]);
         const submit_info = vk.SubmitInfo{
@@ -765,6 +765,60 @@ pub const Dispatcher = struct {
 
         _ = self.ctx.vkd.dispatch.vkEndCommandBuffer.?(self.cmd);
         try self.submitAndWait(self.cmd);
+    }
+
+    pub fn recordEmbedAndGraph(
+        self: *Dispatcher,
+        cmd: vk.CommandBuffer,
+        pos: u32,
+        indices_buf: vulkan.Buffer,
+        weights_buf: vulkan.Buffer,
+        out_offset: u64,
+        n_embd: u32,
+        qtype: u32,
+        row_bytes: u32,
+        scale_bits: u32,
+    ) void {
+        const pipe_name = switch (qtype) {
+            @intFromEnum(tensor.Type.q4_0) => "get_rows_q4_0",
+            @intFromEnum(tensor.Type.q4_1) => "get_rows_q4_1",
+            @intFromEnum(tensor.Type.q4_k) => "get_rows_q4_k",
+            @intFromEnum(tensor.Type.q6_k) => "get_rows_q6_k",
+            else => "get_rows_q",
+        };
+        const pipe = self.registry.get(pipe_name) orelse return;
+        var pc = vulkan.PushConstants{
+            .p1 = n_embd,
+            .p2 = 1,
+            .p3 = qtype,
+            .p4 = scale_bits,
+            .p5 = row_bytes,
+            .a = indices_buf.address,
+            .b = weights_buf.address,
+            .c = self.scratchpad.address + out_offset,
+        };
+        self.ctx.vkd.dispatch.vkCmdBindPipeline.?(cmd, .compute, pipe.pipeline);
+        self.ctx.vkd.dispatch.vkCmdPushConstants.?(cmd, pipe.layout, .{ .compute_bit = true }, 0, @sizeOf(vulkan.PushConstants), @ptrCast(&pc));
+        self.ctx.vkd.dispatch.vkCmdDispatch.?(cmd, (n_embd + 255) / 256, 1, 1);
+
+        const barrier = vk.MemoryBarrier{
+            .src_access_mask = .{ .shader_write_bit = true },
+            .dst_access_mask = .{ .shader_read_bit = true },
+        };
+        self.ctx.vkd.dispatch.vkCmdPipelineBarrier.?(
+            cmd,
+            .{ .compute_shader_bit = true },
+            .{ .compute_shader_bit = true },
+            .{},
+            1,
+            (&barrier)[0..1],
+            0,
+            null,
+            0,
+            null,
+        );
+
+        self.recordGraph(cmd, pos);
     }
 
     pub fn executeTopK(
