@@ -21,6 +21,8 @@ layout(push_constant) uniform PC {
 
 layout(local_size_x = 256) in;
 
+shared float s_sum[256];
+
 uint getByte(UIntBuffer buf, uint idx) {
     uint w = buf.data[idx >> 2];
     return (w >> ((idx & 3u) * 8u)) & 0xFFu;
@@ -34,49 +36,69 @@ float f16ToF32(uint h) {
     return unpackHalf2x16(h).x;
 }
 
-float q6kBlockDot(uint row, uint block) {
+float q6kWeight(uint row, uint kidx) {
     const uint QK = 256u;
     const uint BS = 210u;
     uint blocks = (pc.k + QK - 1u) / QK;
-    uint base = (row * blocks + block) * BS;
+    uint b = kidx / QK;
+    uint i = kidx % QK;
+    uint base = (row * blocks + b) * BS;
+
+    uint hsel = i / 128u;
+    uint local = i % 128u;
+    uint l = local % 32u;
+    uint quarter = local / 32u;
+    uint group = (l / 16u);
+    uint scale_index = hsel * 8u + group + quarter * 2u;
+    int sc = int(int(getByte(pc.b, base + 192u + scale_index) << 24u) >> 24u);
+
+    uint qh = getByte(pc.b, base + 128u + hsel * 32u + l);
+    uint ql0 = getByte(pc.b, base + hsel * 64u + l);
+    uint ql1 = getByte(pc.b, base + hsel * 64u + l + 32u);
+    int qv = 0;
+    if (quarter == 0u) qv = int((ql0 & 0xFu) | (((qh >> 0u) & 0x3u) << 4u)) - 32;
+    if (quarter == 1u) qv = int((ql1 & 0xFu) | (((qh >> 2u) & 0x3u) << 4u)) - 32;
+    if (quarter == 2u) qv = int(((ql0 >> 4u) & 0xFu) | (((qh >> 4u) & 0x3u) << 4u)) - 32;
+    if (quarter == 3u) qv = int(((ql1 >> 4u) & 0xFu) | (((qh >> 6u) & 0x3u) << 4u)) - 32;
+
     float d = f16ToF32(getU16(pc.b, base + 208u));
-    float sum = 0.0;
-    
-    for (uint i = 0u; i < 256u; ++i) {
-        uint kidx = block * QK + i;
-        if (kidx >= pc.k) break;
-
-        uint hsel = i / 128u;
-        uint local = i % 128u;
-        uint l = local % 32u;
-        uint quarter = local / 32u;
-        uint group = (l / 16u);
-        uint scale_index = hsel * 8u + group + quarter * 2u;
-        int sc = int(int(getByte(pc.b, base + 192u + scale_index) << 24u) >> 24u);
-
-        uint qh = getByte(pc.b, base + 128u + hsel * 32u + l);
-        uint ql0 = getByte(pc.b, base + hsel * 64u + l);
-        uint ql1 = getByte(pc.b, base + hsel * 64u + l + 32u);
-        int qv = 0;
-        if (quarter == 0u) qv = int((ql0 & 0xFu) | (((qh >> 0u) & 0x3u) << 4u)) - 32;
-        if (quarter == 1u) qv = int((ql1 & 0xFu) | (((qh >> 2u) & 0x3u) << 4u)) - 32;
-        if (quarter == 2u) qv = int(((ql0 >> 4u) & 0xFu) | (((qh >> 4u) & 0x3u) << 4u)) - 32;
-        if (quarter == 3u) qv = int(((ql1 >> 4u) & 0xFu) | (((qh >> 6u) & 0x3u) << 4u)) - 32;
-
-        sum += pc.a.data[kidx] * (d * float(sc) * float(qv));
-    }
-    return sum;
+    return d * float(sc) * float(qv);
 }
 
 void main() {
-    uint col = gl_GlobalInvocationID.x;
-    if (col >= pc.n) return;
+    const uint LOGICAL_SG_SIZE = 32u;
+    const uint COLS_PER_WG = 8u;
+
+    uint lane = gl_LocalInvocationID.x;
+    uint sg_id = lane / LOGICAL_SG_SIZE;
+    uint sg_lane = lane % LOGICAL_SG_SIZE;
+    uint col = gl_WorkGroupID.x * COLS_PER_WG + sg_id;
 
     float sum = 0.0;
-    uint blocks = (pc.k + 255u) / 256u;
-    for (uint bi = 0u; bi < blocks; ++bi) {
-        sum += q6kBlockDot(col, bi);
+
+    if (col < pc.n) {
+        uint blocks = (pc.k + 255u) / 256u;
+        for (uint bi = 0u; bi < blocks; ++bi) {
+            uint k_base = bi * 256u;
+            for (uint i = sg_lane; i < 256u; i += LOGICAL_SG_SIZE) {
+                if (k_base + i < pc.k) {
+                    sum += pc.a.data[k_base + i] * q6kWeight(col, k_base + i);
+                }
+            }
+        }
     }
 
-    pc.c.data[col] = sum;
+    s_sum[lane] = sum;
+    barrier();
+
+    for (uint offset = 16u; offset > 0u; offset >>= 1u) {
+        if (sg_lane < offset) {
+            s_sum[lane] += s_sum[lane + offset];
+        }
+        barrier();
+    }
+
+    if (sg_lane == 0u && col < pc.n) {
+        pc.c.data[col] = s_sum[lane];
+    }
 }
