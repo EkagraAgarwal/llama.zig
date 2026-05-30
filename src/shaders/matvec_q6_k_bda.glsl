@@ -1,6 +1,8 @@
 #version 450
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_EXT_buffer_reference : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_clustered : require
 
 layout(buffer_reference, std430, buffer_reference_align = 4) buffer FloatBuffer { float data[]; };
 layout(buffer_reference, std430, buffer_reference_align = 4) buffer UIntBuffer { uint data[]; };
@@ -21,8 +23,6 @@ layout(push_constant) uniform PC {
 
 layout(local_size_x = 256) in;
 
-shared float s_sum[256];
-
 uint getByte(UIntBuffer buf, uint idx) {
     uint w = buf.data[idx >> 2];
     return (w >> ((idx & 3u) * 8u)) & 0xFFu;
@@ -36,69 +36,61 @@ float f16ToF32(uint h) {
     return unpackHalf2x16(h).x;
 }
 
-float q6kWeight(uint row, uint kidx) {
-    const uint QK = 256u;
-    const uint BS = 210u;
-    uint blocks = (pc.k + QK - 1u) / QK;
-    uint b = kidx / QK;
-    uint i = kidx % QK;
-    uint base = (row * blocks + b) * BS;
-
-    uint hsel = i / 128u;
-    uint local = i % 128u;
-    uint l = local % 32u;
-    uint quarter = local / 32u;
-    uint group = (l / 16u);
-    uint scale_index = hsel * 8u + group + quarter * 2u;
-    int sc = int(int(getByte(pc.b, base + 192u + scale_index) << 24u) >> 24u);
-
-    uint qh = getByte(pc.b, base + 128u + hsel * 32u + l);
-    uint ql0 = getByte(pc.b, base + hsel * 64u + l);
-    uint ql1 = getByte(pc.b, base + hsel * 64u + l + 32u);
-    int qv = 0;
-    if (quarter == 0u) qv = int((ql0 & 0xFu) | (((qh >> 0u) & 0x3u) << 4u)) - 32;
-    if (quarter == 1u) qv = int((ql1 & 0xFu) | (((qh >> 2u) & 0x3u) << 4u)) - 32;
-    if (quarter == 2u) qv = int(((ql0 >> 4u) & 0xFu) | (((qh >> 4u) & 0x3u) << 4u)) - 32;
-    if (quarter == 3u) qv = int(((ql1 >> 4u) & 0xFu) | (((qh >> 6u) & 0x3u) << 4u)) - 32;
-
-    float d = f16ToF32(getU16(pc.b, base + 208u));
-    return d * float(sc) * float(qv);
-}
-
 void main() {
     const uint LOGICAL_SG_SIZE = 32u;
     const uint COLS_PER_WG = 8u;
-
     uint lane = gl_LocalInvocationID.x;
-    uint sg_id = lane / LOGICAL_SG_SIZE;
-    uint sg_lane = lane % LOGICAL_SG_SIZE;
-    uint col = gl_WorkGroupID.x * COLS_PER_WG + sg_id;
+    uint subgroup_id = lane / LOGICAL_SG_SIZE;
+    uint col = gl_WorkGroupID.x * COLS_PER_WG + subgroup_id;
+    uint base_lane = lane % LOGICAL_SG_SIZE;
+
+    if (col >= pc.n) return;
 
     float sum = 0.0;
+    uint blocks = (pc.k + 255u) / 256u;
 
-    if (col < pc.n) {
-        uint blocks = (pc.k + 255u) / 256u;
-        for (uint bi = 0u; bi < blocks; ++bi) {
-            uint k_base = bi * 256u;
-            for (uint i = sg_lane; i < 256u; i += LOGICAL_SG_SIZE) {
-                if (k_base + i < pc.k) {
-                    sum += pc.a.data[k_base + i] * q6kWeight(col, k_base + i);
-                }
-            }
+    for (uint bi = 0u; bi < blocks; ++bi) {
+        uint k_base = bi * 256u;
+        uint base = (col * blocks + bi) * 210u;
+
+        float d = f16ToF32(getU16(pc.b, base + 208u));
+
+        for (uint hsel = 0u; hsel < 2u; ++hsel) {
+            uint qh_base = base + 128u + hsel * 32u;
+            uint ql0_base = base + hsel * 64u;
+            uint ql1_base = base + hsel * 64u + 32u;
+
+            uint l = base_lane;
+            uint group = l / 16u;
+
+            uint qh = getByte(pc.b, qh_base + l);
+            uint ql0 = getByte(pc.b, ql0_base + l);
+            uint ql1 = getByte(pc.b, ql1_base + l);
+
+            int qv0 = int((ql0 & 0xFu) | (((qh >> 0u) & 0x3u) << 4u)) - 32;
+            int qv1 = int((ql1 & 0xFu) | (((qh >> 2u) & 0x3u) << 4u)) - 32;
+            int qv2 = int(((ql0 >> 4u) & 0xFu) | (((qh >> 4u) & 0x3u) << 4u)) - 32;
+            int qv3 = int(((ql1 >> 4u) & 0xFu) | (((qh >> 6u) & 0x3u) << 4u)) - 32;
+
+            int sc0 = int(int(getByte(pc.b, base + 192u + hsel * 8u + group + 0u) << 24u) >> 24u);
+            int sc1 = int(int(getByte(pc.b, base + 192u + hsel * 8u + group + 2u) << 24u) >> 24u);
+            int sc2 = int(int(getByte(pc.b, base + 192u + hsel * 8u + group + 4u) << 24u) >> 24u);
+            int sc3 = int(int(getByte(pc.b, base + 192u + hsel * 8u + group + 6u) << 24u) >> 24u);
+
+            uint k0 = k_base + hsel * 128u + 0u * 32u + l;
+            uint k1 = k_base + hsel * 128u + 1u * 32u + l;
+            uint k2 = k_base + hsel * 128u + 2u * 32u + l;
+            uint k3 = k_base + hsel * 128u + 3u * 32u + l;
+
+            if (k0 < pc.k) sum += pc.a.data[k0] * (d * float(sc0) * float(qv0));
+            if (k1 < pc.k) sum += pc.a.data[k1] * (d * float(sc1) * float(qv1));
+            if (k2 < pc.k) sum += pc.a.data[k2] * (d * float(sc2) * float(qv2));
+            if (k3 < pc.k) sum += pc.a.data[k3] * (d * float(sc3) * float(qv3));
         }
     }
 
-    s_sum[lane] = sum;
-    barrier();
-
-    for (uint offset = 16u; offset > 0u; offset >>= 1u) {
-        if (sg_lane < offset) {
-            s_sum[lane] += s_sum[lane + offset];
-        }
-        barrier();
-    }
-
-    if (sg_lane == 0u && col < pc.n) {
-        pc.c.data[col] = s_sum[lane];
+    float final_sum = subgroupClusteredAdd(sum, 32u);
+    if (base_lane == 0u) {
+        pc.c.data[col] = final_sum;
     }
 }
