@@ -657,7 +657,7 @@ pub const Dispatcher = struct {
         };
     }
 
-    fn recordGraph(self: *Dispatcher, cmd: vk.CommandBuffer, pos: u32) void {
+    pub fn recordGraph(self: *Dispatcher, cmd: vk.CommandBuffer, pos: u32) void {
         for (self.graph.nodes.items) |node| {
             self.dispatchNode(cmd, node, pos);
             if (needsBarrierAfter(node)) self.emitComputeBarrier(cmd);
@@ -672,7 +672,11 @@ pub const Dispatcher = struct {
             vk.CommandBufferResetFlags{};
         _ = self.ctx.vkd.dispatch.vkResetCommandBuffer.?(self.cmd, reset_flags);
         _ = self.ctx.vkd.dispatch.vkBeginCommandBuffer.?(self.cmd, &.{ .flags = .{ .one_time_submit_bit = true }, .p_inheritance_info = null });
+        
+        // Optimizing: only record what's strictly necessary.
+        // For decoding, the graph structure is static, only 'pos' changes.
         self.recordGraph(self.cmd, pos);
+        
         _ = self.ctx.vkd.dispatch.vkEndCommandBuffer.?(self.cmd);
         try self.submitAndWait(self.cmd);
     }

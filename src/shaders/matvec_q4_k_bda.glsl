@@ -52,26 +52,38 @@ void main() {
     for (uint bi = 0u; bi < blocks; ++bi) {
         uint k_base = bi * 256u;
         uint base = (col * blocks + bi) * 144u;
+        uint w_base = base / 4u;
 
-        float d = f16ToF32(getU16(pc.b, base + 0u));
-        float min = f16ToF32(getU16(pc.b, base + 2u));
-        uint sbase = base + 4u;
-        uint qbase = base + 16u;
+        uint d_dmin = pc.b.data[w_base];
+        float d = f16ToF32(d_dmin & 0xFFFFu);
+        float min = f16ToF32(d_dmin >> 16u);
+
+        uint sw0 = pc.b.data[w_base + 1u];
+        uint sw1 = pc.b.data[w_base + 2u];
+        uint sw2 = pc.b.data[w_base + 3u];
 
         for (uint sb = 0u; sb < 4u; ++sb) {
-            uint is = sb * 2u;
             uint sc0, m0, sc1, m1;
-
-            if (is < 4u) {
-                sc0 = getByte(pc.b, sbase + is + 0u) & 0x3Fu;
-                m0  = getByte(pc.b, sbase + is + 4u) & 0x3Fu;
-                sc1 = getByte(pc.b, sbase + is + 1u) & 0x3Fu;
-                m1  = getByte(pc.b, sbase + is + 5u) & 0x3Fu;
+            if (sb == 0u) {
+                sc0 = sw0 & 0x3Fu;
+                sc1 = (sw0 >> 8u) & 0x3Fu;
+                m0  = sw1 & 0x3Fu;
+                m1  = (sw1 >> 8u) & 0x3Fu;
+            } else if (sb == 1u) {
+                sc0 = (sw0 >> 16u) & 0x3Fu;
+                sc1 = (sw0 >> 24u) & 0x3Fu;
+                m0  = (sw1 >> 16u) & 0x3Fu;
+                m1  = (sw1 >> 24u) & 0x3Fu;
+            } else if (sb == 2u) {
+                sc0 = (sw2 & 0xFu) | ((sw0 >> 2u) & 0x30u);
+                sc1 = ((sw2 >> 8u) & 0xFu) | ((sw0 >> 10u) & 0x30u);
+                m0  = ((sw2 >> 4u) & 0xFu) | ((sw1 >> 2u) & 0x30u);
+                m1  = ((sw2 >> 12u) & 0xFu) | ((sw1 >> 10u) & 0x30u);
             } else {
-                sc0 = (getByte(pc.b, sbase + is + 4u) & 0xFu) | ((getByte(pc.b, sbase + is - 4u) >> 6u) << 4u);
-                m0  = (getByte(pc.b, sbase + is + 4u) >> 4u) | ((getByte(pc.b, sbase + is - 0u) >> 6u) << 4u);
-                sc1 = (getByte(pc.b, sbase + is + 5u) & 0xFu) | ((getByte(pc.b, sbase + is - 3u) >> 6u) << 4u);
-                m1  = (getByte(pc.b, sbase + is + 5u) >> 4u) | ((getByte(pc.b, sbase + is + 1u) >> 6u) << 4u);
+                sc0 = ((sw2 >> 16u) & 0xFu) | ((sw0 >> 18u) & 0x30u);
+                sc1 = ((sw2 >> 24u) & 0xFu) | ((sw0 >> 26u) & 0x30u);
+                m0  = ((sw2 >> 20u) & 0xFu) | ((sw1 >> 18u) & 0x30u);
+                m1  = ((sw2 >> 28u) & 0xFu) | ((sw1 >> 26u) & 0x30u);
             }
 
             float d1 = d * float(sc0);
@@ -79,20 +91,15 @@ void main() {
             float d2 = d * float(sc1);
             float m2v = min * float(m1);
 
-            uint sub_qbase = qbase + sb * 32u;
+            uint q_byte_idx = 16u + sb * 32u + base_lane;
+            uint qb = (pc.b.data[w_base + q_byte_idx / 4u] >> ((q_byte_idx & 3u) * 8u)) & 0xFFu;
 
-            uint qb = getByte(pc.b, sub_qbase + base_lane);
-
-            uint k_idx0 = k_base + sb * 64u + base_lane;
-            if (k_idx0 < pc.k) {
-                float w0 = d1 * float(qb & 0xFu) - m1v;
-                sum += pc.a.data[k_idx0] * w0;
+            uint k_idx = k_base + sb * 64u + base_lane;
+            if (k_idx < pc.k) {
+                sum += pc.a.data[k_idx] * (d1 * float(qb & 0xFu) - m1v);
             }
-
-            uint k_idx1 = k_base + sb * 64u + base_lane + 32u;
-            if (k_idx1 < pc.k) {
-                float w1 = d2 * float(qb >> 4u) - m2v;
-                sum += pc.a.data[k_idx1] * w1;
+            if (k_idx + 32u < pc.k) {
+                sum += pc.a.data[k_idx + 32u] * (d2 * float(qb >> 4u) - m2v);
             }
         }
     }

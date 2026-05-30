@@ -32,6 +32,15 @@ uint getU16(UIntBuffer buf, uint idx) {
     return getByte(buf, idx) | (getByte(buf, idx + 1u) << 8u);
 }
 
+uint getUintUnaligned(UIntBuffer buf, uint byte_idx) {
+    uint word_idx = byte_idx >> 2u;
+    uint shift = (byte_idx & 3u) * 8u;
+    uint w0 = buf.data[word_idx];
+    if (shift == 0u) return w0;
+    uint w1 = buf.data[word_idx + 1u];
+    return (w0 >> shift) | (w1 << (32u - shift));
+}
+
 float f16ToF32(uint h) {
     return unpackHalf2x16(h).x;
 }
@@ -53,7 +62,12 @@ void main() {
         uint k_base = bi * 256u;
         uint base = (col * blocks + bi) * 210u;
 
-        float d = f16ToF32(getU16(pc.b, base + 208u));
+        float d = f16ToF32(getUintUnaligned(pc.b, base + 208u) & 0xFFFFu);
+
+        uint sw0 = getUintUnaligned(pc.b, base + 192u);
+        uint sw1 = getUintUnaligned(pc.b, base + 196u);
+        uint sw2 = getUintUnaligned(pc.b, base + 200u);
+        uint sw3 = getUintUnaligned(pc.b, base + 204u);
 
         for (uint hsel = 0u; hsel < 2u; ++hsel) {
             uint qh_base = base + 128u + hsel * 32u;
@@ -72,10 +86,18 @@ void main() {
             int qv2 = int(((ql0 >> 4u) & 0xFu) | (((qh >> 4u) & 0x3u) << 4u)) - 32;
             int qv3 = int(((ql1 >> 4u) & 0xFu) | (((qh >> 6u) & 0x3u) << 4u)) - 32;
 
-            int sc0 = int(int(getByte(pc.b, base + 192u + hsel * 8u + group + 0u) << 24u) >> 24u);
-            int sc1 = int(int(getByte(pc.b, base + 192u + hsel * 8u + group + 2u) << 24u) >> 24u);
-            int sc2 = int(int(getByte(pc.b, base + 192u + hsel * 8u + group + 4u) << 24u) >> 24u);
-            int sc3 = int(int(getByte(pc.b, base + 192u + hsel * 8u + group + 6u) << 24u) >> 24u);
+            int sc0, sc1, sc2, sc3;
+            if (hsel == 0u) {
+                sc0 = int(int((sw0 >> (group * 8u)) << 24u) >> 24u);
+                sc1 = int(int((sw0 >> ((group + 2u) * 8u)) << 24u) >> 24u);
+                sc2 = int(int((sw1 >> (group * 8u)) << 24u) >> 24u);
+                sc3 = int(int((sw1 >> ((group + 2u) * 8u)) << 24u) >> 24u);
+            } else {
+                sc0 = int(int((sw2 >> (group * 8u)) << 24u) >> 24u);
+                sc1 = int(int((sw2 >> ((group + 2u) * 8u)) << 24u) >> 24u);
+                sc2 = int(int((sw3 >> (group * 8u)) << 24u) >> 24u);
+                sc3 = int(int((sw3 >> ((group + 2u) * 8u)) << 24u) >> 24u);
+            }
 
             uint k0 = k_base + hsel * 128u + 0u * 32u + l;
             uint k1 = k_base + hsel * 128u + 1u * 32u + l;

@@ -43,42 +43,39 @@ float q4kWeight(uint row, uint kidx) {
     uint b = kidx / QK;
     uint i = kidx % QK;
     uint base = (row * blocks + b) * BS;
+    uint w_base = base / 4u;
 
-    float d = f16ToF32(getU16(pc.b, base + 0u));
-    float min = f16ToF32(getU16(pc.b, base + 2u));
+    uint d_dmin = pc.b.data[w_base];
+    float d = f16ToF32(d_dmin & 0xFFFFu);
+    float min = f16ToF32(d_dmin >> 16u);
 
-    uint sbase = base + 4u;
-    uint is = (i / 64u) * 2u;
-    uint sc0, m0, sc1, m1;
-    if (is + 0u < 4u) {
-        sc0 = getByte(pc.b, sbase + is + 0u) & 0x3Fu;
-        m0 = getByte(pc.b, sbase + is + 4u) & 0x3Fu;
+    uint s_word_idx = 1u + (i / 128u);
+    uint s_word = pc.b.data[w_base + s_word_idx];
+    uint m_word = pc.b.data[w_base + s_word_idx + 1u];
+    
+    uint is = (i / 64u);
+    uint sc, m;
+    if (is == 0u) {
+        sc = s_word & 0x3Fu;
+        m  = m_word & 0x3Fu;
+    } else if (is == 1u) {
+        sc = (s_word >> 8u) & 0x3Fu;
+        m  = (m_word >> 8u) & 0x3Fu;
+    } else if (is == 2u) {
+        sc = (pc.b.data[w_base + 3u] & 0xFu) | ((s_word >> 2u) & 0x30u);
+        m  = ((pc.b.data[w_base + 3u] >> 4u) & 0xFu) | ((m_word >> 2u) & 0x30u);
     } else {
-        sc0 = (getByte(pc.b, sbase + is + 4u) & 0xFu) | ((getByte(pc.b, sbase + is - 4u) >> 6u) << 4u);
-        m0 = (getByte(pc.b, sbase + is + 4u) >> 4u) | ((getByte(pc.b, sbase + is - 0u) >> 6u) << 4u);
-    }
-    if (is + 1u < 4u) {
-        sc1 = getByte(pc.b, sbase + is + 1u) & 0x3Fu;
-        m1 = getByte(pc.b, sbase + is + 5u) & 0x3Fu;
-    } else {
-        sc1 = (getByte(pc.b, sbase + is + 5u) & 0xFu) | ((getByte(pc.b, sbase + is - 3u) >> 6u) << 4u);
-        m1 = (getByte(pc.b, sbase + is + 5u) >> 4u) | ((getByte(pc.b, sbase + is + 1u) >> 6u) << 4u);
+        sc = ((pc.b.data[w_base + 3u] >> 16u) & 0xFu) | ((s_word >> 18u) & 0x30u);
+        m  = ((pc.b.data[w_base + 3u] >> 20u) & 0xFu) | ((m_word >> 18u) & 0x30u);
     }
 
-    float d1 = d * float(sc0);
-    float m1v = min * float(m0);
-    float d2 = d * float(sc1);
-    float m2v = min * float(m1);
-
-    uint qbase = base + 16u + (i / 64u) * 32u + (i & 31u);
-    uint qb = getByte(pc.b, qbase);
-    uint q4l = qb & 0xFu;
-    uint q4h = qb >> 4u;
+    uint q_byte_idx = 16u + (i / 64u) * 32u + (i & 31u);
+    uint qb = (pc.b.data[w_base + q_byte_idx / 4u] >> ((q_byte_idx & 3u) * 8u)) & 0xFFu;
 
     if ((i & 32u) == 0u) {
-        return d1 * float(q4l) - m1v;
+        return (d * float(sc)) * float(qb & 0xFu) - (min * float(m));
     } else {
-        return d2 * float(q4h) - m2v;
+        return (d * float(sc)) * float(qb >> 4u) - (min * float(m));
     }
 }
 

@@ -1,6 +1,7 @@
 #version 450
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_EXT_buffer_reference : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
 
 layout(buffer_reference, std430, buffer_reference_align = 4) buffer FloatBuffer {
     float data[];
@@ -22,42 +23,53 @@ layout(push_constant) uniform PC {
 
 layout(local_size_x = 256) in;
 
-shared float shared_max[256];
-shared float shared_sum[256];
+shared float s_max;
+shared float s_sum;
+shared float sg_results[8]; // 256 / 32 = 8
 
 void main() {
-  uint tid = gl_LocalInvocationID.x;
-  uint n = pc.n;
+    uint tid = gl_LocalInvocationID.x;
+    uint n = pc.n;
 
-  float local_max = -1e30;
-  for (uint i = tid; i < n; i += 256) {
-    local_max = max(local_max, pc.a.data[i]);
-  }
-  shared_max[tid] = local_max;
-  barrier();
+    float local_max = -1e30;
+    for (uint i = tid; i < n; i += 256) {
+        local_max = max(local_max, pc.a.data[i]);
+    }
 
-  for (uint s = 128; s > 0; s >>= 1) {
-    if (tid < s) shared_max[tid] = max(shared_max[tid], shared_max[tid + s]);
+    float sg_max = subgroupMax(local_max);
+    if (gl_SubgroupInvocationID == 0) {
+        sg_results[gl_SubgroupID] = sg_max;
+    }
     barrier();
-  }
-  float max_val = shared_max[0];
-
-  float local_sum = 0.0;
-  for (uint i = tid; i < n; i += 256) {
-    float e = exp(pc.a.data[i] - max_val);
-    pc.c.data[i] = e;
-    local_sum += e;
-  }
-  shared_sum[tid] = local_sum;
-  barrier();
-
-  for (uint s = 128; s > 0; s >>= 1) {
-    if (tid < s) shared_sum[tid] += shared_sum[tid + s];
+    if (tid < 8) {
+        float m = sg_results[tid];
+        float max_val_sg = subgroupMax(m);
+        if (tid == 0) s_max = max_val_sg;
+    }
     barrier();
-  }
-  float sum_val = shared_sum[0];
+    float max_val = s_max;
 
-  for (uint i = tid; i < n; i += 256) {
-    pc.c.data[i] /= sum_val;
-  }
+    float local_sum = 0.0;
+    for (uint i = tid; i < n; i += 256) {
+        float e = exp(pc.a.data[i] - max_val);
+        pc.c.data[i] = e;
+        local_sum += e;
+    }
+
+    float sg_sum = subgroupAdd(local_sum);
+    if (gl_SubgroupInvocationID == 0) {
+        sg_results[gl_SubgroupID] = sg_sum;
+    }
+    barrier();
+    if (tid < 8) {
+        float s = sg_results[tid];
+        float total_sum = subgroupAdd(s);
+        if (tid == 0) s_sum = total_sum;
+    }
+    barrier();
+    float sum_val = s_sum;
+
+    for (uint i = tid; i < n; i += 256) {
+        pc.c.data[i] /= sum_val;
+    }
 }

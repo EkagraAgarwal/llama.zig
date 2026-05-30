@@ -37,6 +37,14 @@ uint getU16(UIntBuffer buf, uint idx) {
 float f16ToF32(uint h) {
     return unpackHalf2x16(h).x;
 }
+uint getUintUnaligned(UIntBuffer buf, uint byte_idx) {
+    uint word_idx = byte_idx >> 2u;
+    uint shift = (byte_idx & 3u) * 8u;
+    uint w0 = buf.data[word_idx];
+    if (shift == 0u) return w0;
+    uint w1 = buf.data[word_idx + 1u];
+    return (w0 >> shift) | (w1 << (32u - shift));
+}
 
 float q6kAt(uint row_base, uint kidx) {
     const uint QK = 256u;
@@ -62,7 +70,7 @@ float q6kAt(uint row_base, uint kidx) {
     if (quarter == 2u) qv = int(((ql0 >> 4u) & 0xFu) | (((qh >> 4u) & 0x3u) << 4u)) - 32;
     if (quarter == 3u) qv = int(((ql1 >> 4u) & 0xFu) | (((qh >> 6u) & 0x3u) << 4u)) - 32;
 
-    float d = f16ToF32(getU16(pc.weights, base + 208u));
+    float d = f16ToF32(getUintUnaligned(pc.weights, base + 208u) & 0xFFFFu);
     return d * float(sc) * float(qv);
 }
 
