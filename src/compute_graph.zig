@@ -624,7 +624,7 @@ pub const Dispatcher = struct {
         var dx = node.dispatch_x;
         var dy = node.dispatch_y;
         if (node.op_type == .matmul_q and node.p1 <= 1) {
-            dx = (node.p2 + 255) / 256;
+            dx = (node.p2 + 7) / 8;
             dy = 1;
         }
 

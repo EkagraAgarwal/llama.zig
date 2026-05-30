@@ -1,6 +1,7 @@
 #version 450
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_EXT_buffer_reference : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
 
 layout(buffer_reference, std430, buffer_reference_align = 4) buffer FloatBuffer { float data[]; };
 layout(buffer_reference, std430, buffer_reference_align = 4) buffer UIntBuffer { uint data[]; };
@@ -72,17 +73,29 @@ float q6kWeight(uint row, uint kidx) {
 }
 
 void main() {
-    uint col = gl_GlobalInvocationID.x;
+    const uint SUBGROUP_SIZE = 32u;
+    const uint COLS_PER_WG = 8u;
+    uint lane = gl_LocalInvocationID.x;
+    uint subgroup_id = lane / SUBGROUP_SIZE;
+    uint col = gl_WorkGroupID.x * COLS_PER_WG + subgroup_id;
+    uint base_lane = lane % SUBGROUP_SIZE;
+
     if (col >= pc.n) return;
-    float sum = 0.0;
+
+    float partial_sum = 0.0;
     uint blocks = (pc.k + 255u) / 256u;
     for (uint bi = 0u; bi < blocks; ++bi) {
         uint k_base = bi * 256u;
-        for (uint i = 0u; i < 256u; ++i) {
+        for (uint i = base_lane; i < 256u; i += SUBGROUP_SIZE) {
             if (k_base + i < pc.k) {
-                sum += pc.a.data[k_base + i] * q6kWeight(col, k_base + i);
+                partial_sum += pc.a.data[k_base + i] * q6kWeight(col, k_base + i);
             }
         }
     }
-    pc.c.data[col] = sum;
+
+    float sum = subgroupAdd(partial_sum);
+
+    if (base_lane == 0) {
+        pc.c.data[col] = sum;
+    }
 }
