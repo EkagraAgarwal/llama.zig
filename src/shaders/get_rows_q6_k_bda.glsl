@@ -35,15 +35,7 @@ uint getU16(UIntBuffer buf, uint idx) {
 }
 
 float f16ToF32(uint h) {
-    uint s = (h >> 15u) & 1u;
-    uint e = (h >> 10u) & 0x1Fu;
-    uint m = h & 0x3FFu;
-    if (e == 0u) {
-        if (m == 0u) return uintBitsToFloat(s << 31u);
-        return uintBitsToFloat(s << 31u) + float(m) * exp2(-24.0);
-    }
-    if (e == 31u) return uintBitsToFloat((s << 31u) | 0x7F800000u | (m << 13u));
-    return uintBitsToFloat((s << 31u) | ((e + 112u) << 23u) | (m << 13u));
+    return unpackHalf2x16(h).x;
 }
 
 float q6kAt(uint row_base, uint kidx) {

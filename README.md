@@ -60,7 +60,7 @@ main.zig
 
 ## Optimizations
 
-- **Native Q6_K GPU path**: The `matmul_q6_k_bda.glsl` shader provides on-the-fly 6-bit block dequantization during matrix multiplication, keeping q6_k tensors compressed at ~6.5 bits/element in VRAM. This applies to both matvec (embedding lookup, attention projections) and full matmul (LM head).
+- **Native Q4_K and Q6_K GPU path**: The `matmul` and `matvec` shaders provide on-the-fly dequantization during matrix multiplication. The `matvec` shaders use a thread-per-column `BlockDot` loop that is hardware-independent and correctly handles different subgroup sizes (e.g., AMD vs. NVIDIA).
 - **Compressed weight upload**: `isNativeQuantType` enables q6_k weights to upload as packed binary directly to GPU rather than dequantizing to f32 on CPU first.
 
 ## Compatibility Matrix

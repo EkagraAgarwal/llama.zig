@@ -99,7 +99,9 @@ These are headless Compute Shaders utilizing `GL_EXT_buffer_reference2` to read 
 - `matmul_bda.glsl` / `matvec_bda.glsl`: Standard matrix operations.
 - `matmul_q4_k_bda.glsl`: Native GPU decoding for the 256-element Q4_K block format. Performs nibble-unpacking on the fly during tile multiplication.
 - `matmul_q6_k_bda.glsl`: Native GPU decoding for the 256-element Q6_K block format. Performs 6-bit nibble-unpacking and scale application on the fly during 16×16 tile multiplication.
-- `matvec_q6_k_bda.glsl`: Native GPU matvec for Q6_K with on-the-fly 6-bit dequantization (256 workitems, 1D).
+- `matvec_q4_k_bda.glsl`: Native GPU matvec for Q4_K with on-the-fly dequantization. Uses a thread-per-column `BlockDot` loop to ensure hardware independence across AMD and Nvidia GPUs.
+- `matvec_q6_k_bda.glsl`: Native GPU matvec for Q6_K with on-the-fly 6-bit dequantization. Uses a thread-per-column `BlockDot` loop to ensure hardware independence across AMD and Nvidia GPUs.
+- `get_rows_q4_k_bda.glsl`: Native GPU embedding lookup for Q4_K weights.
 - `get_rows_q6_k_bda.glsl`: Native GPU embedding lookup for Q6_K weights.
 - `attention_bda.glsl` / `flash_attn_bda.glsl`: Computes scaled dot-product attention over the KV cache.
 - `rope_bda.glsl`: Applies Rotary Positional Embeddings.
