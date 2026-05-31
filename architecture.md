@@ -49,6 +49,8 @@ Implements BPE (Byte-Pair Encoding) and SentencePiece text tokenization.
 - **Special Tokens:** Detects architecture-specific tokens like `<|start_of_role|>` and `<|end_of_text|>`.
 - **Merge Logic:** Performs greedy token merging based on rank tables (`tokenizer.ggml.merges`).
 - **Decoding:** Correctly translates token IDs back into UTF-8 strings, handling leading whitespace markers (e.g., the `▁` or `_` character).
+- **Optional BOS Prepending (`encodeEx`):** Supports encoding text with or without prepending a BOS token. This is used by `src/chat.zig` to prevent multiple duplicate BOS tokens from being generated when tokenizing sub-segments of a chat template.
+- **Chat Format Detection & Base Model Bypass:** Auto-detects chat template format based on GGUF metadata or instruct-specific control tokens. If no template or instruct tokens are present, it bypasses chat formatting (`.unknown`), defaulting base models to standard raw text completion instead of formatting them with instruction wrappers.
 
 ### 2.5 Sampling (`src/sampler.zig`)
 Probabilistic token selection from a raw logit distribution.
@@ -74,11 +76,14 @@ Builds the static DAG structure.
 - Iterates over the transformer layers, adding `GraphNode` structures.
 - Generates operation sequences: `rms_norm` -> `matmul` (Q/K/V) -> `rope` -> `kv_write` -> `attention` -> `matmul` (Out) -> `scaled_add` -> `rms_norm` -> `gelu_mul`/`silu_mul` -> `matmul` -> `scaled_add`.
 - Computes optimal buffer offsets (scratchpad memory planning).
+- **Dynamic Weight Fusion:** Concatenates weights at load-time (QKV weights into `.attn_qkv.weight` and MLP Gate/Up weights into `.ffn_gate_up.weight`) to minimize dispatches.
+- **Fusion Type-Safety (`canFuseQkv` / `canFuseGateUp`):** Checks weight quantization types layer-by-layer. If types do not match (e.g. `Q6_K` value projections alongside `Q4_K` query/key projections in `Q4_K_M` GGUF models), fusions are safely disabled for that layer to prevent GPU memory layout mismatch and NaN propagation.
 
 #### `Dispatcher`
 Executes the `Graph`.
 - Exposes `executePrefillBatch()` and `execute()` for step-by-step dispatch.
-- **Push Constants Mapping:** Maps a generic `GraphNode` (with `p1`-`p5` parameters) into a Vulkan `PushConstants` struct consisting of Buffer Device Addresses (BDA) for `A`, `B`, and `C` tensors.
+- **Push Constants Mapping:** Maps a generic `GraphNode` (with expanded `p1`-`p8` parameters) into a Vulkan `PushConstants` struct consisting of Buffer Device Addresses (BDA) for `A`, `B`, and `C` tensors.
+- **Zero-Cost Offsetting:** Passes offset parameters (`p6-p8`) to the consumer nodes (`rope`, `kv_write`, `attention`, and `silu_mul`). These nodes apply the offsets directly to BDA pointers in shaders, bypassing copy operations.
 - Handles Vulkan pipeline barriers between dependent compute stages (e.g., `shader_write_bit` -> `shader_read_bit`).
 
 ### 3.3 Tensors & Quantization (`src/tensor.zig` & `src/weights.zig`)

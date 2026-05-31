@@ -145,6 +145,10 @@ pub const Tokenizer = struct {
     }
 
     pub fn encode(self: *const Tokenizer, text: []const u8, out_allocator: std.mem.Allocator) ![]TokenID {
+        return self.encodeEx(text, self.add_bos_token, out_allocator);
+    }
+
+    pub fn encodeEx(self: *const Tokenizer, text: []const u8, add_bos: bool, out_allocator: std.mem.Allocator) ![]TokenID {
         var arena_alloc = std.heap.ArenaAllocator.init(self.allocator);
         defer arena_alloc.deinit();
         const arena = arena_alloc.allocator();
@@ -152,7 +156,7 @@ pub const Tokenizer = struct {
         var token_ids: std.ArrayList(TokenID) = .empty;
         errdefer token_ids.deinit(out_allocator);
 
-        if (self.add_bos_token) {
+        if (add_bos) {
             if (self.bos_token_id) |bos| {
                 try token_ids.append(out_allocator, bos);
             }

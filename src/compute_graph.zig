@@ -76,6 +76,9 @@ pub const GraphNode = struct {
     p3: u32 = 0,
     p4: u32 = 0,
     p5: u32 = 0,
+    p6: u32 = 0,
+    p7: u32 = 0,
+    p8: u32 = 0,
 };
 
 pub const Graph = struct {
@@ -186,6 +189,25 @@ pub const GraphBuilder = struct {
         return .{ .out = fallback_out, .in = fallback_in };
     }
 
+    fn canFuseQkv(self: *GraphBuilder, qw: []const u8, kw: []const u8, vw: []const u8) bool {
+        if (self.model_tensors) |tbl| {
+            const qt = tbl.get(qw) orelse return false;
+            const kt = tbl.get(kw) orelse return false;
+            const vt = tbl.get(vw) orelse return false;
+            return qt.type == kt.type and kt.type == vt.type;
+        }
+        return false;
+    }
+
+    fn canFuseGateUp(self: *GraphBuilder, gw: []const u8, uw: []const u8) bool {
+        if (self.model_tensors) |tbl| {
+            const gt = tbl.get(gw) orelse return false;
+            const ut = tbl.get(uw) orelse return false;
+            return gt.type == ut.type;
+        }
+        return false;
+    }
+
     pub fn addTensor(self: *GraphBuilder, name: []const u8, size: u64, role: TensorRole) !void {
         if (self.graph.tensors.contains(name)) return;
         const owned = try self.graph.allocator.dupe(u8, name);
@@ -197,6 +219,10 @@ pub const GraphBuilder = struct {
     }
 
     pub fn addNodeP(self: *GraphBuilder, op: OpType, inputs: []const []const u8, output: []const u8, dx: u32, dy: u32, p1: u32, p2: u32, p3: u32, p4: u32, p5: u32) !void {
+        try self.addNodeP8(op, inputs, output, dx, dy, p1, p2, p3, p4, p5, 0, 0, 0);
+    }
+
+    pub fn addNodeP8(self: *GraphBuilder, op: OpType, inputs: []const []const u8, output: []const u8, dx: u32, dy: u32, p1: u32, p2: u32, p3: u32, p4: u32, p5: u32, p6: u32, p7: u32, p8: u32) !void {
         const owned_in = try self.graph.allocator.alloc([]const u8, inputs.len);
         for (inputs, 0..) |in, i| owned_in[i] = try self.graph.allocator.dupe(u8, in);
         try self.graph.nodes.append(self.graph.allocator, .{
@@ -211,6 +237,9 @@ pub const GraphBuilder = struct {
             .p3 = p3,
             .p4 = p4,
             .p5 = p5,
+            .p6 = p6,
+            .p7 = p7,
+            .p8 = p8,
         });
     }
 
@@ -259,31 +288,40 @@ pub const GraphBuilder = struct {
         const qkvw = try std.fmt.bufPrint(&qkvw_buf, "{s}.attn_qkv.weight", .{ln});
 
         var qn_buf: [64]u8 = undefined;
-        const qn = try std.fmt.bufPrint(&qn_buf, "{s}.q", .{ln});
         var kn_buf: [64]u8 = undefined;
-        const kn = try std.fmt.bufPrint(&kn_buf, "{s}.k", .{ln});
         var vn_buf: [64]u8 = undefined;
-        const vn = try std.fmt.bufPrint(&vn_buf, "{s}.v", .{ln});
+        var qkvn_buf: [64]u8 = undefined;
+
+        var qn: []const u8 = undefined;
+        var kn: []const u8 = undefined;
+        var vn: []const u8 = undefined;
+        var q_offset: u32 = 0;
+        var k_offset: u32 = 0;
+        var v_offset: u32 = 0;
 
         const q_out = n_heads * head_dim;
         const kv_out = n_kv * head_dim;
 
-        if (self.hasTensor(qkvw)) {
-            const qkv_dims = self.matmulDims(qkvw, q_out + 2 * kv_out, n_embd);
-            var qkvn_buf: [64]u8 = undefined;
+        const use_fused_qkv = self.canFuseQkv(qw, kw, vw);
+
+        if (use_fused_qkv) {
             const qkvn = try std.fmt.bufPrint(&qkvn_buf, "{s}.qkv", .{ln});
+            const qkv_dims = struct { out: u32, in: u32 }{ .out = q_out + 2 * kv_out, .in = n_embd };
             try self.addTensor(qkvw, f32Size(qkv_dims.out * qkv_dims.in), .weight);
             try self.addTensor(qkvn, f32Size(qkv_dims.out), .activation);
             try self.addNode(.matmul, &.{ normed, qkvw }, qkvn, (qkv_dims.out + 15) / 16, 1, 1, qkv_dims.out, qkv_dims.in, 0);
 
-            try self.addTensor(qn, f32Size(q_out), .activation);
-            try self.addTensor(kn, f32Size(kv_out), .activation);
-            try self.addTensor(vn, f32Size(kv_out), .activation);
-
-            try self.addNodeP(.copy, &.{qkvn}, qn, (q_out + 63) / 64, 1, q_out, 0, 0, 0, 0);
-            try self.addNodeP(.copy, &.{qkvn}, kn, (kv_out + 63) / 64, 1, kv_out, 0, q_out, 0, 0);
-            try self.addNodeP(.copy, &.{qkvn}, vn, (kv_out + 63) / 64, 1, kv_out, 0, q_out + kv_out, 0, 0);
+            qn = qkvn;
+            kn = qkvn;
+            vn = qkvn;
+            q_offset = 0;
+            k_offset = q_out * 4;
+            v_offset = (q_out + kv_out) * 4;
         } else {
+            qn = try std.fmt.bufPrint(&qn_buf, "{s}.q", .{ln});
+            kn = try std.fmt.bufPrint(&kn_buf, "{s}.k", .{ln});
+            vn = try std.fmt.bufPrint(&vn_buf, "{s}.v", .{ln});
+
             const q_dims = self.matmulDims(qw, q_out, n_embd);
             const k_dims = self.matmulDims(kw, kv_out, n_embd);
             const v_dims = self.matmulDims(vw, kv_out, n_embd);
@@ -337,8 +375,8 @@ pub const GraphBuilder = struct {
         // 5. RoPE
         const q_head_dim = if (n_heads > 0) q_out / n_heads else head_dim;
         const k_head_dim = if (n_kv > 0) kv_out / n_kv else head_dim;
-        try self.addNode(.rope, &.{qn}, qn, (q_out + 63) / 64, 1, n_heads, q_head_dim, pos, rope_bits);
-        try self.addNode(.rope, &.{kn}, kn, (kv_out + 63) / 64, 1, n_kv, k_head_dim, pos, rope_bits);
+        try self.addNodeP8(.rope, &.{qn}, qn, (q_out + 63) / 64, 1, n_heads, q_head_dim, pos, rope_bits, q_offset, 0, 0, 0);
+        try self.addNodeP8(.rope, &.{kn}, kn, (kv_out + 63) / 64, 1, n_kv, k_head_dim, pos, rope_bits, k_offset, 0, 0, 0);
 
         // 6. Attention
         var attn_buf: [64]u8 = undefined;
@@ -347,10 +385,10 @@ pub const GraphBuilder = struct {
 
         var kv_name_buf: [16]u8 = undefined;
         const kv_name = try std.fmt.bufPrint(&kv_name_buf, "kv.{d}", .{layer});
-        try self.addNode(.kv_write, &.{ kn, vn, kv_name }, kn, ((kv_out / 2) + 63) / 64, 1, n_kv, k_head_dim, cfg.max_ctx, pos);
+        try self.addNodeP8(.kv_write, &.{ kn, vn, kv_name }, kn, ((kv_out / 2) + 63) / 64, 1, n_kv, k_head_dim, cfg.max_ctx, pos, k_offset, v_offset, 0, 0);
         const attn_p2 = k_head_dim | (n_kv << 16);
         const attn_scale_bits: u32 = @bitCast(cfg.attention_scale);
-        try self.addNodeP(.attention, &.{ qn, kv_name }, attn, n_heads, 1, n_heads, attn_p2, cfg.max_ctx, pos, attn_scale_bits);
+        try self.addNodeP8(.attention, &.{ qn, kv_name }, attn, n_heads, 1, n_heads, attn_p2, cfg.max_ctx, pos, attn_scale_bits, q_offset, 0, 0);
 
         // 7. Output Projection
         var ow_buf: [64]u8 = undefined;
@@ -397,21 +435,46 @@ pub const GraphBuilder = struct {
         const gw = try std.fmt.bufPrint(&gw_buf, "{s}.ffn_gate.weight", .{ln});
         var uw_buf: [64]u8 = undefined;
         const uw = try std.fmt.bufPrint(&uw_buf, "{s}.ffn_up.weight", .{ln});
-        var gate_buf: [64]u8 = undefined;
-        const gate = try std.fmt.bufPrint(&gate_buf, "{s}.gate", .{ln});
-        var up_buf: [64]u8 = undefined;
-        const up = try std.fmt.bufPrint(&up_buf, "{s}.up", .{ln});
+        var gate_up_w_buf: [64]u8 = undefined;
+        const gate_up_w = try std.fmt.bufPrint(&gate_up_w_buf, "{s}.ffn_gate_up.weight", .{ln});
+        var gate_up_n_buf: [64]u8 = undefined;
+        const gate_up_n = try std.fmt.bufPrint(&gate_up_n_buf, "{s}.gate_up", .{ln});
+
+        var gate: []const u8 = undefined;
+        var up: []const u8 = undefined;
+        var gate_offset: u32 = 0;
+        var up_offset: u32 = 0;
+
         const g_dims = self.matmulDims(gw, n_ff, o_dims.out);
-        const u_dims = self.matmulDims(uw, n_ff, o_dims.out);
-        try self.addTensor(gw, f32Size(g_dims.out * g_dims.in), .weight);
-        try self.addTensor(uw, f32Size(u_dims.out * u_dims.in), .weight);
-        try self.addTensor(gate, f32Size(g_dims.out), .activation);
-        try self.addTensor(up, f32Size(u_dims.out), .activation);
-        try self.addNodeP(.matmul, &.{ ffn_normed, gw }, gate, (g_dims.out + 15) / 16, 1, 1, g_dims.out, g_dims.in, 0, 0);
-        try self.addNodeP(.matmul, &.{ ffn_normed, uw }, up, (u_dims.out + 15) / 16, 1, 1, u_dims.out, u_dims.in, 0, 0);
+        const use_fused_gate_up = self.canFuseGateUp(gw, uw);
+
+        if (use_fused_gate_up) {
+            const gate_up_dims = struct { out: u32, in: u32 }{ .out = g_dims.out * 2, .in = g_dims.in };
+            try self.addTensor(gate_up_w, f32Size(gate_up_dims.out * gate_up_dims.in), .weight);
+            try self.addTensor(gate_up_n, f32Size(gate_up_dims.out), .activation);
+            try self.addNode(.matmul, &.{ ffn_normed, gate_up_w }, gate_up_n, (gate_up_dims.out + 15) / 16, 1, 1, gate_up_dims.out, gate_up_dims.in, 0);
+
+            gate = gate_up_n;
+            up = gate_up_n;
+            gate_offset = 0;
+            up_offset = g_dims.out * 4;
+        } else {
+            var gate_buf: [64]u8 = undefined;
+            gate = try self.graph.allocator.dupe(u8, try std.fmt.bufPrint(&gate_buf, "{s}.gate", .{ln}));
+            var up_buf: [64]u8 = undefined;
+            up = try self.graph.allocator.dupe(u8, try std.fmt.bufPrint(&up_buf, "{s}.up", .{ln}));
+
+            const u_dims = self.matmulDims(uw, n_ff, o_dims.out);
+            try self.addTensor(gw, f32Size(g_dims.out * g_dims.in), .weight);
+            try self.addTensor(uw, f32Size(u_dims.out * u_dims.in), .weight);
+            try self.addTensor(gate, f32Size(g_dims.out), .activation);
+            try self.addTensor(up, f32Size(u_dims.out), .activation);
+            try self.addNodeP(.matmul, &.{ ffn_normed, gw }, gate, (g_dims.out + 15) / 16, 1, 1, g_dims.out, g_dims.in, 0, 0);
+            try self.addNodeP(.matmul, &.{ ffn_normed, uw }, up, (u_dims.out + 15) / 16, 1, 1, u_dims.out, u_dims.in, 0, 0);
+        }
 
         const activation_op: OpType = if (cfg.activation == .gelu) .gelu_mul else .silu_mul;
-        try self.addNode(activation_op, &.{ gate, up }, gate, (g_dims.out + 63) / 64, 1, g_dims.out, 0, 0, 0);
+        try self.addNodeP8(activation_op, &.{ gate, up }, gate, (g_dims.out + 63) / 64, 1, g_dims.out, 0, 0, 0, gate_offset, up_offset, gate_offset, 0);
 
         var dw_buf: [64]u8 = undefined;
         const dw = try std.fmt.bufPrint(&dw_buf, "{s}.ffn_down.weight", .{ln});
@@ -606,6 +669,9 @@ pub const Dispatcher = struct {
             .p3 = node.p3,
             .p4 = node.p4,
             .p5 = node.p5,
+            .p6 = node.p6,
+            .p7 = node.p7,
+            .p8 = node.p8,
             .a = 0,
             .b = 0,
             .c = 0,
@@ -613,21 +679,21 @@ pub const Dispatcher = struct {
 
         switch (node.op_type) {
             .kv_write => {
-                pc.a = self.tensorAddr(node.input_names[0]);
-                pc.b = self.tensorAddr(node.input_names[1]);
+                pc.a = self.tensorAddr(node.input_names[0]) + node.p5;
+                pc.b = self.tensorAddr(node.input_names[1]) + node.p6;
                 pc.c = self.tensorAddr(node.input_names[2]);
                 pc.p4 = pos;
             },
             .attention => {
-                pc.a = self.tensorAddr(node.input_names[0]);
+                pc.a = self.tensorAddr(node.input_names[0]) + node.p6;
                 pc.b = self.tensorAddr(node.input_names[1]);
                 pc.c = self.tensorAddr(node.output_name);
                 pc.p4 = pos;
                 if (pos + 1 >= self.flash_attn_threshold) pc.p6 = 64;
             },
             .rope => {
-                if (node.input_names.len >= 1) pc.a = self.tensorAddr(node.input_names[0]);
-                pc.c = self.tensorAddr(node.output_name);
+                if (node.input_names.len >= 1) pc.a = self.tensorAddr(node.input_names[0]) + node.p5;
+                pc.c = self.tensorAddr(node.output_name) + node.p5;
                 pc.p3 = pos;
             },
             .get_rows_q => {
@@ -638,6 +704,11 @@ pub const Dispatcher = struct {
             .copy => {
                 pc.a = self.tensorAddr(node.input_names[0]);
                 pc.c = self.tensorAddr(node.output_name);
+            },
+            .silu_mul, .gelu_mul => {
+                pc.a = self.tensorAddr(node.input_names[0]) + node.p5;
+                pc.b = self.tensorAddr(node.input_names[1]) + node.p6;
+                pc.c = self.tensorAddr(node.output_name) + node.p7;
             },
             else => {
                 if (node.input_names.len >= 1) pc.a = self.tensorAddr(node.input_names[0]);

@@ -16,6 +16,7 @@ pub fn detectChatFormat(
     arch: model.Architecture,
     special: *const tokenizer.SpecialTokens,
 ) ChatFormat {
+    _ = arch;
     if (chat_template) |tpl| {
         if (std.mem.indexOf(u8, tpl, "<|im_start|>") != null) return .chatml;
         if (std.mem.indexOf(u8, tpl, "<start_of_turn>") != null) return .gemma;
@@ -25,16 +26,9 @@ pub fn detectChatFormat(
     }
     if (special.im_start != null) return .chatml;
     if (special.start_of_turn != null) return .gemma;
-    if (special.begin_of_text != null) return .llama3;
     if (special.inst_start != null) return .llama2;
     if (special.start_of_role != null) return .granite;
-    return switch (arch) {
-        .qwen => .chatml,
-        .gemma => .gemma,
-        .granite => .granite,
-        .llama => .llama3,
-        .unknown => .unknown,
-    };
+    return .unknown;
 }
 
 pub fn buildChatPrompt(
@@ -58,7 +52,7 @@ pub fn buildChatPrompt(
 
     const addText = struct {
         fn func(tok_enc: *const tokenizer.Tokenizer, t: *std.ArrayList(tokenizer.TokenID), text: []const u8, a: std.mem.Allocator) !void {
-            const encoded = try tok_enc.encode(text, a);
+            const encoded = try tok_enc.encodeEx(text, false, a);
             try t.appendSlice(a, encoded);
         }
     }.func;
