@@ -21,41 +21,49 @@ The system is broken down into the following logical stages:
 
 ### 2.1 Entry Point (`src/main.zig`)
 The CLI frontend and orchestration layer.
-- **Argument Parsing:** Handles flags like `--model`, `--prompt`, `--chat`, `--temperature`, `--max-tokens`, etc.
+- **Argument Parsing:** Delegates to `cli.zig` to handle flags like `--model`, `--prompt`, `--temperature`, etc.
 - **Orchestration:** 
-  - Calls `gguf.loadModel` to get a file context.
+  - Uses `mmap.zig` and `gguf.loadModelMmap` for high-performance model loading.
   - Initializes `Tokenizer` and `ModelConfig`.
-  - Instantiates `vulkan_backend.Context`.
-  - Sets up the `compute_graph.GraphBuilder` and builds the DAG.
-  - Converts CPU-side tensors into `vulkan.Buffer` objects, applying quantization fallbacks (e.g., dynamically converting unsupported formats to `f16` on the CPU using `weights.zig`).
-- **Inference Loop:** Handles the two-phase inference (Prefill vs Decode). During Decode, it calls `token_sampler.sample` and checks for termination tokens.
+  - Instantiates the `backend.Backend` (currently defaulting to Vulkan).
+  - Delegates the heavy lifting of inference to `engine.runInference`.
 
-### 2.2 Model Configuration (`src/model.zig`)
+### 2.2 Inference Engine (`src/engine.zig`)
+The high-level driver for the inference process.
+- **Inference Lifecycle:** Manages the prefill (prompt processing) and decode (token-by-token generation) phases.
+- **Memory Management:** Allocates the scratchpad and KV cache buffers on the GPU.
+- **Embedding Loading:** Handles both CPU-side and GPU-accelerated embedding lookups.
+- **Execution Loop:** Orchestrates the `compute_graph.Dispatcher` to execute the model's forward pass and applies the `Sampler` to select the next token.
+
+### 2.3 Weight Loader & Fusion (`src/weights_loader.zig`)
+Handles the complex process of loading weights from GGUF and preparing them for the GPU.
+- **Dynamic Weight Fusion:** Automatically detects and concatenates constituent weights at load-time (e.g., merging Q, K, and V projections into a single `.attn_qkv.weight` tensor).
+- **Fusion Type-Safety:** Validates that fused weights share compatible quantization types (e.g., prevents fusing `Q4_K` with `Q6_K` if the hardware kernels don't support mixed-type fusion).
+- **Quantization Dispatch:** Identifies "native" quantization types (like `Q4_K`, `Q6_K`, `Q8_0`) that can be processed directly on the GPU, and applies fallbacks for others.
+- **Upload Management:** Streams weights from the GGUF file to GPU buffers, applying dequantization on the fly where necessary.
+
+### 2.4 Backend Abstraction (`src/backend/`)
+Provides a consistent interface for hardware acceleration.
+- **`interface.zig`**: Defines the `Backend` and `Buffer` types.
+- **`vulkan.zig`**: The primary implementation, providing Vulkan 1.2+ acceleration using Compute Shaders and Buffer Device Address (BDA).
+
+### 2.5 Model Configuration (`src/model.zig`)
 A translation layer that converts raw GGUF Key-Value pairs into a concrete `ModelConfig` struct.
 - **Architecture Abstraction:** Normalizes names between different architectures (Llama, Granite, Gemma, Qwen).
 - **Dimension Parsing:** Extracts `n_embd`, `n_layer`, `n_heads`, `n_kv_heads`, `rope_theta`, `rms_norm_eps`, and specific scaling factors (`embedding_scale`, `attention_scale`, etc.).
-- **GQA Support:** Automatically infers Grouped-Query Attention (GQA) if `n_kv_heads` is omitted by inspecting the tensor shapes of the `K` weight projection.
+- **GQA Support:** Automatically infers Grouped-Query Attention (GQA) if `n_kv_heads` is omitted.
 
-### 2.3 GGUF Parsing (`src/gguf.zig`)
-A lightweight, zero-dependency parser for the GGUF v3 format.
-- Reads magic bytes (`GGUF`).
-- Parses key-value pairs into a recursive `MetadataValue` tagged union.
-- Reads tensor metadata (name, type, dimensions, offset).
-- Exposes `readTensorData()` to seek into the file and stream raw bytes into memory.
-
-### 2.4 Tokenizer (`src/tokenizer.zig`)
+### 2.6 Tokenizer (`src/tokenizer.zig`)
 Implements BPE (Byte-Pair Encoding) and SentencePiece text tokenization.
 - **Byte-to-Unicode Mapping:** Correctly parses GPT-2/Granite style vocabularies.
 - **Special Tokens:** Detects architecture-specific tokens like `<|start_of_role|>` and `<|end_of_text|>`.
-- **Merge Logic:** Performs greedy token merging based on rank tables (`tokenizer.ggml.merges`).
-- **Decoding:** Correctly translates token IDs back into UTF-8 strings, handling leading whitespace markers (e.g., the `▁` or `_` character).
-- **Optional BOS Prepending (`encodeEx`):** Supports encoding text with or without prepending a BOS token. This is used by `src/chat.zig` to prevent multiple duplicate BOS tokens from being generated when tokenizing sub-segments of a chat template.
-- **Chat Format Detection & Base Model Bypass:** Auto-detects chat template format based on GGUF metadata or instruct-specific control tokens. If no template or instruct tokens are present, it bypasses chat formatting (`.unknown`), defaulting base models to standard raw text completion instead of formatting them with instruction wrappers.
+- **Merge Logic:** Performs greedy token merging based on rank tables.
+- **Chat Format Detection & Base Model Bypass:** Auto-detects chat template format based on GGUF metadata or instruct-specific control tokens.
 
-### 2.5 Sampling (`src/sampler.zig`)
+### 2.7 Sampling (`src/sampler.zig`)
 Probabilistic token selection from a raw logit distribution.
 - Applies standard techniques: **Temperature scaling**, **Top-K**, **Top-P (Nucleus)**, **Min-P**, and **Typical-P**.
-- **Repetition Penalty:** Applies penalization vectors against recently generated tokens (maintained in a rolling window in `main.zig`).
+- **Repetition Penalty:** Applies penalization vectors against recently generated tokens.
 
 ---
 

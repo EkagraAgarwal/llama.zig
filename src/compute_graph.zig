@@ -175,12 +175,12 @@ pub const GraphBuilder = struct {
         return @as(u64, n) * 4;
     }
 
-    fn hasTensor(self: *GraphBuilder, name: []const u8) bool {
+    pub fn hasTensor(self: *GraphBuilder, name: []const u8) bool {
         if (self.model_tensors) |tbl| return tbl.contains(name);
         return false;
     }
 
-    fn matmulDims(self: *GraphBuilder, weight_name: []const u8, fallback_out: u32, fallback_in: u32) struct { out: u32, in: u32 } {
+    pub fn matmulDims(self: *GraphBuilder, weight_name: []const u8, fallback_out: u32, fallback_in: u32) struct { out: u32, in: u32 } {
         if (self.model_tensors) |tbl| {
             if (tbl.get(weight_name)) |wt| {
                 return .{ .out = @intCast(wt.ne[1]), .in = @intCast(wt.ne[0]) };
@@ -189,7 +189,7 @@ pub const GraphBuilder = struct {
         return .{ .out = fallback_out, .in = fallback_in };
     }
 
-    fn canFuseQkv(self: *GraphBuilder, qw: []const u8, kw: []const u8, vw: []const u8) bool {
+    pub fn canFuseQkv(self: *GraphBuilder, qw: []const u8, kw: []const u8, vw: []const u8) bool {
         if (self.model_tensors) |tbl| {
             const qt = tbl.get(qw) orelse return false;
             const kt = tbl.get(kw) orelse return false;
@@ -199,7 +199,7 @@ pub const GraphBuilder = struct {
         return false;
     }
 
-    fn canFuseGateUp(self: *GraphBuilder, gw: []const u8, uw: []const u8) bool {
+    pub fn canFuseGateUp(self: *GraphBuilder, gw: []const u8, uw: []const u8) bool {
         if (self.model_tensors) |tbl| {
             const gt = tbl.get(gw) orelse return false;
             const ut = tbl.get(uw) orelse return false;

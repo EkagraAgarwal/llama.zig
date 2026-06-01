@@ -5,8 +5,6 @@ const tensor = @import("tensor.zig");
 pub const Architecture = enum {
     llama,
     granite,
-    gemma,
-    qwen,
     unknown,
 };
 
@@ -93,8 +91,8 @@ pub const ModelConfig = struct {
 
         const final_logit_softcapping = (try getMetaF32Any(ctx, arch_prefix, arch_alt_prefix, "final_logit_softcapping")) orelse 0.0;
 
-        const activation: Activation = if (arch == .gemma) .gelu else .silu;
-        const default_embedding_scale: f32 = if (arch == .gemma) @sqrt(@as(f32, @floatFromInt(n_embd))) else 1.0;
+        const activation: Activation = .silu;
+        const default_embedding_scale: f32 = 1.0;
 
         const embedding_scale = (try getMetaF32Any(ctx, arch_prefix, arch_alt_prefix, "embedding_scale")) orelse
             (try getMetaF32Any(ctx, arch_prefix, arch_alt_prefix, "embedding_multiplier")) orelse default_embedding_scale;
@@ -137,8 +135,6 @@ pub const ModelConfig = struct {
 pub fn parseArchitecture(raw_arch: []const u8) Architecture {
     if (std.ascii.eqlIgnoreCase(raw_arch, "llama")) return .llama;
     if (std.ascii.eqlIgnoreCase(raw_arch, "granite")) return .granite;
-    if (raw_arch.len >= 5 and std.ascii.eqlIgnoreCase(raw_arch[0..5], "gemma")) return .gemma;
-    if (raw_arch.len >= 4 and std.ascii.eqlIgnoreCase(raw_arch[0..4], "qwen")) return .qwen;
     return .unknown;
 }
 
@@ -146,8 +142,6 @@ pub fn canonicalArchitecturePrefix(raw_arch: []const u8) []const u8 {
     return switch (parseArchitecture(raw_arch)) {
         .llama => "llama",
         .granite => "granite",
-        .gemma => "gemma",
-        .qwen => "qwen",
         .unknown => raw_arch,
     };
 }
@@ -214,11 +208,11 @@ test "architecture acceptance matrix parsing" {
     const t = std.testing;
     try t.expectEqual(Architecture.llama, parseArchitecture("llama"));
     try t.expectEqual(Architecture.granite, parseArchitecture("granite"));
-    try t.expectEqual(Architecture.gemma, parseArchitecture("gemma"));
-    try t.expectEqual(Architecture.gemma, parseArchitecture("gemma2"));
-    try t.expectEqual(Architecture.qwen, parseArchitecture("qwen"));
-    try t.expectEqual(Architecture.qwen, parseArchitecture("qwen2"));
-    try t.expectEqual(Architecture.qwen, parseArchitecture("qwen2moe"));
+    try t.expectEqual(Architecture.unknown, parseArchitecture("gemma"));
+    try t.expectEqual(Architecture.unknown, parseArchitecture("gemma2"));
+    try t.expectEqual(Architecture.unknown, parseArchitecture("qwen"));
+    try t.expectEqual(Architecture.unknown, parseArchitecture("qwen2"));
+    try t.expectEqual(Architecture.unknown, parseArchitecture("qwen2moe"));
     try t.expectEqual(Architecture.unknown, parseArchitecture("mistral"));
 }
 
@@ -226,31 +220,17 @@ test "architecture canonical metadata prefix" {
     const t = std.testing;
     try t.expectEqualStrings("llama", canonicalArchitecturePrefix("llama"));
     try t.expectEqualStrings("granite", canonicalArchitecturePrefix("granite"));
-    try t.expectEqualStrings("gemma", canonicalArchitecturePrefix("gemma2"));
-    try t.expectEqualStrings("qwen", canonicalArchitecturePrefix("qwen2moe"));
+    try t.expectEqualStrings("gemma2", canonicalArchitecturePrefix("gemma2"));
+    try t.expectEqualStrings("qwen2moe", canonicalArchitecturePrefix("qwen2moe"));
     try t.expectEqualStrings("unknown_arch", canonicalArchitecturePrefix("unknown_arch"));
 }
 
-test "ModelConfig dynamic activation and scaling" {
+test "ModelConfig supported activation and scaling defaults" {
     const t = std.testing;
     const allocator = t.allocator;
 
-    var kvs = std.StringHashMap(gguf.MetadataValue).init(allocator);
-    defer {
-        var it = kvs.iterator();
-        while (it.next()) |entry| {
-            allocator.free(entry.key_ptr.*);
-            // MetadataValue cleaning
-            switch (entry.value_ptr.*) {
-                .string => |s| allocator.free(s),
-                else => {},
-            }
-        }
-        kvs.deinit();
-    }
-
-    var tensors = std.StringHashMap(*tensor.Tensor).init(allocator);
-    defer tensors.deinit();
+    const kvs = std.StringHashMap(gguf.MetadataValue).init(allocator);
+    const tensors = std.StringHashMap(*tensor.Tensor).init(allocator);
 
     var ctx = gguf.GGUFContext{
         .allocator = allocator,
@@ -261,7 +241,26 @@ test "ModelConfig dynamic activation and scaling" {
         .kvs = kvs,
         .tensors = tensors,
         .data_offset = 0,
+        .mmap_file = null,
     };
+    const cleanupKvs = struct {
+        fn run(a: std.mem.Allocator, map: *std.StringHashMap(gguf.MetadataValue)) void {
+            var it = map.iterator();
+            while (it.next()) |entry| {
+                a.free(entry.key_ptr.*);
+                switch (entry.value_ptr.*) {
+                    .string => |s| a.free(s),
+                    else => {},
+                }
+            }
+            map.clearRetainingCapacity();
+        }
+    }.run;
+    defer {
+        cleanupKvs(allocator, &ctx.kvs);
+        ctx.kvs.deinit();
+        ctx.tensors.deinit();
+    }
 
     // Test Llama (defaults)
     try ctx.kvs.put(try allocator.dupe(u8, "general.architecture"), .{ .string = try allocator.dupe(u8, "llama") });
@@ -275,14 +274,17 @@ test "ModelConfig dynamic activation and scaling" {
     try t.expectEqual(Activation.silu, cfg.activation);
     try t.expectEqual(@as(f32, 1.0), cfg.embedding_scale);
 
-    // Test Gemma
+    cleanupKvs(allocator, &ctx.kvs);
+
+    // Unsupported architectures keep explicit metadata prefixes but do not get
+    // future-architecture behavior until an adapter is implemented.
     try ctx.kvs.put(try allocator.dupe(u8, "general.architecture"), .{ .string = try allocator.dupe(u8, "gemma") });
     try ctx.kvs.put(try allocator.dupe(u8, "gemma.embedding_length"), .{ .u32 = 2048 });
 
-    var cfg_gemma = try ModelConfig.init(allocator, &ctx, 256000);
-    defer cfg_gemma.deinit(allocator);
+    var cfg_unknown = try ModelConfig.init(allocator, &ctx, 256000);
+    defer cfg_unknown.deinit(allocator);
 
-    try t.expectEqual(Architecture.gemma, cfg_gemma.arch);
-    try t.expectEqual(Activation.gelu, cfg_gemma.activation);
-    try t.expectEqual(@sqrt(@as(f32, 2048.0)), cfg_gemma.embedding_scale);
+    try t.expectEqual(Architecture.unknown, cfg_unknown.arch);
+    try t.expectEqual(Activation.silu, cfg_unknown.activation);
+    try t.expectEqual(@as(f32, 1.0), cfg_unknown.embedding_scale);
 }

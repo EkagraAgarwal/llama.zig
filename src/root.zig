@@ -8,11 +8,15 @@ pub const weights = @import("weights.zig");
 pub const tokenizer = @import("tokenizer.zig");
 pub const compute_graph = @import("compute_graph.zig");
 pub const vulkan_backend = @import("vulkan_backend.zig");
+pub const kernels = @import("kernels.zig");
+pub const models = @import("models/interface.zig");
 
 test {
     _ = @import("weights.zig");
+    _ = @import("weights_loader.zig");
     _ = @import("sampler.zig");
     _ = @import("tokenizer.zig");
+    _ = @import("models/interface.zig");
 }
 
 test "bf16 roundtrip" {

@@ -1,13 +1,16 @@
 const std = @import("std");
 const vulkan = @import("vulkan_backend.zig");
 const gguf = @import("gguf.zig");
-const kernels_data = @import("kernels_data");
+const kernels = @import("kernels.zig");
 const compute_graph = @import("compute_graph.zig");
+const models = @import("models/interface.zig");
 const tokenizer = @import("tokenizer.zig");
 const model = @import("model.zig");
 const weights = @import("weights.zig");
+const weights_loader = @import("weights_loader.zig");
 const sampler = @import("sampler.zig");
 const chat = @import("chat.zig");
+const cli = @import("cli.zig");
 const builtin = @import("builtin");
 const vk = @import("vulkan");
 const windows = if (builtin.os.tag == .windows) std.os.windows else struct {};
@@ -39,69 +42,31 @@ pub fn main(init: std.process.Init) !void {
     defer args_it.deinit();
     _ = args_it.next();
 
-    var model_path: ?[]const u8 = null;
-    var prompt_text: ?[]const u8 = null;
-    var max_tokens: u32 = 64;
-    var temperature: f32 = 0.8;
-    var seed: u64 = 0;
-    var top_k: u32 = 0;
-    var top_p: f32 = 0.9;
-    var min_p: f32 = 0.0;
-    var ctx_size_override: ?u32 = null;
-    var debug_logits: u32 = 0;
-    var chat_mode: bool = true;
-    var verbose: bool = false;
-    var inspect_block: bool = false;
-    var prefill_chunk: u32 = 0;
-    var gpu_embed: bool = true;
-    var report_json: bool = false;
-
-    while (args_it.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--model")) {
-            model_path = args_it.next();
-        } else if (std.mem.eql(u8, arg, "--prompt")) {
-            prompt_text = args_it.next();
-        } else if (std.mem.eql(u8, arg, "--max-tokens")) {
-            max_tokens = std.fmt.parseInt(u32, args_it.next() orelse "64", 10) catch 64;
-        } else if (std.mem.eql(u8, arg, "--temperature")) {
-            temperature = std.fmt.parseFloat(f32, args_it.next() orelse "0.8") catch 0.8;
-        } else if (std.mem.eql(u8, arg, "--seed")) {
-            seed = std.fmt.parseInt(u64, args_it.next() orelse "0", 10) catch 0;
-        } else if (std.mem.eql(u8, arg, "--top-k")) {
-            top_k = std.fmt.parseInt(u32, args_it.next() orelse "0", 10) catch 0;
-        } else if (std.mem.eql(u8, arg, "--top-p")) {
-            top_p = std.fmt.parseFloat(f32, args_it.next() orelse "0.9") catch 0.9;
-        } else if (std.mem.eql(u8, arg, "--min-p")) {
-            min_p = std.fmt.parseFloat(f32, args_it.next() orelse "0.0") catch 0.0;
-        } else if (std.mem.eql(u8, arg, "--ctx-size")) {
-            ctx_size_override = std.fmt.parseInt(u32, args_it.next() orelse "0", 10) catch null;
-        } else if (std.mem.eql(u8, arg, "--chat")) {
-            chat_mode = true;
-        } else if (std.mem.eql(u8, arg, "--verbose")) {
-            verbose = true;
-        } else if (std.mem.eql(u8, arg, "--debug-logits")) {
-            debug_logits = std.fmt.parseInt(u32, args_it.next() orelse "10", 10) catch 10;
-        } else if (std.mem.eql(u8, arg, "--inspect-block")) {
-            inspect_block = true;
-        } else if (std.mem.eql(u8, arg, "--prefill-chunk")) {
-            prefill_chunk = std.fmt.parseInt(u32, args_it.next() orelse "512", 10) catch 512;
-        } else if (std.mem.eql(u8, arg, "--no-gpu-embed")) {
-            gpu_embed = false;
-        } else if (std.mem.eql(u8, arg, "--report-json")) {
-            report_json = true;
-        }
-    }
-
-    if (model_path == null or prompt_text == null) {
-        try writer.print("Usage: llama.zig --model <path.gguf> --prompt '<text>' [--max-tokens N] [--temperature T]\n", .{});
+    const options = (try cli.parseArgs(&args_it)) orelse {
+        try cli.printUsage(writer);
         try writer_streaming.interface.flush();
         return;
-    }
+    };
+    const model_path = options.model_path;
+    const prompt_text = options.prompt_text;
+    const max_tokens = options.max_tokens;
+    const temperature = options.temperature;
+    const seed = options.seed;
+    const top_k = options.top_k;
+    const top_p = options.top_p;
+    const min_p = options.min_p;
+    const ctx_size_override = options.ctx_size_override;
+    const debug_logits = options.debug_logits;
+    const verbose = options.verbose;
+    const inspect_block = options.inspect_block;
+    const prefill_chunk = options.prefill_chunk;
+    const gpu_embed = options.gpu_embed;
+    const report_json = options.report_json;
 
     const t_load_start = nowNs();
-    try writer.print("Loading model: {s}...\n", .{model_path.?});
+    try writer.print("Loading model: {s}...\n", .{model_path});
     try writer_streaming.interface.flush();
-    var ctx = try gguf.loadModelMmap(allocator, model_path.?);
+    var ctx = try gguf.loadModelMmap(allocator, model_path);
     defer ctx.deinit();
 
     var tok = try tokenizer.Tokenizer.init(allocator, &ctx);
@@ -119,7 +84,7 @@ pub fn main(init: std.process.Init) !void {
 
     if (cfg.arch == .unknown) {
         try writer.print(
-            "Warning: unrecognized architecture '{s}'. Proceeding with shared lowering path and llama-compatible metadata fallbacks.\n",
+            "Warning: unsupported architecture '{s}'. Only llama and granite are supported by this build.\n",
             .{cfg.arch_prefix},
         );
     }
@@ -131,7 +96,7 @@ pub fn main(init: std.process.Init) !void {
         cfg.embedding_scale, cfg.attention_scale, cfg.residual_scale, cfg.logit_scale,
     });
     try writer_streaming.interface.flush();
-    validateModelLayout(&ctx) catch |err| {
+    weights_loader.validateModelLayout(&ctx) catch |err| {
         try writer.print("Warning: model layout check failed ({s}); continuing with dynamic graph assumptions.\n", .{@errorName(err)});
     };
 
@@ -198,98 +163,21 @@ pub fn main(init: std.process.Init) !void {
     var registry = try vulkan.PipelineRegistry.init(allocator);
     defer registry.deinit(&vk_ctx);
 
-    try registry.register(&vk_ctx, "add", kernels_data.kernels_add_spv, "main");
-    try registry.register(&vk_ctx, "mul", kernels_data.kernels_mul_spv, "main");
-    try registry.register(&vk_ctx, "rms_norm", kernels_data.kernels_rmsnorm_spv, "main");
-    try registry.register(&vk_ctx, "softmax", kernels_data.kernels_softmax_spv, "main");
-    try registry.register(&vk_ctx, "matmul", kernels_data.kernels_matmul_spv, "main");
-    try registry.register(&vk_ctx, "rope", kernels_data.kernels_rope_spv, "main");
-    try registry.register(&vk_ctx, "silu_mul", kernels_data.kernels_silu_mul_spv, "main");
-    try registry.register(&vk_ctx, "attention", kernels_data.kernels_attention_spv, "main");
-    try registry.register(&vk_ctx, "kv_write", kernels_data.kernels_kv_write_spv, "main");
-    try registry.register(&vk_ctx, "scaled_add", kernels_data.kernels_scaled_add_spv, "main");
-    try registry.register(&vk_ctx, "matmul_q8_0", kernels_data.kernels_matmul_q8_0_spv, "main");
-    try registry.register(&vk_ctx, "matvec_q8_0", kernels_data.kernels_matvec_q8_0_spv, "main");
-    try registry.register(&vk_ctx, "matmul_f16", kernels_data.kernels_matmul_f16_spv, "main");
-    try registry.register(&vk_ctx, "matvec_f16", kernels_data.kernels_matvec_f16_spv, "main");
-    try registry.register(&vk_ctx, "get_rows_q", kernels_data.kernels_get_rows_q_spv, "main");
-    try registry.register(&vk_ctx, "matmul_q4_0", kernels_data.kernels_matmul_q4_0_spv, "main");
-    try registry.register(&vk_ctx, "matvec_q4_0", kernels_data.kernels_matvec_q4_0_spv, "main");
-    try registry.register(&vk_ctx, "get_rows_q4_0", kernels_data.kernels_get_rows_q4_0_spv, "main");
-    try registry.register(&vk_ctx, "matvec_q4_1", kernels_data.kernels_matvec_q4_1_spv, "main");
-    try registry.register(&vk_ctx, "matmul_q4_1", kernels_data.kernels_matmul_q4_1_spv, "main");
-    try registry.register(&vk_ctx, "get_rows_q4_1", kernels_data.kernels_get_rows_q4_1_spv, "main");
-    try registry.register(&vk_ctx, "get_rows_q4_k", kernels_data.kernels_get_rows_q4_k_spv, "main");
-    try registry.register(&vk_ctx, "matvec_q4_k", kernels_data.kernels_matvec_q4_k_spv, "main");
-    try registry.register(&vk_ctx, "matmul_q4_k", kernels_data.kernels_matmul_q4_k_spv, "main");
-    try registry.register(&vk_ctx, "get_rows_q6_k", kernels_data.kernels_get_rows_q6_k_spv, "main");
-    try registry.register(&vk_ctx, "matvec_q6_k", kernels_data.kernels_matvec_q6_k_spv, "main");
-    try registry.register(&vk_ctx, "matmul_q6_k", kernels_data.kernels_matmul_q6_k_spv, "main");
-    try registry.register(&vk_ctx, "topk", kernels_data.kernels_topk_spv, "main");
-    try registry.register(&vk_ctx, "attention_flash", kernels_data.kernels_flash_attn_spv, "main");
-    try registry.register(&vk_ctx, "gelu_mul", kernels_data.kernels_gelu_mul_spv, "main");
-    try registry.register(&vk_ctx, "copy", kernels_data.kernels_copy_spv, "main");
+    try kernels.registerDefaultKernels(&registry, &vk_ctx);
 
     var graph = compute_graph.Graph.init(allocator);
     defer graph.deinit();
-    var builder = compute_graph.GraphBuilder.init(&graph, &cfg, &ctx.tensors);
-
-    try builder.addTensor("input", model.f32Bytes(cfg.n_embd), .input);
-    try builder.initKvCaches();
-
-    var prev_out: []const u8 = "input";
-    var l: u32 = 0;
-    while (l < cfg.n_layer) : (l += 1) {
-        const out_owned = if (l == cfg.n_layer - 1)
-            try allocator.dupe(u8, "hidden")
-        else
-            try std.fmt.allocPrint(allocator, "blk.{d}.out", .{l});
-        defer allocator.free(out_owned);
-        try builder.buildTransformerBlock(l, 0, prev_out, out_owned);
-        // Use the graph's owned copy of the name so it outlives this iteration.
-        prev_out = graph.tensors.getPtr(out_owned).?.name;
-    }
-
-    const has_output = ctx.tensors.get("output.weight") != null;
-    if (has_output) {
-        try builder.addTensor("output.weight", model.f32Bytes(@as(u64, cfg.vocab_size) * cfg.n_embd), .weight);
-    }
-    try builder.addTensor("output_norm.weight", model.f32Bytes(cfg.n_embd), .weight);
-    try builder.buildLmHead(prev_out, "logits", has_output);
-    builder.finalize();
+    try models.buildModel(cfg.arch, allocator, &graph, &cfg, &ctx.tensors);
     try graph.verify();
+    const has_output = ctx.tensors.get("output.weight") != null;
     const graph_cost = compute_graph.estimateGraphCost(&graph);
 
-    // Convert eligible matmul nodes to quantized matmul path.
+    weights_loader.rewriteQuantizedMatmuls(allocator, &graph, &ctx.tensors);
     var uses_q4_0_f16_fallback = false;
-    for (graph.nodes.items) |*node| {
-        if (node.op_type != .matmul or node.input_names.len < 2) continue;
-        const w_name = node.input_names[1];
-        const w_type: ?@import("tensor.zig").Type = blk: {
-            if (ctx.tensors.get(w_name)) |t| {
-                break :blk t.type;
-            }
-            if (getFusedComponentNames(allocator, w_name)) |comps| {
-                defer {
-                    for (comps) |c| allocator.free(c);
-                    allocator.free(comps);
-                }
-                if (comps.len > 0) {
-                    if (ctx.tensors.get(comps[0])) |t| {
-                        break :blk t.type;
-                    }
-                }
-            }
-            break :blk null;
-        };
-        const qt = w_type orelse continue;
-        if (qt == .q4_0) {
-            node.op_type = .matmul_q;
-            node.p5 = compute_graph.q4_0_f16_fallback_qtype;
+    for (graph.nodes.items) |node| {
+        if (node.op_type == .matmul_q and node.p5 == compute_graph.q4_0_f16_fallback_qtype) {
             uses_q4_0_f16_fallback = true;
-        } else if (isNativeQuantType(qt)) {
-            node.op_type = .matmul_q;
-            node.p5 = @intFromEnum(qt);
+            break;
         }
     }
 
@@ -305,7 +193,7 @@ pub fn main(init: std.process.Init) !void {
     while (t_it.next()) |entry| {
         if (entry.value_ptr.role == .weight) {
             if (ctx.tensors.get(entry.key_ptr.*)) |gt| {
-                max_staging = @max(max_staging, if (isNativeQuantType(gt.type)) gt.size() else model.weightF32Size(gt));
+                max_staging = @max(max_staging, if (weights_loader.isNativeQuantType(gt.type)) gt.size() else model.weightF32Size(gt));
             } else {
                 max_staging = @max(max_staging, entry.value_ptr.size);
             }
@@ -319,7 +207,7 @@ pub fn main(init: std.process.Init) !void {
     while (t_it.next()) |entry| {
         if (entry.value_ptr.role != .weight) continue;
         const gt = ctx.tensors.get(entry.key_ptr.*);
-        const components = getFusedComponentNames(allocator, entry.key_ptr.*);
+        const components = weights_loader.getFusedComponentNames(allocator, entry.key_ptr.*);
         defer if (components) |comps| {
             for (comps) |c| allocator.free(c);
             allocator.free(comps);
@@ -331,7 +219,7 @@ pub fn main(init: std.process.Init) !void {
 
         const upload_size = blk: {
             if (gt) |t| {
-                break :blk if (isNativeQuantType(t.type))
+                break :blk if (weights_loader.isNativeQuantType(t.type))
                     t.size()
                 else if (t.type == .q4_0 or t.type == .q4_k)
                     model.weightF32Size(t)
@@ -342,7 +230,7 @@ pub fn main(init: std.process.Init) !void {
                 const first_t = ctx.tensors.get(comps[0]) orelse {
                     break :blk entry.value_ptr.size;
                 };
-                const is_native = isNativeQuantType(first_t.type);
+                const is_native = weights_loader.isNativeQuantType(first_t.type);
                 for (comps) |c| {
                     const t = ctx.tensors.get(c) orelse continue;
                     size += if (is_native) t.size() else model.weightF32Size(t);
@@ -361,7 +249,7 @@ pub fn main(init: std.process.Init) !void {
         try weight_buffers.append(allocator, buf);
 
         if (gt) |t| {
-            if (isNativeQuantType(t.type)) {
+            if (weights_loader.isNativeQuantType(t.type)) {
                 const raw_size = t.size();
                 const raw = if (ctx.mmap_file != null)
                     try ctx.getTensorSlice(t)
@@ -409,7 +297,7 @@ pub fn main(init: std.process.Init) !void {
             }
         } else if (components) |comps| {
             const first_t = ctx.tensors.get(comps[0]).?;
-            if (isNativeQuantType(first_t.type)) {
+            if (weights_loader.isNativeQuantType(first_t.type)) {
                 var offset: u64 = 0;
                 const mapped = try vk_ctx.vkd.mapMemory(vk_ctx.device, weight_staging.memory, 0, upload_size, .{});
                 for (comps) |c| {
@@ -456,7 +344,7 @@ pub fn main(init: std.process.Init) !void {
     if (!has_output) {
         if (graph.tensors.getPtr("token_embd.weight")) |gt_entry| {
             if (ctx.tensors.get("token_embd.weight")) |t| {
-                const upload_size = if (isNativeQuantType(t.type))
+                const upload_size = if (weights_loader.isNativeQuantType(t.type))
                     t.size()
                 else if (t.type == .q4_0 or t.type == .q4_k)
                     (t.ne[0] * t.ne[1] * t.ne[2] * t.ne[3]) * 2
@@ -469,7 +357,7 @@ pub fn main(init: std.process.Init) !void {
                     try weight_buffers.append(allocator, buf);
                 }
                 gt_entry.size = upload_size;
-                if (isNativeQuantType(t.type)) {
+                if (weights_loader.isNativeQuantType(t.type)) {
                     const raw_size = t.size();
                     const raw = if (ctx.mmap_file != null)
                         try ctx.getTensorSlice(t)
@@ -552,7 +440,7 @@ pub fn main(init: std.process.Init) !void {
     // Build prompt: auto-detect chat format from template or architecture and apply
     // appropriate control tokens so instruction-tuned models respond as assistants.
     const format = chat.detectChatFormat(tok.chat_template, cfg.arch, &tok.special);
-    const token_ids = try chat.buildChatPrompt(&tok, format, prompt_text.?, allocator);
+    const token_ids = try chat.buildChatPrompt(&tok, format, prompt_text, allocator);
     defer allocator.free(token_ids);
 
     const embd_tensor = ctx.tensors.get("token_embd.weight") orelse return error.MissingEmbeddings;
@@ -567,7 +455,7 @@ pub fn main(init: std.process.Init) !void {
         embd_cache_transposed = cache;
     }
 
-    const embd_quant_gpu = gpu_embed and embd_standard_layout and isNativeQuantType(embd_tensor.type);
+    const embd_quant_gpu = gpu_embed and embd_standard_layout and weights_loader.isNativeQuantType(embd_tensor.type);
     var embd_gpu_buf: ?*vulkan.Buffer = null;
     const embd_row_bytes: u32 = @intCast(weights.quantRowBytes(embd_tensor.type, embd_tensor.ne[0]) orelse 0);
     if (embd_quant_gpu) {
@@ -889,46 +777,6 @@ pub fn main(init: std.process.Init) !void {
         });
     }
     try writer_streaming.interface.flush();
-}
-
-fn isNativeQuantType(tt: @import("tensor.zig").Type) bool {
-    return switch (tt) {
-        .q8_0, .q4_1, .q4_k, .q6_k => true,
-        else => false,
-    };
-}
-
-fn getFusedComponentNames(allocator: std.mem.Allocator, name: []const u8) ?[]const []const u8 {
-    if (std.mem.endsWith(u8, name, ".attn_qkv.weight")) {
-        const prefix = name[0 .. name.len - ".attn_qkv.weight".len];
-        var list: std.ArrayList([]const u8) = .empty;
-        list.append(allocator, std.fmt.allocPrint(allocator, "{s}.attn_q.weight", .{prefix}) catch return null) catch return null;
-        list.append(allocator, std.fmt.allocPrint(allocator, "{s}.attn_k.weight", .{prefix}) catch return null) catch return null;
-        list.append(allocator, std.fmt.allocPrint(allocator, "{s}.attn_v.weight", .{prefix}) catch return null) catch return null;
-        return list.toOwnedSlice(allocator) catch null;
-    } else if (std.mem.endsWith(u8, name, ".ffn_gate_up.weight")) {
-        const prefix = name[0 .. name.len - ".ffn_gate_up.weight".len];
-        var list: std.ArrayList([]const u8) = .empty;
-        list.append(allocator, std.fmt.allocPrint(allocator, "{s}.ffn_gate.weight", .{prefix}) catch return null) catch return null;
-        list.append(allocator, std.fmt.allocPrint(allocator, "{s}.ffn_up.weight", .{prefix}) catch return null) catch return null;
-        return list.toOwnedSlice(allocator) catch null;
-    }
-    return null;
-}
-
-fn validateModelLayout(ctx: *gguf.GGUFContext) !void {
-    const required = [_][]const u8{
-        "token_embd.weight",
-        "blk.0.attn_norm.weight",
-        "blk.0.attn_q.weight",
-        "blk.0.attn_k.weight",
-        "blk.0.attn_v.weight",
-        "blk.0.attn_output.weight",
-        "output_norm.weight",
-    };
-    for (required) |name| {
-        if (ctx.tensors.get(name) == null) return error.UnsupportedArchitectureLayout;
-    }
 }
 
 fn loadEmbedding(

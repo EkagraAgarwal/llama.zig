@@ -38,11 +38,10 @@ pub fn buildChatPrompt(
     allocator: std.mem.Allocator,
 ) ![]tokenizer.TokenID {
     var arena = std.heap.ArenaAllocator.init(allocator);
-    errdefer arena.deinit();
+    defer arena.deinit();
     const arena_alloc = arena.allocator();
 
     var tokens: std.ArrayList(tokenizer.TokenID) = .empty;
-    errdefer tokens.deinit(arena_alloc);
 
     const addToken = struct {
         fn func(t: *std.ArrayList(tokenizer.TokenID), id: tokenizer.TokenID, a: std.mem.Allocator) !void {
@@ -137,5 +136,6 @@ pub fn buildChatPrompt(
         },
     }
 
-    return try tokens.toOwnedSlice(arena_alloc);
+    const arena_owned = try tokens.toOwnedSlice(arena_alloc);
+    return try allocator.dupe(tokenizer.TokenID, arena_owned);
 }

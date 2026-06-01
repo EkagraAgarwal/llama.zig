@@ -44,7 +44,12 @@ Shaders are compiled automatically when `glslangValidator` is on `PATH`; prebuil
 | `--ctx-size` | Context window size (default 8192) |
 | `--top-k` | Top-k sampling (default 0 = disabled) |
 | `--top-p` | Top-p nucleus sampling (default 0.9) |
+| `--min-p` | Min-p sampling (default 0.0) |
 | `--seed` | RNG seed for reproducibility |
+| `--prefill-chunk` | Batch size for prefill phase (default 512) |
+| `--no-gpu-embed` | Disable GPU embedding lookup |
+| `--verbose` | Enable verbose logging |
+| `--report-json` | Output generation metrics in JSON format |
 
 **Note**: Chat template mode is enabled by default for instruct-tuned models. Base models are automatically detected (based on the absence of GGUF chat template metadata and instruct-specific control tokens) and execute in raw text autocomplete mode.
 
@@ -52,22 +57,24 @@ Shaders are compiled automatically when `glslangValidator` is on `PATH`; prebuil
 
 ```
 main.zig
-  ├── model.zig        (GGUF metadata + model config)
-  ├── chat.zig         (chat template detection + formatting)
-  ├── sampler.zig      (temperature / top-p sampling)
-  ├── tokenizer.zig    (BPE encode/decode, special token detection)
-  ├── weights.zig      (dequant + upload to GPU)
-  ├── vulkan_backend.zig (BDA buffers, pipelines)
-  ├── compute_graph.zig (DAG + dispatcher)
-  └── root.zig         (root comptime struct for all ops)
+  ├── cli.zig           (argument parsing)
+  ├── engine.zig        (high-level inference driver)
+  │     ├── compute_graph.zig (DAG + dispatcher)
+  │     └── sampler.zig       (probabilistic sampling)
+  ├── weights_loader.zig (fusion + GPU upload)
+  ├── chat.zig          (template detection)
+  ├── tokenizer.zig     (BPE encode/decode)
+  ├── model.zig         (GGUF metadata)
+  ├── mmap.zig          (high-performance I/O)
+  └── backend/          (Vulkan acceleration)
 ```
 
-- Fused GPU dequant matmul (avoid full FP32 weight VRAM)
-- Fused MLP Gate/Up and Attention QKV projection weights (dynamic type-safety fallback)
-- CPU-side address offsetting for zero-cost sub-matrix query dispatches
-- Flash-attention style tiled attention kernel
-- Multi-GPU model splitting
-- Architecture-aware chat templates for instruct models (Llama 3, Granite, Gemma, Qwen, Llama 2)
+- **Dynamic Weight Fusion**: Concatenates QKV and MLP weights at load-time to reduce GPU dispatches.
+- **Mmap Loading**: Near-instant model startup using memory-mapped I/O.
+- **Engine Abstraction**: Unified inference lifecycle handling prefill and decode phases.
+- **CPU-Side Address Offsetting**: Zero-cost sub-matrix queries via BDA push constants.
+- **Flash-Attention**: Tiled attention kernels for efficient context processing.
+- **Architecture-Aware Chat**: Automatic template formatting for Llama 3, Granite, Gemma, Qwen, and Llama 2.
 
 ## Optimizations
 
@@ -92,15 +99,15 @@ Measured on AMD Radeon RX 7700S GPU:
 
 ## Compatibility Matrix
 
-### Supported Model Types
+### Supported Quantization Types
 
-Only the following model types are currently supported:
-- **BF16 / F32 / F16** (native precision)
-- **Q8_0** (native 8-bit quantization)
-- **Q4_K** (native K-quantization)
-- **Q6_K** (native K-quantization — 6-bit, ~6.5 bits/element)
-
-All other quantization types (`q4_0`, `q5_0`, `q2_k`, `q3_k`, `q5_k`, `q8_k`) are not supported.
+| Type | GPU Support | Notes |
+|------|-------------|-------|
+| **BF16 / F16 / F32** | Native | High precision |
+| **Q8_0** | Native | High-speed 8-bit |
+| **Q4_K** | Native | Balanced 4-bit |
+| **Q6_K** | Native | High-quality 6-bit |
+| **Q4_0** | Fallback | Dequantized to F16 on upload |
 
 ### Model architecture and tokenizer/sampler parity
 
