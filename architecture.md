@@ -90,32 +90,56 @@ Executes the `Graph`.
 Defines the `Tensor.Type` layout and provides host-side dequantization routines.
 - Supports types: `f32`, `f16`, `bf16`, `q8_0`, `q4_0`, `q4_1`, `q4_k`, `q6_k`.
 - **`weights.zig`**: Contains fallback math to decode complex quantized block formats. For example, `dequantQ6KRaw` dynamically unpacks 6-bit scales and sub-block quantizers into an `f32` slice.
-- Enables the "Hybrid Path": If native GPU shaders for a quant type are missing, `main.zig` uses `weights.zig` to dequantize the weight to `f16` CPU-side, uploads it to the GPU, and uses `matmul_f16`.
-- **Q6_K native path**: `matmul_q6_k_bda.glsl` provides full native GPU path for q6_k — both matvec (1D, 256 workitems) and matmul (16×16 tiled). Weights stay compressed at ~6.5 bits/element in VRAM.
+- **Native GPU path (`isNativeQuantType`)**: q8_0, q4_1, q4_k, and q6_k weights are uploaded as packed binary directly to GPU, bypassing CPU dequantization.
+- **F16 fallback path**: q4_0 weights are dequantized to f16 on CPU, uploaded, and executed via the `matmul_f16` / `matvec_f16` GPU shaders.
+- **F32 fallback path**: q4_1 (and any unrecognized type) weights are dequantized to f32 on CPU, uploaded, and executed via the `matmul` GPU shader (or specialized `matmul_q4_1` shader if the GPU quant path is taken for q4_1).
+- **Quants with full native GPU coverage (matmul + matvec + embedding lookup)**: q4_k and q6_k have dedicated `matmul`, `matvec`, and `get_rows` GPU shaders.
+- **Q4_K**: Native GPU decoding for the 256-element block format (144 bytes). Nibble-unpacking on the fly during tile/matvec multiplication. `get_rows_q4_k` handles embedding lookups.
+- **Q6_K**: Native GPU decoding for the 256-element block format (210 bytes). 6-bit signed unpacking and scale application. `get_rows_q6_k` handles embedding lookups.
 
 ---
 
 ## 4. Shaders (GLSL Compute)
 
-Located in `src/shaders/*.glsl` (compiled to `.spv`).
+Located in `src/shaders/*.glsl` (compiled to `.spv`). 31 shaders are compiled by `build.zig`.
 These are headless Compute Shaders utilizing `GL_EXT_buffer_reference2` to read memory directly via pointers rather than descriptor sets.
 
-*Key Shaders:*
-- `matmul_bda.glsl` / `matvec_bda.glsl`: Standard matrix operations.
-- `matmul_q4_k_bda.glsl`: Native GPU decoding for the 256-element Q4_K block format. Performs nibble-unpacking on the fly during tile multiplication.
-- `matmul_q6_k_bda.glsl`: Native GPU decoding for the 256-element Q6_K block format. Performs 6-bit nibble-unpacking and scale application on the fly during 16×16 tile multiplication.
-- `matvec_q4_k_bda.glsl`: Native GPU matvec for Q4_K with on-the-fly dequantization. Uses a thread-per-column `BlockDot` loop to ensure hardware independence across AMD and Nvidia GPUs.
-- `matvec_q6_k_bda.glsl`: Native GPU matvec for Q6_K with on-the-fly 6-bit dequantization. Uses a thread-per-column `BlockDot` loop to ensure hardware independence across AMD and Nvidia GPUs.
-- `get_rows_q4_k_bda.glsl`: Native GPU embedding lookup for Q4_K weights.
-- `get_rows_q6_k_bda.glsl`: Native GPU embedding lookup for Q6_K weights.
-- `attention_bda.glsl` / `flash_attn_bda.glsl`: Computes scaled dot-product attention over the KV cache.
-- `rope_bda.glsl`: Applies Rotary Positional Embeddings.
+*Core Shaders:*
+- `rmsnorm_bda.glsl` — Root Mean Square Normalization
+- `softmax_bda.glsl` — Softmax with subgroup reduction
+- `rope_bda.glsl` — Rotary Position Embedding (RoPE)
+- `attention_bda.glsl` — Standard scaled dot-product attention over KV cache
+- `flash_attn_bda.glsl` — Flash attention with tiled accumulation
+- `kv_write_bda.glsl` — KV cache write (appends K/V at position)
+- `silu_mul_bda.glsl`, `gelu_mul_bda.glsl` — FFN activation (SiLU/GELU + multiply)
+- `scaled_add_bda.glsl` — Residual add with scaling
+- `add_bda.glsl`, `mul_bda.glsl` — Element-wise add/multiply
+- `copy_bda.glsl` — Tensor copy
+- `topk_bda.glsl` — GPU top-k selection
+
+*Floating-Point Matrices:*
+- `matmul_bda.glsl` / `matmul_f16_bda.glsl` — Standard matrix multiplication (f32/f16)
+- `matvec_f16_bda.glsl` — Matrix-vector product (f16)
+- `get_rows_q_bda.glsl` — Generic embedding lookup
+
+*Quantized GPU Matrix Operations (on-the-fly dequant):*
+- `matmul_q4_k_bda.glsl` / `matvec_q4_k_bda.glsl` — Q4_K matmul/matvec with nibble unpacking
+- `matmul_q6_k_bda.glsl` / `matvec_q6_k_bda.glsl` — Q6_K matmul/matvec with 6-bit unpacking
+- `matmul_q8_0_bda.glsl` / `matvec_q8_0_bda.glsl` — Q8_0 matmul/matvec
+- `matmul_q4_0_bda.glsl` / `matvec_q4_0_bda.glsl` — Q4_0 matmul/matvec
+- `matmul_q4_1_bda.glsl` / `matvec_q4_1_bda.glsl` — Q4_1 matmul/matvec
+
+*Quantized GPU Embedding Lookups:*
+- `get_rows_q4_0_bda.glsl` — Q4_0 embedding lookup
+- `get_rows_q4_1_bda.glsl` — Q4_1 embedding lookup
+- `get_rows_q4_k_bda.glsl` — Q4_K embedding lookup
+- `get_rows_q6_k_bda.glsl` — Q6_K embedding lookup
 
 ---
 
 ## 5. Token Generation Loop
 
-**Location:** `src/main.zig` (lines 698-802)
+**Location:** `src/main.zig` (lines 762-875)
 
 The token generation loop is a `while` loop that produces tokens sequentially after the prefill phase:
 
@@ -184,11 +208,11 @@ This reduces per-token CPU overhead from 2 submits/wait cycles to 1.
 
 | Function | Location | Purpose |
 |----------|----------|---------|
-| `dispatcher.executeTopK()` | `src/compute_graph.zig:770-806` | GPU top-k selection with subgroup reduction |
-| `token_sampler.sample()` | `src/sampler.zig` | CPU sampling with temperature/top-p/min-p |
-| `dispatcher.executeGetRowsQ()` | `src/compute_graph.zig:721-768` | GPU embedding lookup for quantized weights |
-| `dispatcher.execute()` | `src/compute_graph.zig:667-678` | Execute full DAG for single token |
-| `dispatcher.recordEmbedAndGraph()` | `src/compute_graph.zig:770+` | Batched GPU embedding lookup + graph dispatch |
+| `dispatcher.executeTopK()` | `src/compute_graph.zig:948` | GPU top-k selection with subgroup reduction |
+| `token_sampler.sample()` | `src/sampler.zig:26` | CPU sampling with temperature/top-p/min-p |
+| `dispatcher.executeGetRowsQ()` | `src/compute_graph.zig:845-892` | GPU embedding lookup for quantized weights |
+| `dispatcher.execute()` | `src/compute_graph.zig:787-802` | Execute full DAG for single token |
+| `dispatcher.recordEmbedAndGraph()` | `src/compute_graph.zig:894` | Batched GPU embedding lookup + graph dispatch |
 
 ### Sampling Paths
 
@@ -208,40 +232,29 @@ This reduces per-token CPU overhead from 2 submits/wait cycles to 1.
 
 **Location:** Shader-based implementations in `src/shaders/`
 
-The codebase uses **workgroup-local shared memory** for reduction patterns, NOT subgroup intrinsics (no `subgroupReduce`, `subgroupShuffle`, etc.). All reductions follow a **power-of-2 tree reduction** pattern using `barrier()` between stages.
+The codebase uses both **subgroup intrinsics** and **workgroup-local shared memory** reductions depending on the shader.
 
 ### 6.1 Softmax Reduction (`softmax_bda.glsl`)
 
-Two-phase reduction for numerically stable softmax:
+Uses `subgroupMax()` and `subgroupAdd()` for fast intra-subgroup reduction, with a workgroup-level fallback via shared memory for cross-subgroup aggregation when the workgroup exceeds the subgroup size:
 
 ```glsl
 layout(local_size_x = 256) in;
-shared float shared_max[256];
-shared float shared_sum[256];
+shared float shared_max[8];
+shared float shared_sum[8];
 
-// Phase 1: Local max reduction (power-of-2 halving)
-for (uint s = 128; s > 0; s >>= 1) {
-    if (tid < s) shared_max[tid] = max(shared_max[tid], shared_max[tid + s]);
-    barrier();
-}
-// Phase 2: Expsum reduction
-for (uint s = 128; s > 0; s >>= 1) {
-    if (tid < s) shared_sum[tid] += shared_sum[tid + s];
-    barrier();
-}
+float sg_max = subgroupMax(local_max);
+// subgroup-level aggregation via shared memory when workgroup > subgroup
 ```
-
-**Pattern:** 256 workitems cooperatively reduce via power-of-2 halving. Each stage halves the working set, with `barrier()` ensuring all workitems sync before the next stage.
 
 ### 6.2 TopK Reduction (`topk_bda.glsl`)
 
-Parallel reduction to find maximum value with index tracking:
+Power-of-2 tree reduction using shared memory to find maximum value with index tracking:
 
 ```glsl
 shared float s_val[256];
 shared uint s_idx[256];
 
-// Parallel reduction to find max
 for (uint off = 128u; off > 0u; off >>= 1u) {
     if (lid < off) {
         if (s_val[lid + off] > s_val[lid]) {
@@ -253,21 +266,25 @@ for (uint off = 128u; off > 0u; off >>= 1u) {
 }
 ```
 
-**Pattern:** Same power-of-2 reduction, but keeps index alongside value. Final result at `s_val[0]` / `s_idx[0]` contains the maximum and its position.
+### 6.3 Matvec Reduction (`matvec_q4_k_bda.glsl`, `matvec_q6_k_bda.glsl`)
 
-### 6.3 Attention Flash (`flash_attn_bda.glsl`)
+Uses `subgroupClusteredAdd(32)` for intra-subgroup sum reduction of dot products. These shaders require `GL_KHR_shader_subgroup_arithmetic`, `GL_KHR_shader_subgroup_clustered`, `GL_KHR_shader_subgroup_shuffle`, and `GL_KHR_shader_subgroup_ballot` extensions. Each subgroup processes one column independently; final results are aggregated via subgroup clustered add.
 
-Note: Flash attention does NOT use reduction. Instead, it employs a **tiled approach** with a loop over `tile_sz` (typically 64), accumulating results in register without shared memory reduction.
+### 6.4 Attention Flash (`flash_attn_bda.glsl`)
 
-### 6.4 Reduction Pattern Summary
+Flash attention uses a **tiled accumulation** approach: a loop over `tile_sz` chunks accumulates Q*K dot products and V-weighted sums in registers without shared memory reduction or subgroup intrinsics.
+
+### 6.5 Reduction Pattern Summary
 
 | Shader | Workgroup Size | Reduction Type |
 |--------|---------------|----------------|
-| `softmax_bda.glsl` | 256 | Power-of-2 tree (max + sum) |
-| `topk_bda.glsl` | 256 | Power-of-2 tree (max with index) |
-| `flash_attn_bda.glsl` | 64 | Tiled accumulation (no reduction) |
+| `softmax_bda.glsl` | 256×1 | Subgroup (max + sum) with shared memory cross-subgroup |
+| `topk_bda.glsl` | 256×1 | Power-of-2 tree (max with index) via shared memory |
+| `flash_attn_bda.glsl` | 64×1 | Tiled accumulation (no reduction) |
+| `matvec_q4_k_bda.glsl` | 256×1 | Subgroup clustered add |
+| `matvec_q6_k_bda.glsl` | 256×1 | Subgroup clustered add |
 
-All reductions use `gl_WorkgroupBarrier()` (`memory_barrier_flag` + `workgroup_barrier_flag`) to ensure correct synchronization between workitems.
+All shared memory reductions use `barrier()` to ensure correct synchronization between workitems.
 
 ---
 
@@ -356,7 +373,7 @@ f32 q6kWeight(uint col, uint row) {
 All GPU buffers are created with `shader_device_address_bit` enabled. Shaders use `GL_EXT_buffer_reference2` to access memory directly via pointers:
 
 ```glsl
-// Push constants structure (72 bytes)
+// Push constants structure (56 bytes)
 struct PushConstants {
     uint p1, p2, p3, p4, p5, p6, p7, p8;  // u32 parameters
     uint64_t a, b, c;  // Buffer Device Address pointers
@@ -401,12 +418,13 @@ Flat buffer of size `max_ctx * n_kv_heads * head_dim * 2 * 2 * n_layer`:
 
 ### 9.3 Quantized Weight Storage
 
-| Format | Elements/Block | Bytes/Block | Native GPU |
-|--------|---------------|-------------|------------|
-| `f32` | 1 | 4 | Yes |
-| `f16` | 1 | 2 | Yes |
-| `q8_0` | 32 | 34 | Partial |
-| `q4_0` | 32 | 18 | Partial |
-| `q4_1` | 32 | 20 | Partial |
-| `q4_k` | 256 | 144 | Yes |
-| `q6_k` | 256 | 210 | Yes (native GPU — matvec + matmul) |
+| Format | Elements/Block | Bytes/Block | GPU Path |
+|--------|---------------|-------------|----------|
+| `f32` | 1 | 4 | Uploaded as f32 |
+| `f16` | 1 | 2 | Uploaded as f16 |
+| `bf16` | 1 | 2 | Host dequant → f32 upload |
+| `q8_0` | 32 | 34 | Native GPU (matmul + matvec) |
+| `q4_0` | 32 | 18 | Host dequant → f16 upload, f16 GPU matmul/matvec |
+| `q4_1` | 32 | 20 | Native GPU (matmul + matvec + get_rows) |
+| `q4_k` | 256 | 144 | Native GPU (matmul + matvec + get_rows) |
+| `q6_k` | 256 | 210 | Native GPU (matmul + matvec + get_rows) |

@@ -20,6 +20,13 @@ zig-pkg/
 *.swp
 .cursor/
 .antigravitycli/
+
+# Dot-directories (config, tools, etc.)
+.opencode/
+.antigravity/
+
+# OpenCode
+opencode.json
 AGENTS.md
 
 # Binaries
