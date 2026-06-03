@@ -32,6 +32,16 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
+    const inspect_exe = b.addExecutable(.{
+        .name = "inspect_gguf",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("inspect_gguf.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    b.installArtifact(inspect_exe);
+
     if (compileShaders(b)) |shader_step| {
         exe.step.dependOn(shader_step);
     }
@@ -68,6 +78,28 @@ pub fn build(b: *std.Build) void {
     });
     const run_root_tests = b.addRunArtifact(root_tests);
 
+    const ssm_state_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/ssm_state_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_ssm_state_tests = b.addRunArtifact(ssm_state_tests);
+
+    const qwen35_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/qwen35_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "vulkan", .module = vulkan_mod },
+                .{ .name = "kernels_data", .module = kernels_data_mod },
+            },
+        }),
+    });
+    const run_qwen35_tests = b.addRunArtifact(qwen35_tests);
+
     const mmap_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/mmap_test.zig"),
@@ -93,6 +125,8 @@ pub fn build(b: *std.Build) void {
 const test_step = b.step("test", "Run CPU and parity-focused unit tests");
     test_step.dependOn(&run_ops_tests.step);
     test_step.dependOn(&run_root_tests.step);
+    test_step.dependOn(&run_ssm_state_tests.step);
+    test_step.dependOn(&run_qwen35_tests.step);
     test_step.dependOn(&run_mmap_tests.step);
 
     const clean_step = b.step("clean", "Remove all build artifacts and caches");
@@ -143,6 +177,15 @@ fn compileShaders(b: *std.Build) ?*std.Build.Step {
         .{ .src = "src/shaders/scaled_add_bda.glsl", .out = "scaled_add_bda.spv" },
         .{ .src = "src/shaders/gelu_mul_bda.glsl", .out = "gelu_mul_bda.spv" },
         .{ .src = "src/shaders/copy_bda.glsl", .out = "copy_bda.spv" },
+        .{ .src = "src/shaders/softplus_bda.glsl", .out = "softplus_bda.spv" },
+        .{ .src = "src/shaders/sigmoid_bda.glsl", .out = "sigmoid_bda.spv" },
+        .{ .src = "src/shaders/silu_bda.glsl", .out = "silu_bda.spv" },
+        .{ .src = "src/shaders/l2_norm_bda.glsl", .out = "l2_norm_bda.spv" },
+        .{ .src = "src/shaders/mrope_bda.glsl", .out = "mrope_bda.spv" },
+        .{ .src = "src/shaders/attn_gate_mul_bda.glsl", .out = "attn_gate_mul_bda.spv" },
+        .{ .src = "src/shaders/ssm_conv1d_bda.glsl", .out = "ssm_conv1d_bda.spv" },
+        .{ .src = "src/shaders/ssm_delta_net_decode_bda.glsl", .out = "ssm_delta_net_decode_bda.spv" },
+        .{ .src = "src/shaders/ssm_gated_norm_bda.glsl", .out = "ssm_gated_norm_bda.spv" },
     };
 
     const step = b.step("shaders", "Compile GLSL compute shaders to SPIR-V");

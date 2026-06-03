@@ -72,10 +72,108 @@ test "mmap load matches file I/O load" {
             try ctx_mmap.readTensorData(t_mmap, buf_mmap);
 
             try testing.expectEqualStrings(buf_file, buf_mmap);
-            
-            // Also check getTensorSlice directly
+
+            // Also check getTensorSlice directamente
             const mmap_slice = try ctx_mmap.getTensorSlice(t_mmap);
             try testing.expectEqualStrings(buf_file, mmap_slice[0..compare_len]);
         }
+    }
+}
+
+test "Qwen3.5 4B GGUF parses and has expected architecture + SSM dims" {
+    const t = std.testing;
+    const allocator = t.allocator;
+
+    const model_path = "D:\\llama.zig\\models\\Qwen3.5-4B-Q4_K_M.gguf";
+    if (!std.fs.path.isAbsolute(model_path)) return;
+    const file_exists = blk: {
+        const cwd = std.Io.Dir.cwd();
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const f = cwd.openFile(io, model_path, .{ .mode = .read_only }) catch {
+            break :blk false;
+        };
+        f.close(io);
+        break :blk true;
+    };
+    if (!file_exists) return;
+
+    var ctx = try gguf.loadModelMmap(allocator, model_path);
+    defer ctx.deinit();
+
+    // Architecture must be qwen35
+    const arch_val = ctx.kvs.get("general.architecture") orelse return error.MissingArchitecture;
+    try t.expectEqualStrings("qwen35", arch_val.string);
+
+    // Qwen 3.5 SSM parameters must be populated
+    const ssm_d_conv = ctx.kvs.get("qwen35.ssm.conv_kernel") orelse return error.MissingSSMConv;
+    try t.expectEqual(@as(u32, 4), ssm_d_conv.u32);
+    const ssm_d_state = ctx.kvs.get("qwen35.ssm.state_size") orelse return error.MissingSSMState;
+    try t.expectEqual(@as(u32, 128), ssm_d_state.u32);
+    const ssm_dt_rank = ctx.kvs.get("qwen35.ssm.time_step_rank") orelse return error.MissingSSMDtRank;
+    try t.expectEqual(@as(u32, 32), ssm_dt_rank.u32);
+    const ssm_n_group = ctx.kvs.get("qwen35.ssm.group_count") orelse return error.MissingSSMGroup;
+    try t.expectEqual(@as(u32, 4), ssm_n_group.u32);
+
+    // Dense 4B has no NextN
+    if (ctx.kvs.get("qwen35.nextn_predict_layers")) |nextn| {
+        try t.expectEqual(@as(u32, 0), nextn.u32);
+    }
+
+    // Critical tensor names must be present
+    try t.expect(ctx.tensors.contains("blk.0.attn_qkv.weight"));
+    try t.expect(ctx.tensors.contains("blk.0.attn_gate.weight"));
+    try t.expect(ctx.tensors.contains("blk.0.ssm_conv1d.weight"));
+    try t.expect(ctx.tensors.contains("blk.0.ssm_dt.bias"));
+    try t.expect(ctx.tensors.contains("blk.0.ffn_down.weight"));
+    try t.expect(ctx.tensors.contains("token_embd.weight"));
+    try t.expect(ctx.tensors.contains("output_norm.weight"));
+
+    // Architecture-shape sanity checks
+    const n_embd_kv = ctx.kvs.get("qwen35.embedding_length") orelse return error.MissingEmbDim;
+    try t.expectEqual(@as(u32, 2560), n_embd_kv.u32);
+    const n_layer_kv = ctx.kvs.get("qwen35.block_count") orelse return error.MissingBlockCount;
+    try t.expectEqual(@as(u32, 32), n_layer_kv.u32);
+    const head_dim_kv = ctx.kvs.get("qwen35.attention.key_length") orelse return error.MissingKeyLength;
+    try t.expectEqual(@as(u32, 160), head_dim_kv.u32);
+}
+
+test "Qwen3.5 9B GGUF parses and has expected architecture + SSM dims" {
+    const t = std.testing;
+    const allocator = t.allocator;
+
+    const model_path = "D:\\llama.zig\\models\\Qwen3.5-9B-Q4_K_M.gguf";
+    const file_exists = blk: {
+        const cwd = std.Io.Dir.cwd();
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const f = cwd.openFile(io, model_path, .{ .mode = .read_only }) catch {
+            break :blk false;
+        };
+        f.close(io);
+        break :blk true;
+    };
+    if (!file_exists) return;
+
+    var ctx = try gguf.loadModelMmap(allocator, model_path);
+    defer ctx.deinit();
+
+    const arch_val = ctx.kvs.get("general.architecture") orelse return error.MissingArchitecture;
+    try t.expectEqualStrings("qwen35", arch_val.string);
+
+    // 9B has 3584 hidden_dim (vs 4B's 2560)
+    const n_embd_kv = ctx.kvs.get("qwen35.embedding_length") orelse return error.MissingEmbDim;
+    try t.expectEqual(@as(u32, 3584), n_embd_kv.u32);
+    const n_layer_kv = ctx.kvs.get("qwen35.block_count") orelse return error.MissingBlockCount;
+    try t.expectEqual(@as(u32, 32), n_layer_kv.u32);
+
+    // 9B has a larger head_dim (224 vs 160)
+    const head_dim_kv = ctx.kvs.get("qwen35.attention.key_length") orelse return error.MissingKeyLength;
+    try t.expectEqual(@as(u32, 224), head_dim_kv.u32);
+
+    // SSM parameters consistent with 4B
+    const ssm_d_conv = ctx.kvs.get("qwen35.ssm.conv_kernel") orelse return error.MissingSSMConv;
+    try t.expectEqual(@as(u32, 4), ssm_d_conv.u32);
+    const ssm_d_state = ctx.kvs.get("qwen35.ssm.state_size") orelse return error.MissingSSMState;
+    try t.expectEqual(@as(u32, 128), ssm_d_state.u32);
+}
     }
 }

@@ -19,9 +19,16 @@ pub const PushConstants = extern struct {
     p6: u32 = 0,
     p7: u32 = 0,
     p8: u32 = 0,
-    a: u64,
-    b: u64,
-    c: u64,
+    /// Buffer device addresses. Most ops use only a/b/c; the SSM ops
+    /// (ssm_conv1d, ssm_delta_net_decode, ssm_gated_norm) and the
+    /// multi-input dispatcher paths use d/e/f/g.
+    a: u64 = 0,
+    b: u64 = 0,
+    c: u64 = 0,
+    d: u64 = 0,
+    e: u64 = 0,
+    f: u64 = 0,
+    g: u64 = 0,
 };
 
 pub const Context = struct {
@@ -183,8 +190,20 @@ pub const Context = struct {
     }
 
     pub fn createShaderModule(self: Context, code: []const u8) !vk.ShaderModule {
+        // Vulkan's pCode is [*]const u32 (4-byte aligned per spec). @embedFile
+        // returns 1-byte aligned data and the linker provides no alignment
+        // guarantees, so we copy into a 4-aligned scratch buffer.
+        const aligned_code = try self.allocator.alignedAlloc(u8, .@"4", code.len);
+        defer self.allocator.free(aligned_code);
+        @memcpy(aligned_code, code);
+
         var shader: vk.ShaderModule = undefined;
-        const result = self.vkd.dispatch.vkCreateShaderModule.?(self.device, &.{ .flags = .{}, .code_size = code.len, .p_code = @ptrCast(@alignCast(code.ptr)) }, null, &shader);
+        const result = self.vkd.dispatch.vkCreateShaderModule.?(
+            self.device,
+            &.{ .flags = .{}, .code_size = code.len, .p_code = @ptrCast(aligned_code.ptr) },
+            null,
+            &shader,
+        );
         if (result != .success) return error.ShaderModuleCreationFailed;
         return shader;
     }

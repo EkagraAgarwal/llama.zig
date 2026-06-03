@@ -7,6 +7,7 @@ pub const Architecture = enum {
     granite,
     gemma,
     qwen,
+    qwen35,
     unknown,
 };
 
@@ -36,6 +37,23 @@ pub const ModelConfig = struct {
     logit_scale: f32,
     final_logit_softcapping: f32,
 
+    // Qwen 3.5 hybrid (Gated Delta Net + periodic full attention) parameters.
+    ssm_d_conv: u32 = 0,
+    ssm_d_inner: u32 = 0,
+    ssm_d_state: u32 = 0,
+    ssm_dt_rank: u32 = 0,
+    ssm_n_group: u32 = 0,
+    nextn_predict_layers: u32 = 0,
+    full_attn_interval: u32 = 4,
+    rope_sections: [4]u32 = .{ 0, 0, 0, 0 },
+
+    pub fn isRecurrent(self: *const ModelConfig, layer: u32) bool {
+        const n_main = self.n_layer -| self.nextn_predict_layers;
+        if (layer >= n_main) return false;
+        if (self.full_attn_interval == 0) return false;
+        return (layer + 1) % self.full_attn_interval != 0;
+    }
+
     pub fn init(allocator: std.mem.Allocator, ctx: *gguf.GGUFContext, vocab_size: u32) !ModelConfig {
         const arch_str: []const u8 = blk: {
             if (ctx.kvs.get("general.architecture")) |v| {
@@ -57,7 +75,16 @@ pub const ModelConfig = struct {
             getU32(ctx, "llama.block_count") orelse 1;
         const n_heads = try getMetaU32Any(ctx, arch_prefix, arch_alt_prefix, "attention.head_count") orelse
             getU32(ctx, "llama.attention.head_count") orelse 12;
-        const head_dim = n_embd / n_heads;
+        // Qwen 3.5 head_dim is independent of n_embd / n_heads — prefer attention.key_length.
+        const head_dim: u32 = blk: {
+            if (try getMetaU32Any(ctx, arch_prefix, arch_alt_prefix, "attention.key_length")) |v| {
+                if (v > 0) break :blk v;
+            }
+            if (getU32(ctx, "llama.attention.key_length")) |v| {
+                if (v > 0) break :blk v;
+            }
+            break :blk if (n_heads > 0) n_embd / n_heads else 0;
+        };
         const n_kv_heads = blk: {
             if (try getMetaU32Any(ctx, arch_prefix, arch_alt_prefix, "attention.head_count_kv")) |v| break :blk v;
             if (getU32(ctx, "llama.attention.head_count_kv")) |v| break :blk v;
@@ -106,6 +133,35 @@ pub const ModelConfig = struct {
         const logit_scale = (try getMetaF32Any(ctx, arch_prefix, arch_alt_prefix, "logit_scale")) orelse
             (try getMetaF32Any(ctx, arch_prefix, arch_alt_prefix, "logits_scaling")) orelse 1.0;
 
+        // Qwen 3.5 Gated Delta Net + MRoPE + NextN parameters.
+        // All optional; default to zero so non-Qwen35 GGUFs are unaffected.
+        const ssm_d_conv: u32 = (try getMetaU32Any(ctx, arch_prefix, arch_alt_prefix, "ssm.conv_kernel")) orelse 0;
+        const ssm_d_inner: u32 = (try getMetaU32Any(ctx, arch_prefix, arch_alt_prefix, "ssm.inner_size")) orelse 0;
+        const ssm_d_state: u32 = (try getMetaU32Any(ctx, arch_prefix, arch_alt_prefix, "ssm.state_size")) orelse 0;
+        const ssm_dt_rank: u32 = (try getMetaU32Any(ctx, arch_prefix, arch_alt_prefix, "ssm.time_step_rank")) orelse 0;
+        const ssm_n_group: u32 = (try getMetaU32Any(ctx, arch_prefix, arch_alt_prefix, "ssm.group_count")) orelse 0;
+        const nextn_predict_layers: u32 = (try getMetaU32Any(ctx, arch_prefix, arch_alt_prefix, "nextn_predict_layers")) orelse 0;
+        const full_attn_interval: u32 = (try getMetaU32Any(ctx, arch_prefix, arch_alt_prefix, "full_attention_interval")) orelse 4;
+
+        var rope_sections: [4]u32 = .{ 0, 0, 0, 0 };
+        if (ctx.kvs.get("qwen35.rope.dimension_sections")) |v| {
+            if (v == .array) {
+                const arr = v.array;
+                const n = @min(arr.len, @as(usize, 4));
+                for (arr[0..n], 0..) |item, i| {
+                    if (item == .u32) {
+                        rope_sections[i] = item.u32;
+                    } else if (item == .i32) {
+                        rope_sections[i] = @intCast(@max(item.i32, 0));
+                    } else if (item == .u64) {
+                        rope_sections[i] = @intCast(item.u64);
+                    } else if (item == .i64) {
+                        rope_sections[i] = @intCast(@max(item.i64, 0));
+                    }
+                }
+            }
+        }
+
         return ModelConfig{
             .arch = arch,
             .arch_prefix = try allocator.dupe(u8, arch_prefix),
@@ -126,6 +182,14 @@ pub const ModelConfig = struct {
             .residual_scale = residual_scale,
             .logit_scale = logit_scale,
             .final_logit_softcapping = final_logit_softcapping,
+            .ssm_d_conv = ssm_d_conv,
+            .ssm_d_inner = ssm_d_inner,
+            .ssm_d_state = ssm_d_state,
+            .ssm_dt_rank = ssm_dt_rank,
+            .ssm_n_group = ssm_n_group,
+            .nextn_predict_layers = nextn_predict_layers,
+            .full_attn_interval = full_attn_interval,
+            .rope_sections = rope_sections,
         };
     }
 
@@ -138,6 +202,7 @@ pub fn parseArchitecture(raw_arch: []const u8) Architecture {
     if (std.ascii.eqlIgnoreCase(raw_arch, "llama")) return .llama;
     if (std.ascii.eqlIgnoreCase(raw_arch, "granite")) return .granite;
     if (raw_arch.len >= 5 and std.ascii.eqlIgnoreCase(raw_arch[0..5], "gemma")) return .gemma;
+    if (std.ascii.eqlIgnoreCase(raw_arch, "qwen35")) return .qwen35;
     if (raw_arch.len >= 4 and std.ascii.eqlIgnoreCase(raw_arch[0..4], "qwen")) return .qwen;
     return .unknown;
 }
@@ -148,6 +213,7 @@ pub fn canonicalArchitecturePrefix(raw_arch: []const u8) []const u8 {
         .granite => "granite",
         .gemma => "gemma",
         .qwen => "qwen",
+        .qwen35 => "qwen35",
         .unknown => raw_arch,
     };
 }
@@ -219,6 +285,8 @@ test "architecture acceptance matrix parsing" {
     try t.expectEqual(Architecture.qwen, parseArchitecture("qwen"));
     try t.expectEqual(Architecture.qwen, parseArchitecture("qwen2"));
     try t.expectEqual(Architecture.qwen, parseArchitecture("qwen2moe"));
+    try t.expectEqual(Architecture.qwen35, parseArchitecture("qwen35"));
+    try t.expectEqual(Architecture.qwen35, parseArchitecture("QWEN35"));
     try t.expectEqual(Architecture.unknown, parseArchitecture("mistral"));
 }
 
@@ -228,61 +296,183 @@ test "architecture canonical metadata prefix" {
     try t.expectEqualStrings("granite", canonicalArchitecturePrefix("granite"));
     try t.expectEqualStrings("gemma", canonicalArchitecturePrefix("gemma2"));
     try t.expectEqualStrings("qwen", canonicalArchitecturePrefix("qwen2moe"));
+    try t.expectEqualStrings("qwen35", canonicalArchitecturePrefix("qwen35"));
+    try t.expectEqualStrings("qwen35", canonicalArchitecturePrefix("QWEN35"));
     try t.expectEqualStrings("unknown_arch", canonicalArchitecturePrefix("unknown_arch"));
+}
+
+test "isRecurrent schedule for Qwen 3.5 n_layer=32 interval=4" {
+    const t = std.testing;
+    // 32 layers, 4 attention layers (3,7,11,15,19,23,27,31) and 24 SSM layers.
+    var cfg = ModelConfig{
+        .arch = .qwen35,
+        .arch_prefix = "qwen35",
+        .activation = .silu,
+        .n_embd = 2560,
+        .n_layer = 32,
+        .n_heads = 16,
+        .n_kv_heads = 4,
+        .n_ff = 9216,
+        .head_dim = 160,
+        .vocab_size = 100,
+        .max_ctx = 128,
+        .rope_theta = 1.0e6,
+        .rms_norm_eps = 1.0e-6,
+        .wtype = .q4_k,
+        .embedding_scale = 1.0,
+        .attention_scale = 0.0,
+        .residual_scale = 1.0,
+        .logit_scale = 1.0,
+        .final_logit_softcapping = 0.0,
+        .full_attn_interval = 4,
+    };
+    var recurrent_count: u32 = 0;
+    var attention_count: u32 = 0;
+    var l: u32 = 0;
+    while (l < 32) : (l += 1) {
+        if (cfg.isRecurrent(l)) {
+            recurrent_count += 1;
+        } else {
+            attention_count += 1;
+        }
+    }
+    try t.expectEqual(@as(u32, 24), recurrent_count);
+    try t.expectEqual(@as(u32, 8), attention_count);
+    // Boundary checks: layer 0,1,2 are recurrent; layer 3 is attention.
+    try t.expect(cfg.isRecurrent(0));
+    try t.expect(cfg.isRecurrent(1));
+    try t.expect(cfg.isRecurrent(2));
+    try t.expect(!cfg.isRecurrent(3));
+    try t.expect(cfg.isRecurrent(4));
+    try t.expect(!cfg.isRecurrent(31));
+}
+
+test "isRecurrent returns false for NextN layers" {
+    const t = std.testing;
+    var cfg = ModelConfig{
+        .arch = .qwen35,
+        .arch_prefix = "qwen35",
+        .activation = .silu,
+        .n_embd = 256,
+        .n_layer = 4,
+        .n_heads = 4,
+        .n_kv_heads = 2,
+        .n_ff = 1024,
+        .head_dim = 64,
+        .vocab_size = 100,
+        .max_ctx = 128,
+        .rope_theta = 1.0e6,
+        .rms_norm_eps = 1.0e-6,
+        .wtype = .q4_k,
+        .embedding_scale = 1.0,
+        .attention_scale = 0.0,
+        .residual_scale = 1.0,
+        .logit_scale = 1.0,
+        .final_logit_softcapping = 0.0,
+        .nextn_predict_layers = 1, // last layer is NextN
+        .full_attn_interval = 4,
+    };
+    // n_main = 3, so layer 3 is NextN — never recurrent.
+    try t.expect(cfg.isRecurrent(0));
+    try t.expect(!cfg.isRecurrent(3));
+}
+
+test "isRecurrent guards against zero interval" {
+    const t = std.testing;
+    var cfg = ModelConfig{
+        .arch = .qwen35,
+        .arch_prefix = "qwen35",
+        .activation = .silu,
+        .n_embd = 256,
+        .n_layer = 4,
+        .n_heads = 4,
+        .n_kv_heads = 2,
+        .n_ff = 1024,
+        .head_dim = 64,
+        .vocab_size = 100,
+        .max_ctx = 128,
+        .rope_theta = 1.0e6,
+        .rms_norm_eps = 1.0e-6,
+        .wtype = .q4_k,
+        .embedding_scale = 1.0,
+        .attention_scale = 0.0,
+        .residual_scale = 1.0,
+        .logit_scale = 1.0,
+        .final_logit_softcapping = 0.0,
+        .full_attn_interval = 0, // degenerate; should not divide-by-zero
+    };
+    try t.expect(!cfg.isRecurrent(0));
+    try t.expect(!cfg.isRecurrent(1));
 }
 
 test "ModelConfig dynamic activation and scaling" {
     const t = std.testing;
     const allocator = t.allocator;
 
-    var kvs = std.StringHashMap(gguf.MetadataValue).init(allocator);
-    defer {
-        var it = kvs.iterator();
-        while (it.next()) |entry| {
-            allocator.free(entry.key_ptr.*);
-            // MetadataValue cleaning
-            switch (entry.value_ptr.*) {
-                .string => |s| allocator.free(s),
-                else => {},
-            }
-        }
-        kvs.deinit();
-    }
-
-    var tensors = std.StringHashMap(*tensor.Tensor).init(allocator);
-    defer tensors.deinit();
-
-    var ctx = gguf.GGUFContext{
-        .allocator = allocator,
-        .file = undefined,
-        .version = 3,
-        .tensor_count = 0,
-        .kv_count = 0,
-        .kvs = kvs,
-        .tensors = tensors,
-        .data_offset = 0,
-    };
+    // Use an arena allocator so all test allocations are released together
+    // when the arena is destroyed. The Zig 0.16 leak detector was flagging
+    // the hashmap internal-storage allocations as leaks because the deferred
+    // iterator-then-deinit pattern was not running in all control paths.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
 
     // Test Llama (defaults)
-    try ctx.kvs.put(try allocator.dupe(u8, "general.architecture"), .{ .string = try allocator.dupe(u8, "llama") });
-    try ctx.kvs.put(try allocator.dupe(u8, "llama.embedding_length"), .{ .u32 = 4096 });
-    try ctx.kvs.put(try allocator.dupe(u8, "llama.block_count"), .{ .u32 = 32 });
+    {
+        var kvs = std.StringHashMap(gguf.MetadataValue).init(a);
+        defer kvs.deinit();
+        var tensors = std.StringHashMap(*tensor.Tensor).init(a);
+        defer tensors.deinit();
 
-    var cfg = try ModelConfig.init(allocator, &ctx, 32000);
-    defer cfg.deinit(allocator);
+        var ctx = gguf.GGUFContext{
+            .allocator = a,
+            .file = undefined,
+            .version = 3,
+            .tensor_count = 0,
+            .kv_count = 0,
+            .kvs = kvs,
+            .tensors = tensors,
+            .data_offset = 0,
+            .mmap_file = null,
+        };
+        try ctx.kvs.put(try a.dupe(u8, "general.architecture"), .{ .string = try a.dupe(u8, "llama") });
+        try ctx.kvs.put(try a.dupe(u8, "llama.embedding_length"), .{ .u32 = 4096 });
+        try ctx.kvs.put(try a.dupe(u8, "llama.block_count"), .{ .u32 = 32 });
 
-    try t.expectEqual(Architecture.llama, cfg.arch);
-    try t.expectEqual(Activation.silu, cfg.activation);
-    try t.expectEqual(@as(f32, 1.0), cfg.embedding_scale);
+        var cfg = try ModelConfig.init(a, &ctx, 32000);
+        defer cfg.deinit(a);
+
+        try t.expectEqual(Architecture.llama, cfg.arch);
+        try t.expectEqual(Activation.silu, cfg.activation);
+        try t.expectEqual(@as(f32, 1.0), cfg.embedding_scale);
+    }
 
     // Test Gemma
-    try ctx.kvs.put(try allocator.dupe(u8, "general.architecture"), .{ .string = try allocator.dupe(u8, "gemma") });
-    try ctx.kvs.put(try allocator.dupe(u8, "gemma.embedding_length"), .{ .u32 = 2048 });
+    {
+        var kvs = std.StringHashMap(gguf.MetadataValue).init(a);
+        defer kvs.deinit();
+        var tensors = std.StringHashMap(*tensor.Tensor).init(a);
+        defer tensors.deinit();
 
-    var cfg_gemma = try ModelConfig.init(allocator, &ctx, 256000);
-    defer cfg_gemma.deinit(allocator);
+        var ctx = gguf.GGUFContext{
+            .allocator = a,
+            .file = undefined,
+            .version = 3,
+            .tensor_count = 0,
+            .kv_count = 0,
+            .kvs = kvs,
+            .tensors = tensors,
+            .data_offset = 0,
+            .mmap_file = null,
+        };
+        try ctx.kvs.put(try a.dupe(u8, "general.architecture"), .{ .string = try a.dupe(u8, "gemma") });
+        try ctx.kvs.put(try a.dupe(u8, "gemma.embedding_length"), .{ .u32 = 2048 });
 
-    try t.expectEqual(Architecture.gemma, cfg_gemma.arch);
-    try t.expectEqual(Activation.gelu, cfg_gemma.activation);
-    try t.expectEqual(@sqrt(@as(f32, 2048.0)), cfg_gemma.embedding_scale);
+        var cfg_gemma = try ModelConfig.init(a, &ctx, 256000);
+        defer cfg_gemma.deinit(a);
+
+        try t.expectEqual(Architecture.gemma, cfg_gemma.arch);
+        try t.expectEqual(Activation.gelu, cfg_gemma.activation);
+        try t.expectEqual(@sqrt(@as(f32, 2048.0)), cfg_gemma.embedding_scale);
+    }
 }

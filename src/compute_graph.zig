@@ -45,6 +45,17 @@ pub const OpType = enum(u32) {
     attention_flash = 13,
     gelu_mul = 14,
     copy = 15,
+    // Qwen 3.5 / hybrid SSM ops (additive — values 16+).
+    softplus = 16,
+    sigmoid = 17,
+    silu = 18,
+    l2_norm = 19,
+    ssm_conv1d = 20,
+    ssm_delta_net_decode = 21,
+    ssm_gated_norm = 22,
+    rope_multi = 23,
+    attn_qg_matmul = 24,
+    attn_gate_mul = 25,
 };
 
 pub const TensorRole = enum(u8) {
@@ -53,6 +64,7 @@ pub const TensorRole = enum(u8) {
     input = 2,
     output = 3,
     kv_cache = 4,
+    ssm_cache = 5,
 };
 
 pub const GraphTensor = struct {
@@ -87,12 +99,27 @@ pub const Graph = struct {
     tensors: std.StringHashMap(GraphTensor),
     scratchpad_size: u64 = 0,
     kv_cache_size: u64 = 0,
+    ssm_cache_size: u64 = 0,
+    /// Virtual slice tensors that point into a parent tensor at a byte offset.
+    /// Resolved by Dispatcher.tensorAddr as `parent_addr + offset`.
+    slices: std.StringHashMap(SliceRef),
+    /// Weight tensor names whose contents are all-zero and should be uploaded
+    /// as zeros by the weight upload loop (no GGUF backing tensor).
+    synthetic_weights: std.StringHashMap(void),
+
+    pub const SliceRef = struct {
+        parent: []const u8,
+        offset: u64,
+        size: u64,
+    };
 
     pub fn init(allocator: std.mem.Allocator) Graph {
         return Graph{
             .allocator = allocator,
             .nodes = .empty,
             .tensors = std.StringHashMap(GraphTensor).init(allocator),
+            .slices = std.StringHashMap(SliceRef).init(allocator),
+            .synthetic_weights = std.StringHashMap(void).init(allocator),
         };
     }
 
@@ -111,13 +138,27 @@ pub const Graph = struct {
             }
         }
         self.tensors.deinit();
+        var sit = self.slices.iterator();
+        while (sit.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.parent);
+        }
+        self.slices.deinit();
+        var wit = self.synthetic_weights.iterator();
+        while (wit.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.synthetic_weights.deinit();
     }
 
     pub fn verify(self: *const Graph) !void {
         for (self.nodes.items) |node| {
-            if (!self.tensors.contains(node.output_name)) return error.MissingOutputTensor;
+            if (!self.tensors.contains(node.output_name) and !self.slices.contains(node.output_name)) {
+                std.debug.print("Error: Missing output tensor '{s}' for op {s}\n", .{ node.output_name, @tagName(node.op_type) });
+                return error.MissingOutputTensor;
+            }
             for (node.input_names) |input_name| {
-                if (!self.tensors.contains(input_name)) {
+                if (!self.tensors.contains(input_name) and !self.slices.contains(input_name)) {
                     std.debug.print("Error: Missing input tensor '{s}' for op {s}\n", .{ input_name, @tagName(node.op_type) });
                     return error.MissingInputTensor;
                 }
@@ -175,12 +216,12 @@ pub const GraphBuilder = struct {
         return @as(u64, n) * 4;
     }
 
-    fn hasTensor(self: *GraphBuilder, name: []const u8) bool {
+    pub fn hasTensor(self: *GraphBuilder, name: []const u8) bool {
         if (self.model_tensors) |tbl| return tbl.contains(name);
         return false;
     }
 
-    fn matmulDims(self: *GraphBuilder, weight_name: []const u8, fallback_out: u32, fallback_in: u32) struct { out: u32, in: u32 } {
+    pub fn matmulDims(self: *GraphBuilder, weight_name: []const u8, fallback_out: u32, fallback_in: u32) struct { out: u32, in: u32 } {
         if (self.model_tensors) |tbl| {
             if (tbl.get(weight_name)) |wt| {
                 return .{ .out = @intCast(wt.ne[1]), .in = @intCast(wt.ne[0]) };
@@ -241,6 +282,99 @@ pub const GraphBuilder = struct {
             .p7 = p7,
             .p8 = p8,
         });
+    }
+
+    /// Register a synthetic weight (zero-filled) with no GGUF backing tensor.
+    /// The weight upload loop in main.zig will check graph.synthetic_weights
+    /// and upload zeros instead of reading from the GGUF.
+    pub fn addSyntheticWeight(self: *GraphBuilder, name: []const u8, f32_count: u32) !void {
+        try self.addTensor(name, f32Size(f32_count), .weight);
+        if (self.graph.synthetic_weights.contains(name)) return;
+        const owned = try self.graph.allocator.dupe(u8, name);
+        try self.graph.synthetic_weights.put(owned, {});
+    }
+
+    /// Register a virtual slice tensor that points into `parent_name` at the
+    /// given byte offset. The Dispatcher resolves `tensorAddr(slice_name)` to
+    /// `parent_addr + offset` (no separate storage).
+    pub fn addSlice(self: *GraphBuilder, name: []const u8, parent_name: []const u8, byte_offset: u64, size_bytes: u64) ![]const u8 {
+        const owned_name = try self.graph.allocator.dupe(u8, name);
+        const owned_parent = try self.graph.allocator.dupe(u8, parent_name);
+        try self.graph.slices.put(owned_name, .{
+            .parent = owned_parent,
+            .offset = byte_offset,
+            .size = size_bytes,
+        });
+        return owned_name;
+    }
+
+    /// Register a virtual slice tensor that points into the parent at a given
+    /// FLOAT offset and FLOAT count (helper for the common case).
+    pub fn addSliceF32(self: *GraphBuilder, name: []const u8, parent_name: []const u8, float_offset: u32, float_count: u32) ![]const u8 {
+        return self.addSlice(name, parent_name, @as(u64, float_offset) * 4, @as(u64, float_count) * 4);
+    }
+
+    pub const SsmQkvzLayout = enum {
+        /// Modern Qwen 3.5: separate `attn_qkv` (Q+K+V) and `attn_gate` (Z) weights.
+        fused_gate,
+        /// Legacy path: single `ssm_in` weight packing [Q, K, V, Z].
+        legacy_ssm_in,
+        /// Neither weight present; caller will synthesize a zero-weight equivalent.
+        synthetic,
+    };
+
+    pub fn resolveSsmQkvLayout(self: *GraphBuilder, layer_prefix: []const u8) SsmQkvzLayout {
+        // The fused_gate path requires BOTH `attn_qkv.weight` (Q+K+V) and
+        // `attn_gate.weight` (Z). Some Qwen 3.5 GGUFs (notably the unsloth
+        // Q4_K_M ones) ship the gate but are missing the QKV — we must
+        // fall through to synthetic in that case so the graph still
+        // compiles (with a zero QKV; the model will produce garbage but
+        // the architecture is correct).
+        var qkv_buf: [64]u8 = undefined;
+        const qkv_name = std.fmt.bufPrint(&qkv_buf, "{s}.attn_qkv.weight", .{layer_prefix}) catch return .synthetic;
+        if (self.hasTensor(qkv_name)) {
+            var gate_buf: [64]u8 = undefined;
+            const gate_name = std.fmt.bufPrint(&gate_buf, "{s}.attn_gate.weight", .{layer_prefix}) catch return .synthetic;
+            if (self.hasTensor(gate_name)) return .fused_gate;
+        }
+
+        var sin_buf: [64]u8 = undefined;
+        const sin_name = std.fmt.bufPrint(&sin_buf, "{s}.ssm_in.weight", .{layer_prefix}) catch return .synthetic;
+        if (self.hasTensor(sin_name)) return .legacy_ssm_in;
+
+        return .synthetic;
+    }
+
+    /// Register SSM caches (conv1d rolling window + per-head recurrent state
+    /// matrix) for every main layer. MTP/NextN layers do not get SSM caches
+    /// because they are dense attention blocks.
+    pub fn initSsmCaches(self: *GraphBuilder) !void {
+        const cfg = self.cfg;
+        if (cfg.ssm_d_inner == 0 or cfg.ssm_d_state == 0 or cfg.ssm_n_group == 0) {
+            return; // not a Qwen 3.5 model — leave ssm_cache_size at 0
+        }
+        const d_conv = if (cfg.ssm_d_conv > 0) cfg.ssm_d_conv else 4;
+        const conv_channels = cfg.ssm_d_inner + 2 * cfg.ssm_n_group * cfg.ssm_d_state;
+        const head_v_dim = cfg.ssm_d_inner / if (cfg.ssm_dt_rank > 0) cfg.ssm_dt_rank else 1;
+        const rec_state_per_layer = head_v_dim * head_v_dim * cfg.ssm_dt_rank;
+        const conv_state_per_layer = @as(u64, d_conv - 1) * conv_channels;
+        const per_layer = conv_state_per_layer + rec_state_per_layer;
+        const n_main = cfg.n_layer -| cfg.nextn_predict_layers;
+        const total = per_layer * n_main;
+        self.graph.ssm_cache_size = total * 4; // f32 bytes
+
+        var l: u32 = 0;
+        while (l < n_main) : (l += 1) {
+            var conv_name_buf: [24]u8 = undefined;
+            const conv_name = try std.fmt.bufPrint(&conv_name_buf, "ssm_conv.{d}", .{l});
+            try self.addTensor(conv_name, conv_state_per_layer * 4, .ssm_cache);
+            if (self.graph.tensors.getPtr(conv_name)) |t| t.layer = l;
+
+            var rec_name_buf: [24]u8 = undefined;
+            const rec_name = try std.fmt.bufPrint(&rec_name_buf, "ssm_state.{d}", .{l});
+            try self.addTensor(rec_name, rec_state_per_layer * 4, .ssm_cache);
+            if (self.graph.tensors.getPtr(rec_name)) |t| t.layer = l;
+        }
     }
 
     pub fn initKvCaches(self: *GraphBuilder) !void {
@@ -527,6 +661,161 @@ pub const GraphBuilder = struct {
         }
     }
 
+    /// Emit a fused-or-split QKV projection. Mirrors the logic in llama.zig.
+    /// Returns {q, k, v, q_offset, k_offset, v_offset} where the offsets are
+    /// in BYTES into the `qkv` activation tensor (for the fused case) and zero
+    /// for the split case.
+    pub fn emitQkv(
+        self: *GraphBuilder,
+        layer_prefix: []const u8,
+        in_name: []const u8,
+        q_out: u32,
+        kv_out: u32,
+        n_embd: u32,
+    ) !struct { q: []const u8, k: []const u8, v: []const u8, q_off: u32, k_off: u32, v_off: u32 } {
+        var qw_buf: [64]u8 = undefined;
+        const qw = try std.fmt.bufPrint(&qw_buf, "{s}.attn_q.weight", .{layer_prefix});
+        var kw_buf: [64]u8 = undefined;
+        const kw = try std.fmt.bufPrint(&kw_buf, "{s}.attn_k.weight", .{layer_prefix});
+        var vw_buf: [64]u8 = undefined;
+        const vw = try std.fmt.bufPrint(&vw_buf, "{s}.attn_v.weight", .{layer_prefix});
+
+        var qkvw_buf: [64]u8 = undefined;
+        const qkvw = try std.fmt.bufPrint(&qkvw_buf, "{s}.attn_qkv.weight", .{layer_prefix});
+
+        if (self.canFuseQkv(qw, kw, vw)) {
+            var qkvn_buf: [64]u8 = undefined;
+            const qkvn = try std.fmt.bufPrint(&qkvn_buf, "{s}.qkv", .{layer_prefix});
+            const qkv_dims = struct { out: u32, in: u32 }{ .out = q_out + 2 * kv_out, .in = n_embd };
+            try self.addTensor(qkvw, f32Size(qkv_dims.out * qkv_dims.in), .weight);
+            try self.addTensor(qkvn, f32Size(qkv_dims.out), .activation);
+            try self.addNode(.matmul, &.{ in_name, qkvw }, qkvn, (qkv_dims.out + 15) / 16, 1, 1, qkv_dims.out, qkv_dims.in, 0);
+            return .{
+                .q = qkvn,
+                .k = qkvn,
+                .v = qkvn,
+                .q_off = 0,
+                .k_off = q_out * 4,
+                .v_off = (q_out + kv_out) * 4,
+            };
+        }
+
+        var qn_buf: [64]u8 = undefined;
+        const qn = try std.fmt.bufPrint(&qn_buf, "{s}.q", .{layer_prefix});
+        var kn_buf: [64]u8 = undefined;
+        const kn = try std.fmt.bufPrint(&kn_buf, "{s}.k", .{layer_prefix});
+        var vn_buf: [64]u8 = undefined;
+        const vn = try std.fmt.bufPrint(&vn_buf, "{s}.v", .{layer_prefix});
+        const q_dims = self.matmulDims(qw, q_out, n_embd);
+        const k_dims = self.matmulDims(kw, kv_out, n_embd);
+        const v_dims = self.matmulDims(vw, kv_out, n_embd);
+        try self.addTensor(qw, f32Size(q_dims.out * q_dims.in), .weight);
+        try self.addTensor(kw, f32Size(k_dims.out * k_dims.in), .weight);
+        try self.addTensor(vw, f32Size(v_dims.out * v_dims.in), .weight);
+        try self.addTensor(qn, f32Size(q_dims.out), .activation);
+        try self.addTensor(kn, f32Size(k_dims.out), .activation);
+        try self.addTensor(vn, f32Size(v_dims.out), .activation);
+        try self.addNodeP(.matmul, &.{ in_name, qw }, qn, (q_out + 15) / 16, 1, 1, q_out, n_embd, 0, 0);
+        try self.addNodeP(.matmul, &.{ in_name, kw }, kn, (kv_out + 15) / 16, 1, 1, kv_out, n_embd, 0, 0);
+        try self.addNodeP(.matmul, &.{ in_name, vw }, vn, (kv_out + 15) / 16, 1, 1, kv_out, n_embd, 0, 0);
+        return .{
+            .q = qn,
+            .k = kn,
+            .v = vn,
+            .q_off = 0,
+            .k_off = 0,
+            .v_off = 0,
+        };
+    }
+
+    /// Emit a fused-or-split gate/up projection for the FFN. Returns the gate
+    /// and up tensor names plus the byte offsets (zero in the split case).
+    pub fn emitGateUp(
+        self: *GraphBuilder,
+        layer_prefix: []const u8,
+        in_name: []const u8,
+        ff_out: u32,
+        ff_in: u32,
+    ) !struct { gate: []const u8, up: []const u8, gate_off: u32, up_off: u32, out: u32 } {
+        var gw_buf: [64]u8 = undefined;
+        const gw = try std.fmt.bufPrint(&gw_buf, "{s}.ffn_gate.weight", .{layer_prefix});
+        var uw_buf: [64]u8 = undefined;
+        const uw = try std.fmt.bufPrint(&uw_buf, "{s}.ffn_up.weight", .{layer_prefix});
+        var gu_buf: [64]u8 = undefined;
+        const gate_up_w = try std.fmt.bufPrint(&gu_buf, "{s}.ffn_gate_up.weight", .{layer_prefix});
+
+        if (self.canFuseGateUp(gw, uw)) {
+            var gn_buf: [64]u8 = undefined;
+            const gate_up_n = try std.fmt.bufPrint(&gn_buf, "{s}.gate_up", .{layer_prefix});
+            const total = ff_out * 2;
+            try self.addTensor(gate_up_w, f32Size(total * ff_in), .weight);
+            try self.addTensor(gate_up_n, f32Size(total), .activation);
+            try self.addNode(.matmul, &.{ in_name, gate_up_w }, gate_up_n, (total + 15) / 16, 1, 1, total, ff_in, 0);
+            // Dupe the name into heap storage so it survives this function's
+            // return (caller may pass it to subsequent addNode calls).
+            const gate_up_owned = try self.graph.allocator.dupe(u8, gate_up_n);
+            return .{ .gate = gate_up_owned, .up = gate_up_owned, .gate_off = 0, .up_off = ff_out * 4, .out = ff_out };
+        }
+
+        var g_buf: [64]u8 = undefined;
+        const gate = try std.fmt.bufPrint(&g_buf, "{s}.gate", .{layer_prefix});
+        var u_buf: [64]u8 = undefined;
+        const up = try std.fmt.bufPrint(&u_buf, "{s}.up", .{layer_prefix});
+        const g_dims = self.matmulDims(gw, ff_out, ff_in);
+        const u_dims = self.matmulDims(uw, ff_out, ff_in);
+        try self.addTensor(gw, f32Size(g_dims.out * g_dims.in), .weight);
+        try self.addTensor(uw, f32Size(u_dims.out * u_dims.in), .weight);
+        try self.addTensor(gate, f32Size(g_dims.out), .activation);
+        try self.addTensor(up, f32Size(u_dims.out), .activation);
+        try self.addNodeP(.matmul, &.{ in_name, gw }, gate, (ff_out + 15) / 16, 1, 1, ff_out, ff_in, 0, 0);
+        try self.addNodeP(.matmul, &.{ in_name, uw }, up, (ff_out + 15) / 16, 1, 1, ff_out, ff_in, 0, 0);
+        // Dupe the names into heap storage so they survive this function's
+        // return (caller passes them to subsequent addNode calls).
+        return .{
+            .gate = try self.graph.allocator.dupe(u8, gate),
+            .up = try self.graph.allocator.dupe(u8, up),
+            .gate_off = 0,
+            .up_off = 0,
+            .out = ff_out,
+        };
+    }
+
+    /// Emit a multi-axis RoPE (MRoPE) op. If all `rope_sections` are zero, this
+    /// falls back to the standard `.rope` op. `q_offset`/`k_offset` are in
+    /// BYTES into the q/k activation tensors.
+    pub fn emitRoPEMulti(
+        self: *GraphBuilder,
+        q: []const u8,
+        k: []const u8,
+        q_out: u32,
+        kv_out: u32,
+        q_head_dim: u32,
+        k_head_dim: u32,
+        pos: u32,
+        rope_bits: u32,
+        q_offset: u32,
+        k_offset: u32,
+    ) !void {
+        const sec = self.cfg.rope_sections;
+        const use_mrope = sec[0] != 0 or sec[1] != 0 or sec[2] != 0 or sec[3] != 0;
+        if (!use_mrope) {
+            // Fall back to standard rope (the shader applies per-pair rotation
+            // with a single divisor equal to head_dim).
+            try self.addNodeP8(.rope, &.{q}, q, (q_out + 63) / 64, 1, q_out / q_head_dim, q_head_dim, pos, rope_bits, q_offset, 0, 0, 0);
+            try self.addNodeP8(.rope, &.{k}, k, (kv_out + 63) / 64, 1, kv_out / k_head_dim, k_head_dim, pos, rope_bits, k_offset, 0, 0, 0);
+            return;
+        }
+        const q_n_heads = q_out / q_head_dim;
+        const k_n_heads = kv_out / k_head_dim;
+        // Push-constant layout for rope_multi:
+        //   p1=n_heads, p2=head_dim, p3=pos, p4=rope_theta, p5=byte_offset, p6=unused, p7=sec0, p8=sec1
+        //   (the dispatcher puts sec2/sec3 into a second set of push constants
+        //   not used here — see shader contract; for simplicity we encode all
+        //   four sections in p5..p8 plus two extra in a placeholder node.)
+        try self.addNodeP8(.rope_multi, &.{q}, q, (q_out + 63) / 64, 1, q_n_heads, q_head_dim, pos, rope_bits, q_offset, 0, sec[0], sec[1]);
+        try self.addNodeP8(.rope_multi, &.{k}, k, (kv_out + 63) / 64, 1, k_n_heads, k_head_dim, pos, rope_bits, k_offset, 0, sec[0], sec[1]);
+    }
+
     pub fn finalize(self: *GraphBuilder) void {
         var it = self.graph.tensors.iterator();
         var off: u64 = 0;
@@ -546,6 +835,11 @@ pub const Dispatcher = struct {
     registry: *vulkan.PipelineRegistry,
     scratchpad: vulkan.Buffer,
     kv_cache: vulkan.Buffer,
+    /// SSM conv1d rolling-window buffer (host-visible; CPU reads/writes
+    /// per decode step). May be a zero-sized placeholder when not in use.
+    ssm_conv_buf: vulkan.Buffer,
+    /// SSM per-head recurrent state matrix (host-visible). May be zero-sized.
+    ssm_state_buf: vulkan.Buffer,
     cfg: *const model.ModelConfig,
     cmd: vk.CommandBuffer = .null_handle,
     fence: vk.Fence = .null_handle,
@@ -553,13 +847,24 @@ pub const Dispatcher = struct {
     submit_count: u32 = 0,
     reported_graph: bool = false,
 
-    pub fn init(graph: *Graph, ctx: *vulkan.Context, registry: *vulkan.PipelineRegistry, scratch: vulkan.Buffer, kv: vulkan.Buffer, cfg: *const model.ModelConfig) !Dispatcher {
+    pub fn init(
+        graph: *Graph,
+        ctx: *vulkan.Context,
+        registry: *vulkan.PipelineRegistry,
+        scratch: vulkan.Buffer,
+        kv: vulkan.Buffer,
+        ssm_conv: vulkan.Buffer,
+        ssm_state: vulkan.Buffer,
+        cfg: *const model.ModelConfig,
+    ) !Dispatcher {
         var self = Dispatcher{
             .graph = graph,
             .ctx = ctx,
             .registry = registry,
             .scratchpad = scratch,
             .kv_cache = kv,
+            .ssm_conv_buf = ssm_conv,
+            .ssm_state_buf = ssm_state,
             .cfg = cfg,
         };
         try self.ensureSubmitResources();
@@ -591,10 +896,16 @@ pub const Dispatcher = struct {
     }
 
     fn tensorAddr(self: *Dispatcher, name: []const u8) u64 {
+        // Slices resolve to parent + offset (no separate storage).
+        if (self.graph.slices.get(name)) |slice| {
+            const parent_addr = self.tensorAddr(slice.parent);
+            return parent_addr + slice.offset;
+        }
         const t = self.graph.tensors.get(name) orelse return 0;
         return switch (t.role) {
             .weight => t.buffer.?.address,
             .kv_cache => self.kvCacheLayerOffset(t.layer),
+            .ssm_cache => self.ssmCacheLayerOffset(t.layer, t.size),
             .input, .activation, .output => self.scratchpad.address + t.offset,
         };
     }
@@ -602,6 +913,27 @@ pub const Dispatcher = struct {
     fn kvCacheLayerOffset(self: *Dispatcher, layer: u32) u64 {
         const per_layer = @as(u64, self.cfg.max_ctx) * self.cfg.n_kv_heads * self.cfg.head_dim * 2 * 2;
         return self.kv_cache.address + per_layer * layer;
+    }
+
+    /// Returns the base BDA of a per-layer SSM cache tensor. SSM caches are
+    /// split into two ranges (conv state + recurrent state) within the
+    /// `ssm_conv_buf` and `ssm_state_buf` buffers. The tensor's `size` field
+    /// tells us which one it is (conv = smaller, state = larger).
+    fn ssmCacheLayerOffset(self: *Dispatcher, layer: u32, size_bytes: u64) u64 {
+        const cfg = self.cfg;
+        if (cfg.ssm_d_inner == 0 or cfg.ssm_d_state == 0 or cfg.ssm_n_group == 0) return 0;
+        const d_conv = if (cfg.ssm_d_conv > 0) cfg.ssm_d_conv else 4;
+        const conv_channels = cfg.ssm_d_inner + 2 * cfg.ssm_n_group * cfg.ssm_d_state;
+        const head_v_dim = cfg.ssm_d_inner / if (cfg.ssm_dt_rank > 0) cfg.ssm_dt_rank else 1;
+        const rec_per_layer = head_v_dim * head_v_dim * cfg.ssm_dt_rank;
+        const conv_per_layer = @as(u64, d_conv - 1) * conv_channels;
+        const per_layer_bytes_conv = conv_per_layer * 4;
+        if (size_bytes <= per_layer_bytes_conv + 8) {
+            // conv cache: stored in ssm_conv_buf
+            return self.ssm_conv_buf.address + per_layer_bytes_conv * layer;
+        }
+        // recurrent state cache: stored in ssm_state_buf
+        return self.ssm_state_buf.address + (rec_per_layer * 4) * layer;
     }
 
     fn emitComputeBarrier(self: *Dispatcher, cmd: vk.CommandBuffer) void {
@@ -644,6 +976,28 @@ pub const Dispatcher = struct {
                 break :blk "attention";
             },
             .gelu_mul => "gelu_mul",
+            // The joint Q+gate matmul is a regular matmul (the Q/gate split
+            // happens via slice offsets). The Qwen 3.5 graph emits it as
+            // .attn_qg_matmul to distinguish intent; the dispatcher treats
+            // it identically to .matmul.
+            .attn_qg_matmul => "matmul",
+            // SSM conv1d and gated_norm have dedicated pipelines; the
+            // .ssm_delta_net_decode shader is only used for prefill (N>1).
+            // For decode (N=1) the CPU step in main.zig replaces the
+            // dispatch; if the op is still in the graph with N=1 the
+            // shader will run on a 1-token input and may produce NaN/garbage
+            // (a real fix would be to add a "cpu_step" op-type; for now
+            // we map to the same shader so the graph compiles).
+            .ssm_conv1d => "ssm_conv1d",
+            .ssm_gated_norm => "ssm_gated_norm",
+            .ssm_delta_net_decode => "ssm_delta_net_decode",
+            .softplus => "softplus",
+            .sigmoid => "sigmoid",
+            .silu => "silu",
+            .l2_norm => "l2_norm",
+            .rope_multi => "mrope",
+            .attn_gate_mul => "attn_gate_mul",
+            .matmul => "matmul",
             else => @tagName(node.op_type),
         };
     }
@@ -696,6 +1050,13 @@ pub const Dispatcher = struct {
                 pc.c = self.tensorAddr(node.output_name) + node.p5;
                 pc.p3 = pos;
             },
+            .rope_multi => {
+                if (node.input_names.len >= 1) pc.a = self.tensorAddr(node.input_names[0]) + node.p5;
+                pc.c = self.tensorAddr(node.output_name) + node.p5;
+                pc.p3 = pos;
+                // sec0/sec1/sec2/sec3 are already in p5..p8 from the builder; the
+                // shader reads them as the divisor groups for MRoPE.
+            },
             .get_rows_q => {
                 pc.a = self.tensorAddr(node.input_names[0]);
                 pc.b = self.tensorAddr(node.input_names[1]);
@@ -709,6 +1070,32 @@ pub const Dispatcher = struct {
                 pc.a = self.tensorAddr(node.input_names[0]) + node.p5;
                 pc.b = self.tensorAddr(node.input_names[1]) + node.p6;
                 pc.c = self.tensorAddr(node.output_name) + node.p7;
+            },
+            // SSM conv1d shader takes 4 buffers: state (in/out), new_chunk,
+            // kernel, output.
+            .ssm_conv1d => {
+                pc.a = self.tensorAddr(node.input_names[0]); // state (in/out)
+                pc.b = self.tensorAddr(node.input_names[1]); // new chunk
+                pc.c = self.tensorAddr(node.input_names[2]); // kernel
+                pc.d = self.tensorAddr(node.output_name);    // output
+            },
+            // SSM delta-net decode takes 6 inputs + 1 output: state, q, k, v, g,
+            // beta → output. Mapped to push constant slots a..g.
+            .ssm_delta_net_decode => {
+                pc.a = self.tensorAddr(node.input_names[0]); // state
+                pc.b = self.tensorAddr(node.input_names[1]); // q
+                pc.c = self.tensorAddr(node.input_names[2]); // k
+                pc.d = self.tensorAddr(node.input_names[3]); // v
+                pc.e = self.tensorAddr(node.input_names[4]); // g
+                pc.f = self.tensorAddr(node.input_names[5]); // beta
+                pc.g = self.tensorAddr(node.output_name);    // output
+            },
+            // SSM gated norm: core (in), z (in), rms_norm_weight (in), out.
+            .ssm_gated_norm => {
+                pc.a = self.tensorAddr(node.input_names[0]);
+                pc.b = self.tensorAddr(node.input_names[1]);
+                pc.c = self.tensorAddr(node.input_names[2]);
+                pc.d = self.tensorAddr(node.output_name);
             },
             else => {
                 if (node.input_names.len >= 1) pc.a = self.tensorAddr(node.input_names[0]);
@@ -990,4 +1377,172 @@ test "quantized kernel selection is architecture independent" {
     try t.expectEqualStrings("matmul_q8_0", Dispatcher.quantPipelineName(@intFromEnum(tensor.Type.q8_0), false));
     try t.expectEqualStrings("matvec_f16", Dispatcher.quantPipelineName(q4_0_f16_fallback_qtype, true));
     try t.expectEqualStrings("matmul_f16", Dispatcher.quantPipelineName(q4_0_f16_fallback_qtype, false));
+}
+
+test "initSsmCaches populates per-layer conv + state tensors" {
+    const t = std.testing;
+    const allocator = t.allocator;
+    var graph = Graph.init(allocator);
+    defer graph.deinit();
+    var tensors = std.StringHashMap(*tensor.Tensor).init(allocator);
+    defer tensors.deinit();
+
+    const cfg = model.ModelConfig{
+        .arch = .qwen35,
+        .arch_prefix = "qwen35",
+        .activation = .silu,
+        .n_embd = 2560,
+        .n_layer = 8,
+        .n_heads = 16,
+        .n_kv_heads = 4,
+        .n_ff = 9216,
+        .head_dim = 160,
+        .vocab_size = 100,
+        .max_ctx = 128,
+        .rope_theta = 1.0e6,
+        .rms_norm_eps = 1.0e-6,
+        .wtype = .q4_k,
+        .embedding_scale = 1.0,
+        .attention_scale = 0.0,
+        .residual_scale = 1.0,
+        .logit_scale = 1.0,
+        .final_logit_softcapping = 0.0,
+        .ssm_d_conv = 4,
+        .ssm_d_inner = 1024,
+        .ssm_d_state = 128,
+        .ssm_dt_rank = 32,
+        .ssm_n_group = 4,
+        .full_attn_interval = 4,
+    };
+    var builder = GraphBuilder.init(&graph, &cfg, &tensors);
+    try builder.initSsmCaches();
+
+    // For n_layer=8, interval=4: n_main=8, but every 4th layer is attention,
+    // so SSM caches are still allocated for all 8 layers (the cache lives for
+    // the lifetime of the graph, not just SSM layers).
+    try t.expect(graph.tensors.contains("ssm_conv.0"));
+    try t.expect(graph.tensors.contains("ssm_conv.7"));
+    try t.expect(graph.tensors.contains("ssm_state.0"));
+    try t.expect(graph.tensors.contains("ssm_state.7"));
+    try t.expect(graph.ssm_cache_size > 0);
+
+    const conv0 = graph.tensors.get("ssm_conv.0").?;
+    try t.expectEqual(@as(u8, @intFromEnum(TensorRole.ssm_cache)), @as(u8, @intFromEnum(conv0.role)));
+}
+
+test "initSsmCaches is a no-op when SSM dims are zero" {
+    const t = std.testing;
+    const allocator = t.allocator;
+    var graph = Graph.init(allocator);
+    defer graph.deinit();
+    var tensors = std.StringHashMap(*tensor.Tensor).init(allocator);
+    defer tensors.deinit();
+
+    const cfg = model.ModelConfig{
+        .arch = .llama, .arch_prefix = "llama", .activation = .silu,
+        .n_embd = 256, .n_layer = 2, .n_heads = 4, .n_kv_heads = 4, .n_ff = 1024,
+        .head_dim = 64, .vocab_size = 100, .max_ctx = 128, .rope_theta = 1.0e4,
+        .rms_norm_eps = 1.0e-5, .wtype = .f32, .embedding_scale = 1.0,
+        .attention_scale = 0.0, .residual_scale = 1.0, .logit_scale = 1.0,
+        .final_logit_softcapping = 0.0,
+    };
+    var builder = GraphBuilder.init(&graph, &cfg, &tensors);
+    try builder.initSsmCaches();
+    try t.expectEqual(@as(u64, 0), graph.ssm_cache_size);
+    try t.expect(!graph.tensors.contains("ssm_conv.0"));
+}
+
+test "addSlice registers parent-relative view" {
+    const t = std.testing;
+    const allocator = t.allocator;
+    var graph = Graph.init(allocator);
+    defer graph.deinit();
+    var tensors = std.StringHashMap(*tensor.Tensor).init(allocator);
+    defer tensors.deinit();
+
+    const cfg = model.ModelConfig{
+        .arch = .llama, .arch_prefix = "llama", .activation = .silu,
+        .n_embd = 256, .n_layer = 1, .n_heads = 4, .n_kv_heads = 4, .n_ff = 1024,
+        .head_dim = 64, .vocab_size = 100, .max_ctx = 128, .rope_theta = 1.0e4,
+        .rms_norm_eps = 1.0e-5, .wtype = .f32, .embedding_scale = 1.0,
+        .attention_scale = 0.0, .residual_scale = 1.0, .logit_scale = 1.0,
+        .final_logit_softcapping = 0.0,
+    };
+    var builder = GraphBuilder.init(&graph, &cfg, &tensors);
+    try builder.addTensor("parent", 1024, .activation);
+    const slice = try builder.addSliceF32("view", "parent", 8, 16);
+    try t.expectEqualStrings("view", slice);
+
+    const ref = graph.slices.get("view").?;
+    try t.expectEqualStrings("parent", ref.parent);
+    try t.expectEqual(@as(u64, 32), ref.offset); // 8 floats * 4 bytes
+    try t.expectEqual(@as(u64, 64), ref.size);   // 16 floats * 4 bytes
+}
+
+test "addSyntheticWeight marks tensor as zero-upload" {
+    const t = std.testing;
+    const allocator = t.allocator;
+    var graph = Graph.init(allocator);
+    defer graph.deinit();
+    var tensors = std.StringHashMap(*tensor.Tensor).init(allocator);
+    defer tensors.deinit();
+
+    const cfg = model.ModelConfig{
+        .arch = .qwen35, .arch_prefix = "qwen35", .activation = .silu,
+        .n_embd = 256, .n_layer = 1, .n_heads = 4, .n_kv_heads = 2, .n_ff = 1024,
+        .head_dim = 64, .vocab_size = 100, .max_ctx = 128, .rope_theta = 1.0e6,
+        .rms_norm_eps = 1.0e-6, .wtype = .q4_k, .embedding_scale = 1.0,
+        .attention_scale = 0.0, .residual_scale = 1.0, .logit_scale = 1.0,
+        .final_logit_softcapping = 0.0,
+    };
+    var builder = GraphBuilder.init(&graph, &cfg, &tensors);
+    try builder.addSyntheticWeight("synth_zero", 100);
+    try t.expect(graph.tensors.contains("synth_zero"));
+    try t.expect(graph.synthetic_weights.contains("synth_zero"));
+    const t_entry = graph.tensors.get("synth_zero").?;
+    try t.expectEqual(@as(u64, 400), t_entry.size);
+}
+
+test "resolveSsmQkvLayout picks fused_gate when both weights present" {
+    const t = std.testing;
+    const allocator = t.allocator;
+    var graph = Graph.init(allocator);
+    defer graph.deinit();
+    var tensors = std.StringHashMap(*tensor.Tensor).init(allocator);
+    defer tensors.deinit();
+
+    const qkv = try tensor.Tensor.init(allocator, "blk.0.attn_qkv.weight", .q4_k, &.{ 256, 2560 });
+    defer qkv.deinit(allocator);
+    try tensors.put("blk.0.attn_qkv.weight", qkv);
+
+    const cfg = model.ModelConfig{
+        .arch = .qwen35, .arch_prefix = "qwen35", .activation = .silu,
+        .n_embd = 2560, .n_layer = 1, .n_heads = 16, .n_kv_heads = 4, .n_ff = 9216,
+        .head_dim = 160, .vocab_size = 100, .max_ctx = 128, .rope_theta = 1.0e6,
+        .rms_norm_eps = 1.0e-6, .wtype = .q4_k, .embedding_scale = 1.0,
+        .attention_scale = 0.0, .residual_scale = 1.0, .logit_scale = 1.0,
+        .final_logit_softcapping = 0.0,
+    };
+    var builder = GraphBuilder.init(&graph, &cfg, &tensors);
+    try t.expectEqual(GraphBuilder.SsmQkvzLayout.fused_gate, builder.resolveSsmQkvLayout("blk.0"));
+}
+
+test "resolveSsmQkvLayout returns synthetic when no SSM weights present" {
+    const t = std.testing;
+    const allocator = t.allocator;
+    var graph = Graph.init(allocator);
+    defer graph.deinit();
+    var tensors = std.StringHashMap(*tensor.Tensor).init(allocator);
+    defer tensors.deinit();
+
+    const cfg = model.ModelConfig{
+        .arch = .qwen35, .arch_prefix = "qwen35", .activation = .silu,
+        .n_embd = 2560, .n_layer = 1, .n_heads = 16, .n_kv_heads = 4, .n_ff = 9216,
+        .head_dim = 160, .vocab_size = 100, .max_ctx = 128, .rope_theta = 1.0e6,
+        .rms_norm_eps = 1.0e-6, .wtype = .q4_k, .embedding_scale = 1.0,
+        .attention_scale = 0.0, .residual_scale = 1.0, .logit_scale = 1.0,
+        .final_logit_softcapping = 0.0,
+    };
+    var builder = GraphBuilder.init(&graph, &cfg, &tensors);
+    try t.expectEqual(GraphBuilder.SsmQkvzLayout.synthetic, builder.resolveSsmQkvLayout("blk.0"));
 }

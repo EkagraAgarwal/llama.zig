@@ -43,7 +43,6 @@
     },
     .paths = .{
         "build.zig",
-        "build.zig.zon",
         "kernels_data.zig",
         "src",
         "add_bda.spv",
@@ -57,5 +56,14 @@
         "attention_bda.spv",
         "kv_write_bda.spv",
         "scaled_add_bda.spv",
+        "softplus_bda.spv",
+        "sigmoid_bda.spv",
+        "silu_bda.spv",
+        "l2_norm_bda.spv",
+        "mrope_bda.spv",
+        "attn_gate_mul_bda.spv",
+        "ssm_conv1d_bda.spv",
+        "ssm_delta_net_decode_bda.spv",
+        "ssm_gated_norm_bda.spv",
     },
 }

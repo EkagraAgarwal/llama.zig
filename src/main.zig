@@ -229,6 +229,15 @@ pub fn main(init: std.process.Init) !void {
     try registry.register(&vk_ctx, "attention_flash", kernels_data.kernels_flash_attn_spv, "main");
     try registry.register(&vk_ctx, "gelu_mul", kernels_data.kernels_gelu_mul_spv, "main");
     try registry.register(&vk_ctx, "copy", kernels_data.kernels_copy_spv, "main");
+    try registry.register(&vk_ctx, "softplus", kernels_data.kernels_softplus_spv, "main");
+    try registry.register(&vk_ctx, "sigmoid", kernels_data.kernels_sigmoid_spv, "main");
+    try registry.register(&vk_ctx, "silu", kernels_data.kernels_silu_spv, "main");
+    try registry.register(&vk_ctx, "l2_norm", kernels_data.kernels_l2_norm_spv, "main");
+    try registry.register(&vk_ctx, "mrope", kernels_data.kernels_mrope_spv, "main");
+    try registry.register(&vk_ctx, "attn_gate_mul", kernels_data.kernels_attn_gate_mul_spv, "main");
+    try registry.register(&vk_ctx, "ssm_conv1d", kernels_data.kernels_ssm_conv1d_spv, "main");
+    try registry.register(&vk_ctx, "ssm_delta_net_decode", kernels_data.kernels_ssm_delta_net_decode_spv, "main");
+    try registry.register(&vk_ctx, "ssm_gated_norm", kernels_data.kernels_ssm_gated_norm_spv, "main");
 
     var graph = compute_graph.Graph.init(allocator);
     defer graph.deinit();
@@ -236,6 +245,7 @@ pub fn main(init: std.process.Init) !void {
 
     try builder.addTensor("input", model.f32Bytes(cfg.n_embd), .input);
     try builder.initKvCaches();
+    try builder.initSsmCaches();
 
     var prev_out: []const u8 = "input";
     var l: u32 = 0;
@@ -245,7 +255,17 @@ pub fn main(init: std.process.Init) !void {
         else
             try std.fmt.allocPrint(allocator, "blk.{d}.out", .{l});
         defer allocator.free(out_owned);
-        try builder.buildTransformerBlock(l, 0, prev_out, out_owned);
+        // Dispatch to the architecture-specific block builder. The
+        // Qwen 3.5 hybrid path alternates between full-attention and SSM
+        // (Gated Delta Net) blocks internally; the llama path is a
+        // straight transformer block.
+        switch (cfg.arch) {
+            .qwen35 => {
+                const qwen35_mod = @import("models/qwen35.zig");
+                try qwen35_mod.buildBlockEntry(&builder, &cfg, l, prev_out, out_owned);
+            },
+            else => try builder.buildTransformerBlock(l, 0, prev_out, out_owned),
+        }
         // Use the graph's owned copy of the name so it outlives this iteration.
         prev_out = graph.tensors.getPtr(out_owned).?.name;
     }
@@ -260,10 +280,12 @@ pub fn main(init: std.process.Init) !void {
     try graph.verify();
     const graph_cost = compute_graph.estimateGraphCost(&graph);
 
-    // Convert eligible matmul nodes to quantized matmul path.
-    var uses_q4_0_f16_fallback = false;
+    // Convert eligible matmul nodes to quantized matmul path. The Qwen 3.5
+    // graph also emits `.attn_qg_matmul` (joint Q+gate matmul); treat it
+    // identically to `.matmul` for the quantization decision.
     for (graph.nodes.items) |*node| {
-        if (node.op_type != .matmul or node.input_names.len < 2) continue;
+        if ((node.op_type != .matmul and node.op_type != .attn_qg_matmul) or
+            node.input_names.len < 2) continue;
         const w_name = node.input_names[1];
         const w_type: ?@import("tensor.zig").Type = blk: {
             if (ctx.tensors.get(w_name)) |t| {
@@ -283,11 +305,7 @@ pub fn main(init: std.process.Init) !void {
             break :blk null;
         };
         const qt = w_type orelse continue;
-        if (qt == .q4_0) {
-            node.op_type = .matmul_q;
-            node.p5 = compute_graph.q4_0_f16_fallback_qtype;
-            uses_q4_0_f16_fallback = true;
-        } else if (isNativeQuantType(qt)) {
+        if (isNativeQuantType(qt)) {
             node.op_type = .matmul_q;
             node.p5 = @intFromEnum(qt);
         }
@@ -305,7 +323,7 @@ pub fn main(init: std.process.Init) !void {
     while (t_it.next()) |entry| {
         if (entry.value_ptr.role == .weight) {
             if (ctx.tensors.get(entry.key_ptr.*)) |gt| {
-                max_staging = @max(max_staging, if (isNativeQuantType(gt.type)) gt.size() else model.weightF32Size(gt));
+                max_staging = @max(max_staging, gpuUploadSize(gt));
             } else {
                 max_staging = @max(max_staging, entry.value_ptr.size);
             }
@@ -331,21 +349,12 @@ pub fn main(init: std.process.Init) !void {
 
         const upload_size = blk: {
             if (gt) |t| {
-                break :blk if (isNativeQuantType(t.type))
-                    t.size()
-                else if (t.type == .q4_0 or t.type == .q4_k)
-                    model.weightF32Size(t)
-                else
-                    model.weightF32Size(t);
+                break :blk gpuUploadSize(t);
             } else if (components) |comps| {
                 var size: u64 = 0;
-                const first_t = ctx.tensors.get(comps[0]) orelse {
-                    break :blk entry.value_ptr.size;
-                };
-                const is_native = isNativeQuantType(first_t.type);
                 for (comps) |c| {
                     const t = ctx.tensors.get(c) orelse continue;
-                    size += if (is_native) t.size() else model.weightF32Size(t);
+                    size += gpuUploadSize(t);
                 }
                 break :blk size;
             } else {
@@ -390,22 +399,11 @@ pub fn main(init: std.process.Init) !void {
                     }
                     return err;
                 };
-                if (t.type == .q4_0) {
-                    const f16_size = n * 2;
-                    const f16_data = try allocator.alloc(u16, n);
-                    defer allocator.free(f16_data);
-                    for (f32_data, 0..) |v, i| f16_data[i] = @bitCast(@as(f16, @floatCast(v)));
-                    const mapped = try vk_ctx.vkd.mapMemory(vk_ctx.device, weight_staging.memory, 0, f16_size, .{});
-                    @memcpy(@as([*]u8, @ptrCast(mapped))[0..f16_size], std.mem.sliceAsBytes(f16_data));
-                    vk_ctx.vkd.unmapMemory(vk_ctx.device, weight_staging.memory);
-                    try vk_ctx.copyBuffer(weight_staging, buf, f16_size);
-                } else {
-                    const f32_size = model.weightF32Size(t);
-                    const mapped = try vk_ctx.vkd.mapMemory(vk_ctx.device, weight_staging.memory, 0, f32_size, .{});
-                    @memcpy(@as([*]u8, @ptrCast(mapped))[0..f32_size], std.mem.sliceAsBytes(f32_data));
-                    vk_ctx.vkd.unmapMemory(vk_ctx.device, weight_staging.memory);
-                    try vk_ctx.copyBuffer(weight_staging, buf, f32_size);
-                }
+                const f32_size = model.weightF32Size(t);
+                const mapped = try vk_ctx.vkd.mapMemory(vk_ctx.device, weight_staging.memory, 0, f32_size, .{});
+                @memcpy(@as([*]u8, @ptrCast(mapped))[0..f32_size], std.mem.sliceAsBytes(f32_data));
+                vk_ctx.vkd.unmapMemory(vk_ctx.device, weight_staging.memory);
+                try vk_ctx.copyBuffer(weight_staging, buf, f32_size);
             }
         } else if (components) |comps| {
             const first_t = ctx.tensors.get(comps[0]).?;
@@ -456,12 +454,7 @@ pub fn main(init: std.process.Init) !void {
     if (!has_output) {
         if (graph.tensors.getPtr("token_embd.weight")) |gt_entry| {
             if (ctx.tensors.get("token_embd.weight")) |t| {
-                const upload_size = if (isNativeQuantType(t.type))
-                    t.size()
-                else if (t.type == .q4_0 or t.type == .q4_k)
-                    (t.ne[0] * t.ne[1] * t.ne[2] * t.ne[3]) * 2
-                else
-                    model.weightF32Size(t);
+                const upload_size = gpuUploadSize(t);
                 if (gt_entry.buffer == null) {
                     const buf = try vulkan.Buffer.init(&vk_ctx, upload_size, .{ .storage_buffer_bit = true, .shader_device_address_bit = true, .transfer_dst_bit = true }, .{ .device_local_bit = true });
                     gt_entry.buffer = try allocator.create(vulkan.Buffer);
@@ -484,19 +477,6 @@ pub fn main(init: std.process.Init) !void {
                     @memcpy(@as([*]u8, @ptrCast(mapped))[0..raw_size], raw);
                     vk_ctx.vkd.unmapMemory(vk_ctx.device, weight_staging.memory);
                     try vk_ctx.copyBuffer(weight_staging, gt_entry.buffer.?.*, raw_size);
-                } else if (t.type == .q4_0 or t.type == .q4_k) {
-                    const n = t.ne[0] * t.ne[1] * t.ne[2] * t.ne[3];
-                    const f32_data = try allocator.alloc(f32, n);
-                    defer allocator.free(f32_data);
-                    try weights.dequantToF32(&ctx, t, f32_data);
-                    const f16_size = n * 2;
-                    const f16_data = try allocator.alloc(u16, n);
-                    defer allocator.free(f16_data);
-                    for (f32_data, 0..) |v, i| f16_data[i] = @bitCast(@as(f16, @floatCast(v)));
-                    const mapped = try vk_ctx.vkd.mapMemory(vk_ctx.device, weight_staging.memory, 0, f16_size, .{});
-                    @memcpy(@as([*]u8, @ptrCast(mapped))[0..f16_size], std.mem.sliceAsBytes(f16_data));
-                    vk_ctx.vkd.unmapMemory(vk_ctx.device, weight_staging.memory);
-                    try vk_ctx.copyBuffer(weight_staging, gt_entry.buffer.?.*, f16_size);
                 } else {
                     const n = t.ne[0] * t.ne[1] * t.ne[2] * t.ne[3];
                     const f32_data = try allocator.alloc(f32, n);
@@ -517,12 +497,20 @@ pub fn main(init: std.process.Init) !void {
     var scratchpad = try vulkan.Buffer.init(&vk_ctx, graph.scratchpad_size, .{ .storage_buffer_bit = true, .shader_device_address_bit = true, .transfer_src_bit = true, .transfer_dst_bit = true }, .{ .device_local_bit = true });
     defer scratchpad.deinit(&vk_ctx);
 
-    const kv_props: vk.MemoryPropertyFlags = if (uses_q4_0_f16_fallback)
-        .{ .host_visible_bit = true, .host_coherent_bit = true }
-    else
-        .{ .device_local_bit = true };
+    const kv_props: vk.MemoryPropertyFlags = .{ .device_local_bit = true };
     var kv_cache = try vulkan.Buffer.init(&vk_ctx, graph.kv_cache_size, .{ .storage_buffer_bit = true, .shader_device_address_bit = true }, kv_props);
     defer kv_cache.deinit(&vk_ctx);
+
+    // SSM cache buffers (Qwen 3.5 Gated Delta Net). Sized to graph.ssm_cache_size
+    // which is 0 for non-hybrid architectures. Host-visible because the per-decode
+    // CPU step (Phase 6) reads/writes the recurrent state. For now we allocate
+    // a minimum-size buffer so the Dispatcher has valid placeholders.
+    const ssm_props: vk.MemoryPropertyFlags = .{ .host_visible_bit = true, .host_coherent_bit = true };
+    const ssm_alloc_size: u64 = if (graph.ssm_cache_size > 0) graph.ssm_cache_size / 2 else 4096;
+    var ssm_conv_cache = try vulkan.Buffer.init(&vk_ctx, ssm_alloc_size, .{ .storage_buffer_bit = true, .shader_device_address_bit = true }, ssm_props);
+    defer ssm_conv_cache.deinit(&vk_ctx);
+    var ssm_state_cache = try vulkan.Buffer.init(&vk_ctx, ssm_alloc_size, .{ .storage_buffer_bit = true, .shader_device_address_bit = true }, ssm_props);
+    defer ssm_state_cache.deinit(&vk_ctx);
 
     var input_staging = try vulkan.Buffer.init(&vk_ctx, model.f32Bytes(cfg.n_embd), .{ .transfer_src_bit = true }, .{ .host_visible_bit = true, .host_coherent_bit = true });
     defer input_staging.deinit(&vk_ctx);
@@ -542,7 +530,7 @@ pub fn main(init: std.process.Init) !void {
     defer vk_ctx.vkd.unmapMemory(vk_ctx.device, logits_staging.memory);
     const logits_persistent = @as([*]f32, @ptrCast(@alignCast(logits_mapped_ptr)))[0..cfg.vocab_size];
 
-    var dispatcher = try compute_graph.Dispatcher.init(&graph, &vk_ctx, &registry, scratchpad, kv_cache, &cfg);
+    var dispatcher = try compute_graph.Dispatcher.init(&graph, &vk_ctx, &registry, scratchpad, kv_cache, ssm_conv_cache, ssm_state_cache, &cfg);
     defer dispatcher.deinit();
     if (verbose) {
         try writer.print("[verbose] graph: {} nodes, {} tensors\n", .{ graph.nodes.items.len, graph.tensors.count() });
@@ -675,7 +663,6 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     const t_prefill_end = nowNs();
-
     var current_token: tokenizer.TokenID = if (token_ids.len > 0) token_ids[token_ids.len - 1] else 0;
 
     // Track generated token history for repetition penalty (fixed-size ring buffer).
@@ -893,8 +880,25 @@ pub fn main(init: std.process.Init) !void {
 
 fn isNativeQuantType(tt: @import("tensor.zig").Type) bool {
     return switch (tt) {
-        .q8_0, .q4_1, .q4_k, .q6_k => true,
+        .q4_0, .q8_0, .q4_1, .q4_k, .q6_k => true,
         else => false,
+    };
+}
+
+/// Size in bytes this tensor will occupy in the GPU weight buffer after any
+/// on-host preprocessing. For native quantized types (q4_0, q8_0, q4_1, q4_k,
+/// q6_k) this is the raw file size — we copy the GGUF bytes verbatim to GPU
+/// memory and dequantize inside the matmul shader. For unquantized types it's
+/// the natural size. This MUST match the actual bytes written to the weight
+/// buffer in the upload loop — otherwise the GPU buffer is allocated too large
+/// and the model fails to load on memory-constrained devices.
+fn gpuUploadSize(t: *@import("tensor.zig").Tensor) u64 {
+    const n = t.ne[0] * t.ne[1] * t.ne[2] * t.ne[3];
+    return switch (t.type) {
+        .f32 => n * 4,
+        .f16, .bf16 => n * 2,
+        // Native quant types: copy GGUF bytes verbatim to the GPU buffer.
+        .q4_0, .q8_0, .q4_1, .q4_k, .q6_k => t.size(),
     };
 }
 

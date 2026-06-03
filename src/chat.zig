@@ -37,12 +37,8 @@ pub fn buildChatPrompt(
     user_text: []const u8,
     allocator: std.mem.Allocator,
 ) ![]tokenizer.TokenID {
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    errdefer arena.deinit();
-    const arena_alloc = arena.allocator();
-
     var tokens: std.ArrayList(tokenizer.TokenID) = .empty;
-    errdefer tokens.deinit(arena_alloc);
+    errdefer tokens.deinit(allocator);
 
     const addToken = struct {
         fn func(t: *std.ArrayList(tokenizer.TokenID), id: tokenizer.TokenID, a: std.mem.Allocator) !void {
@@ -53,6 +49,7 @@ pub fn buildChatPrompt(
     const addText = struct {
         fn func(tok_enc: *const tokenizer.Tokenizer, t: *std.ArrayList(tokenizer.TokenID), text: []const u8, a: std.mem.Allocator) !void {
             const encoded = try tok_enc.encodeEx(text, false, a);
+            defer a.free(encoded);
             try t.appendSlice(a, encoded);
         }
     }.func;
@@ -60,82 +57,82 @@ pub fn buildChatPrompt(
     switch (format) {
         .chatml => {
             if (tok.bos_token_id != null and tok.add_bos_token) {
-                try addToken(&tokens, tok.bos_token_id.?, arena_alloc);
+                try addToken(&tokens, tok.bos_token_id.?, allocator);
             }
-            if (tok.special.im_start) |id| try addToken(&tokens, id, arena_alloc);
-            try addText(tok, &tokens, "user\n", arena_alloc);
-            try addText(tok, &tokens, user_text, arena_alloc);
-            if (tok.special.im_end) |id| try addToken(&tokens, id, arena_alloc);
-            try addText(tok, &tokens, "\n", arena_alloc);
-            if (tok.special.im_start) |id| try addToken(&tokens, id, arena_alloc);
-            try addText(tok, &tokens, "assistant\n", arena_alloc);
+            if (tok.special.im_start) |id| try addToken(&tokens, id, allocator);
+            try addText(tok, &tokens, "user\n", allocator);
+            try addText(tok, &tokens, user_text, allocator);
+            if (tok.special.im_end) |id| try addToken(&tokens, id, allocator);
+            try addText(tok, &tokens, "\n", allocator);
+            if (tok.special.im_start) |id| try addToken(&tokens, id, allocator);
+            try addText(tok, &tokens, "assistant\n", allocator);
         },
         .gemma => {
             if (tok.special.start_of_turn == null or tok.special.end_of_turn == null) {
                 return try tok.encode(user_text, allocator);
             }
             if (tok.bos_token_id != null and tok.add_bos_token) {
-                try addToken(&tokens, tok.bos_token_id.?, arena_alloc);
+                try addToken(&tokens, tok.bos_token_id.?, allocator);
             }
-            if (tok.special.start_of_turn) |id| try addToken(&tokens, id, arena_alloc);
-            try addText(tok, &tokens, "user\n", arena_alloc);
-            try addText(tok, &tokens, user_text, arena_alloc);
-            if (tok.special.end_of_turn) |id| try addToken(&tokens, id, arena_alloc);
-            try addText(tok, &tokens, "\n", arena_alloc);
-            if (tok.special.start_of_turn) |id| try addToken(&tokens, id, arena_alloc);
-            try addText(tok, &tokens, "model\n", arena_alloc);
+            if (tok.special.start_of_turn) |id| try addToken(&tokens, id, allocator);
+            try addText(tok, &tokens, "user\n", allocator);
+            try addText(tok, &tokens, user_text, allocator);
+            if (tok.special.end_of_turn) |id| try addToken(&tokens, id, allocator);
+            try addText(tok, &tokens, "\n", allocator);
+            if (tok.special.start_of_turn) |id| try addToken(&tokens, id, allocator);
+            try addText(tok, &tokens, "model\n", allocator);
         },
         .llama3 => {
             if (tok.special.begin_of_text == null or tok.special.start_header_id == null or
                 tok.special.end_header_id == null or tok.special.eot_id == null) {
                 return try tok.encode(user_text, allocator);
             }
-            try addToken(&tokens, tok.special.begin_of_text.?, arena_alloc);
-            try addToken(&tokens, tok.special.start_header_id.?, arena_alloc);
-            try addText(tok, &tokens, "user", arena_alloc);
-            try addToken(&tokens, tok.special.end_header_id.?, arena_alloc);
-            try addText(tok, &tokens, "\n\n", arena_alloc);
-            try addText(tok, &tokens, user_text, arena_alloc);
-            try addToken(&tokens, tok.special.eot_id.?, arena_alloc);
-            try addToken(&tokens, tok.special.start_header_id.?, arena_alloc);
-            try addText(tok, &tokens, "assistant", arena_alloc);
-            try addToken(&tokens, tok.special.end_header_id.?, arena_alloc);
-            try addText(tok, &tokens, "\n\n", arena_alloc);
+            try addToken(&tokens, tok.special.begin_of_text.?, allocator);
+            try addToken(&tokens, tok.special.start_header_id.?, allocator);
+            try addText(tok, &tokens, "user", allocator);
+            try addToken(&tokens, tok.special.end_header_id.?, allocator);
+            try addText(tok, &tokens, "\n\n", allocator);
+            try addText(tok, &tokens, user_text, allocator);
+            try addToken(&tokens, tok.special.eot_id.?, allocator);
+            try addToken(&tokens, tok.special.start_header_id.?, allocator);
+            try addText(tok, &tokens, "assistant", allocator);
+            try addToken(&tokens, tok.special.end_header_id.?, allocator);
+            try addText(tok, &tokens, "\n\n", allocator);
         },
         .llama2 => {
             if (tok.special.inst_start == null or tok.special.inst_end == null) {
                 return try tok.encode(user_text, allocator);
             }
             if (tok.bos_token_id != null and tok.add_bos_token) {
-                try addToken(&tokens, tok.bos_token_id.?, arena_alloc);
+                try addToken(&tokens, tok.bos_token_id.?, allocator);
             }
-            try addToken(&tokens, tok.special.inst_start.?, arena_alloc);
-            try addText(tok, &tokens, user_text, arena_alloc);
-            try addToken(&tokens, tok.special.inst_end.?, arena_alloc);
-            try addText(tok, &tokens, "\n", arena_alloc);
+            if (tok.special.inst_start) |id| try addToken(&tokens, id, allocator);
+            try addText(tok, &tokens, user_text, allocator);
+            if (tok.special.inst_end) |id| try addToken(&tokens, id, allocator);
+            try addText(tok, &tokens, "\n", allocator);
         },
         .granite => {
             if (tok.special.start_of_role == null or tok.special.end_of_role == null) {
                 return try tok.encode(user_text, allocator);
             }
             if (tok.bos_token_id != null and tok.add_bos_token) {
-                try addToken(&tokens, tok.bos_token_id.?, arena_alloc);
+                try addToken(&tokens, tok.bos_token_id.?, allocator);
             }
-            try addToken(&tokens, tok.special.start_of_role.?, arena_alloc);
-            try addText(tok, &tokens, "user", arena_alloc);
-            if (tok.special.end_of_role) |id| try addToken(&tokens, id, arena_alloc);
-            if (tok.special.end_of_text) |id| try addToken(&tokens, id, arena_alloc);
-            try addText(tok, &tokens, user_text, arena_alloc);
-            try addText(tok, &tokens, "\n", arena_alloc);
-            try addToken(&tokens, tok.special.start_of_role.?, arena_alloc);
-            try addText(tok, &tokens, "assistant", arena_alloc);
-            if (tok.special.end_of_role) |id| try addToken(&tokens, id, arena_alloc);
-            try addText(tok, &tokens, "\n", arena_alloc);
+            if (tok.special.start_of_role) |id| try addToken(&tokens, id, allocator);
+            try addText(tok, &tokens, "user", allocator);
+            if (tok.special.end_of_role) |id| try addToken(&tokens, id, allocator);
+            if (tok.special.end_of_text) |id| try addToken(&tokens, id, allocator);
+            try addText(tok, &tokens, user_text, allocator);
+            try addText(tok, &tokens, "\n", allocator);
+            if (tok.special.start_of_role) |id| try addToken(&tokens, id, allocator);
+            try addText(tok, &tokens, "assistant", allocator);
+            if (tok.special.end_of_role) |id| try addToken(&tokens, id, allocator);
+            try addText(tok, &tokens, "\n", allocator);
         },
         .unknown => {
             return try tok.encode(user_text, allocator);
         },
     }
 
-    return try tokens.toOwnedSlice(arena_alloc);
+    return try tokens.toOwnedSlice(allocator);
 }
