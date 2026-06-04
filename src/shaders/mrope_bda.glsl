@@ -12,13 +12,12 @@ layout(push_constant) uniform PC {
     uint pos;            // p3
     uint rope_theta_bits; // p4
     uint p5_byte_off;    // p5: byte offset into a/c (divided by 4 inside)
-    uint sec0;           // p7
-    uint sec1;           // p8
-    uint p9;             // p9: sec2 (we use first 8 push slots; sec3 in p10 if needed)
-    uint p10;            // p10: sec3
-    FloatBuffer a;
-    FloatBuffer b;
-    FloatBuffer c;
+    uint sec0;           // p6
+    uint sec1;           // p7
+    uint sec2;           // p8
+    FloatBuffer a;       // offset 32 bytes (pc.a in Zig)
+    FloatBuffer b;       // offset 40 bytes (pc.b in Zig, unused)
+    FloatBuffer c;       // offset 48 bytes (pc.c in Zig)
 } pc;
 
 layout(local_size_x = 64) in;
@@ -42,7 +41,7 @@ void main() {
 
     uint s0 = pc.sec0;
     uint s1 = s0 + pc.sec1;
-    uint s2 = s1 + pc.p9;
+    uint s2 = s1 + pc.sec2;
     uint section_size;
     uint within;
     if (pair_idx < s0) {
@@ -52,10 +51,10 @@ void main() {
         section_size = pc.sec1;
         within = pair_idx - s0;
     } else if (pair_idx < s2) {
-        section_size = pc.p9;
+        section_size = pc.sec2;
         within = pair_idx - s1;
     } else {
-        section_size = pc.p10;
+        section_size = (pc.head_dim / 2u) - pc.sec0 - pc.sec1 - pc.sec2;
         within = pair_idx - s2;
     }
     if (section_size == 0u) return;

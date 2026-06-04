@@ -28,7 +28,7 @@ layout(local_size_x = 64) in;
 // ssm_gated_norm: y = silu(z) * rms_norm(x)
 // Per-head row: out[row, v] = silu(z[row, v]) * (x[row, v] / sqrt(mean(x[row]^2) + eps))
 void main() {
-    uint row = gl_GlobalInvocationID.x;
+    uint row = gl_WorkGroupID.x;
     if (row >= pc.n_rows) return;
     uint row_width = pc.row_width;
     float eps = uintBitsToFloat(pc.eps_bits);

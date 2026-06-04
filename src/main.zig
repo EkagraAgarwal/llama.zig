@@ -8,6 +8,7 @@ const model = @import("model.zig");
 const weights = @import("weights.zig");
 const sampler = @import("sampler.zig");
 const chat = @import("chat.zig");
+const ssm = @import("ssm_state.zig");
 const builtin = @import("builtin");
 const vk = @import("vulkan");
 const windows = if (builtin.os.tag == .windows) std.os.windows else struct {};
@@ -24,6 +25,88 @@ fn nowNs() u64 {
         return (c / f) * std.time.ns_per_s + ((c % f) * std.time.ns_per_s) / f;
     }
     return 0;
+}
+
+/// Run the CPU-side Gated Delta Net recurrence for one layer of one prefill
+/// or decode token. The `core` output is written into the scratchpad at
+/// `core_t.offset`.
+///
+/// Buffer layout inside `logits_staging` to avoid aliasing between the q
+/// input and the out output (the stepDeltaNet loop writes to out while
+/// still reading q for the same head):
+///   - inputs (q, k, v, gate, beta) packed at the START of the buffer
+///   - `core` output written at the END of the buffer
+///
+/// This is the same stepDeltaNet algorithm as the existing decode path, just
+/// with a non-overlapping buffer layout and exposed for use during prefill.
+fn runCpuSsmDeltaForLayer(
+    allocator: std.mem.Allocator,
+    vk_ctx: *vulkan.Context,
+    scratchpad: vulkan.Buffer,
+    logits_staging: vulkan.Buffer,
+    staging_size: u64,
+    ssm_ctx: *ssm.SsmCpuContext,
+    graph: *const compute_graph.Graph,
+    layer: u32,
+    head_v_dim: u32,
+) !void {
+    var ln_buf: [32]u8 = undefined;
+    const ln = std.fmt.bufPrint(&ln_buf, "blk.{d}", .{layer}) catch return;
+
+    var name_buf: [32]u8 = undefined;
+    const qn_name = std.fmt.bufPrint(&name_buf, "{s}.q_norm", .{ln}) catch return;
+    @memset(name_buf[0..qn_name.len], 0);
+    const kn_name = std.fmt.bufPrint(&name_buf, "{s}.k_norm", .{ln}) catch return;
+    @memset(name_buf[0..kn_name.len], 0);
+    const vn_name = std.fmt.bufPrint(&name_buf, "{s}.v_conv", .{ln}) catch return;
+    @memset(name_buf[0..vn_name.len], 0);
+    const gate_name = std.fmt.bufPrint(&name_buf, "{s}.gate", .{ln}) catch return;
+    @memset(name_buf[0..gate_name.len], 0);
+    const beta_name = std.fmt.bufPrint(&name_buf, "{s}.beta", .{ln}) catch return;
+    @memset(name_buf[0..beta_name.len], 0);
+    const core_name = std.fmt.bufPrint(&name_buf, "{s}.core", .{ln}) catch return;
+
+    const qn_t = graph.tensors.get(qn_name) orelse return;
+    const kn_t = graph.tensors.get(kn_name) orelse return;
+    const vn_t = graph.tensors.get(vn_name) orelse return;
+    const gate_t = graph.tensors.get(gate_name) orelse return;
+    const beta_t = graph.tensors.get(beta_name) orelse return;
+    const core_t = graph.tensors.get(core_name) orelse return;
+
+    // Pack inputs at the start of the staging buffer (no aliasing with out).
+    const total_input: u64 = qn_t.size + kn_t.size + vn_t.size + gate_t.size + beta_t.size;
+    const q_off: u64 = 0;
+    const k_off: u64 = qn_t.size;
+    const v_off: u64 = k_off + kn_t.size;
+    const g_off: u64 = v_off + vn_t.size;
+    const b_off: u64 = g_off + gate_t.size;
+    // Output at the END of the buffer (after any other writes).
+    const core_off: u64 = staging_size - core_t.size;
+    std.debug.assert(core_off >= total_input); // Ensure no overlap.
+
+    try vk_ctx.copyBufferOffset(scratchpad, qn_t.offset, logits_staging, q_off, qn_t.size);
+    try vk_ctx.copyBufferOffset(scratchpad, kn_t.offset, logits_staging, k_off, kn_t.size);
+    try vk_ctx.copyBufferOffset(scratchpad, vn_t.offset, logits_staging, v_off, vn_t.size);
+    try vk_ctx.copyBufferOffset(scratchpad, gate_t.offset, logits_staging, g_off, gate_t.size);
+    try vk_ctx.copyBufferOffset(scratchpad, beta_t.offset, logits_staging, b_off, beta_t.size);
+
+    const mapped_ssm = try vk_ctx.vkd.mapMemory(vk_ctx.device, logits_staging.memory, 0, staging_size, .{});
+    defer vk_ctx.vkd.unmapMemory(vk_ctx.device, logits_staging.memory);
+
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_v_dim)));
+    try ssm_ctx.stepDeltaNet(
+        layer,
+        @as([*]f32, @ptrCast(@alignCast(mapped_ssm)))[q_off / 4 ..][0 .. @as(usize, qn_t.size) / 4],
+        @as([*]f32, @ptrCast(@alignCast(mapped_ssm)))[k_off / 4 ..][0 .. @as(usize, kn_t.size) / 4],
+        @as([*]f32, @ptrCast(@alignCast(mapped_ssm)))[v_off / 4 ..][0 .. @as(usize, vn_t.size) / 4],
+        @as([*]f32, @ptrCast(@alignCast(mapped_ssm)))[g_off / 4 ..][0 .. @as(usize, gate_t.size) / 4],
+        @as([*]f32, @ptrCast(@alignCast(mapped_ssm)))[b_off / 4 ..][0 .. @as(usize, beta_t.size) / 4],
+        @as([*]f32, @ptrCast(@alignCast(mapped_ssm)))[core_off / 4 ..][0 .. @as(usize, core_t.size) / 4],
+        scale,
+    );
+
+    try vk_ctx.copyBufferOffset(logits_staging, core_off, scratchpad, core_t.offset, core_t.size);
+    _ = allocator;
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -49,7 +132,7 @@ pub fn main(init: std.process.Init) !void {
     var min_p: f32 = 0.0;
     var ctx_size_override: ?u32 = null;
     var debug_logits: u32 = 0;
-    var chat_mode: bool = true;
+    var chat_mode: bool = false;
     var verbose: bool = false;
     var inspect_block: bool = false;
     var prefill_chunk: u32 = 0;
@@ -77,6 +160,8 @@ pub fn main(init: std.process.Init) !void {
             ctx_size_override = std.fmt.parseInt(u32, args_it.next() orelse "0", 10) catch null;
         } else if (std.mem.eql(u8, arg, "--chat")) {
             chat_mode = true;
+        } else if (std.mem.eql(u8, arg, "--no-chat")) {
+            chat_mode = false;
         } else if (std.mem.eql(u8, arg, "--verbose")) {
             verbose = true;
         } else if (std.mem.eql(u8, arg, "--debug-logits")) {
@@ -134,6 +219,14 @@ pub fn main(init: std.process.Init) !void {
     validateModelLayout(&ctx) catch |err| {
         try writer.print("Warning: model layout check failed ({s}); continuing with dynamic graph assumptions.\n", .{@errorName(err)});
     };
+    {
+        var ts_buf: [64]u8 = undefined;
+        const ts = std.fmt.bufPrint(&ts_buf, "[phase] post-validate t={d:.1}s\n", .{
+            @as(f64, @floatFromInt(nowNs() - t_load_start)) / 1e9,
+        }) catch "";
+        try writer.print("{s}", .{ts});
+        try writer_streaming.interface.flush();
+    }
 
     // Dump GGUF metadata for debugging
     if (verbose) {
@@ -199,6 +292,14 @@ pub fn main(init: std.process.Init) !void {
     defer registry.deinit(&vk_ctx);
 
     try registry.register(&vk_ctx, "add", kernels_data.kernels_add_spv, "main");
+    {
+        var ts_buf: [64]u8 = undefined;
+        const ts = std.fmt.bufPrint(&ts_buf, "[phase] after 1st pipeline t={d:.1}s\n", .{
+            @as(f64, @floatFromInt(nowNs() - t_load_start)) / 1e9,
+        }) catch "";
+        try writer.print("{s}", .{ts});
+        try writer_streaming.interface.flush();
+    }
     try registry.register(&vk_ctx, "mul", kernels_data.kernels_mul_spv, "main");
     try registry.register(&vk_ctx, "rms_norm", kernels_data.kernels_rmsnorm_spv, "main");
     try registry.register(&vk_ctx, "softmax", kernels_data.kernels_softmax_spv, "main");
@@ -238,6 +339,14 @@ pub fn main(init: std.process.Init) !void {
     try registry.register(&vk_ctx, "ssm_conv1d", kernels_data.kernels_ssm_conv1d_spv, "main");
     try registry.register(&vk_ctx, "ssm_delta_net_decode", kernels_data.kernels_ssm_delta_net_decode_spv, "main");
     try registry.register(&vk_ctx, "ssm_gated_norm", kernels_data.kernels_ssm_gated_norm_spv, "main");
+    {
+        var ts_buf: [64]u8 = undefined;
+        const ts = std.fmt.bufPrint(&ts_buf, "[phase] all pipelines registered t={d:.1}s\n", .{
+            @as(f64, @floatFromInt(nowNs() - t_load_start)) / 1e9,
+        }) catch "";
+        try writer.print("{s}", .{ts});
+        try writer_streaming.interface.flush();
+    }
 
     var graph = compute_graph.Graph.init(allocator);
     defer graph.deinit();
@@ -276,8 +385,26 @@ pub fn main(init: std.process.Init) !void {
     }
     try builder.addTensor("output_norm.weight", model.f32Bytes(cfg.n_embd), .weight);
     try builder.buildLmHead(prev_out, "logits", has_output);
-    builder.finalize();
+    try builder.finalize();
+    {
+        var ts_buf: [64]u8 = undefined;
+        const ts = std.fmt.bufPrint(&ts_buf, "[phase] graph built t={d:.1}s, n={d} nodes, t={d} tensors\n", .{
+            @as(f64, @floatFromInt(nowNs() - t_load_start)) / 1e9,
+            graph.nodes.items.len,
+            graph.tensors.count(),
+        }) catch "";
+        try writer.print("{s}", .{ts});
+        try writer_streaming.interface.flush();
+    }
     try graph.verify();
+    {
+        var ts_buf: [64]u8 = undefined;
+        const ts = std.fmt.bufPrint(&ts_buf, "[phase] graph verified t={d:.1}s\n", .{
+            @as(f64, @floatFromInt(nowNs() - t_load_start)) / 1e9,
+        }) catch "";
+        try writer.print("{s}", .{ts});
+        try writer_streaming.interface.flush();
+    }
     const graph_cost = compute_graph.estimateGraphCost(&graph);
 
     // Convert eligible matmul nodes to quantized matmul path. The Qwen 3.5
@@ -308,6 +435,9 @@ pub fn main(init: std.process.Init) !void {
         if (isNativeQuantType(qt)) {
             node.op_type = .matmul_q;
             node.p5 = @intFromEnum(qt);
+        } else if (qt == .bf16) {
+            node.op_type = .matmul_q;
+            node.p5 = @intFromEnum(@import("tensor.zig").Type.f16);
         }
     }
 
@@ -318,19 +448,21 @@ pub fn main(init: std.process.Init) !void {
         weight_buffers.deinit(allocator);
     }
 
-    var max_staging: u64 = 0;
+    const STAGING_BUF_SIZE = 128 * 1024 * 1024; // Cap staging buffer at 128MB
+    var staging_alloc_size: u64 = 0;
     var t_it = graph.tensors.iterator();
     while (t_it.next()) |entry| {
         if (entry.value_ptr.role == .weight) {
             if (ctx.tensors.get(entry.key_ptr.*)) |gt| {
-                max_staging = @max(max_staging, gpuUploadSize(gt));
+                staging_alloc_size = @max(staging_alloc_size, gpuUploadSize(gt));
             } else {
-                max_staging = @max(max_staging, entry.value_ptr.size);
+                staging_alloc_size = @max(staging_alloc_size, entry.value_ptr.size);
             }
         }
     }
+    staging_alloc_size = @min(staging_alloc_size, STAGING_BUF_SIZE);
 
-    var weight_staging = try vulkan.Buffer.init(&vk_ctx, max_staging, .{ .transfer_src_bit = true }, .{ .host_visible_bit = true, .host_coherent_bit = true });
+    var weight_staging = try vulkan.Buffer.init(&vk_ctx, staging_alloc_size, .{ .transfer_src_bit = true }, .{ .host_visible_bit = true, .host_coherent_bit = true });
     defer weight_staging.deinit(&vk_ctx);
 
     t_it = graph.tensors.iterator();
@@ -364,6 +496,10 @@ pub fn main(init: std.process.Init) !void {
 
         const buf_usage = vk.BufferUsageFlags{ .storage_buffer_bit = true, .shader_device_address_bit = true, .transfer_dst_bit = true };
         const buf_props: vk.MemoryPropertyFlags = .{ .device_local_bit = true };
+        if (verbose) {
+            try writer.print("[verbose] Allocating buffer for weight '{s}' size={}\n", .{entry.key_ptr.*, upload_size});
+            try writer_streaming.interface.flush();
+        }
         const buf = try vulkan.Buffer.init(&vk_ctx, upload_size, buf_usage, buf_props);
         entry.value_ptr.buffer = try allocator.create(vulkan.Buffer);
         entry.value_ptr.buffer.?.* = buf;
@@ -380,72 +516,55 @@ pub fn main(init: std.process.Init) !void {
                     break :blk temp;
                 };
                 defer if (ctx.mmap_file == null) allocator.free(raw);
-
-                const mapped = try vk_ctx.vkd.mapMemory(vk_ctx.device, weight_staging.memory, 0, raw_size, .{});
-                @memcpy(@as([*]u8, @ptrCast(mapped))[0..raw_size], raw);
-                vk_ctx.vkd.unmapMemory(vk_ctx.device, weight_staging.memory);
-                try vk_ctx.copyBuffer(weight_staging, buf, raw_size);
+                try uploadBufferChunked(&vk_ctx, weight_staging, buf, raw, STAGING_BUF_SIZE);
+            } else if (t.type == .bf16) {
+                const n = t.ne[0] * t.ne[1] * t.ne[2] * t.ne[3];
+                const f16_data = try allocator.alloc(u16, n);
+                defer allocator.free(f16_data);
+                try weights.dequantToF16(&ctx, t, f16_data);
+                try uploadBufferChunked(&vk_ctx, weight_staging, buf, std.mem.sliceAsBytes(f16_data), STAGING_BUF_SIZE);
             } else {
                 const n = t.ne[0] * t.ne[1] * t.ne[2] * t.ne[3];
                 const f32_data = try allocator.alloc(f32, n);
                 defer allocator.free(f32_data);
-                weights.dequantToF32(&ctx, t, f32_data) catch |err| {
-                    if (err == error.UnsupportedQuantType) {
-                        try writer.print(
-                            "Unsupported tensor quantization type '{s}' for weight '{s}'. Supported types: f32, f16, bf16, q8_0.\n",
-                            .{ weights.typeName(t.type), entry.key_ptr.* },
-                        );
-                        try writer_streaming.interface.flush();
-                    }
-                    return err;
-                };
-                const f32_size = model.weightF32Size(t);
-                const mapped = try vk_ctx.vkd.mapMemory(vk_ctx.device, weight_staging.memory, 0, f32_size, .{});
-                @memcpy(@as([*]u8, @ptrCast(mapped))[0..f32_size], std.mem.sliceAsBytes(f32_data));
-                vk_ctx.vkd.unmapMemory(vk_ctx.device, weight_staging.memory);
-                try vk_ctx.copyBuffer(weight_staging, buf, f32_size);
+                try weights.dequantToF32(&ctx, t, f32_data);
+                try uploadBufferChunked(&vk_ctx, weight_staging, buf, std.mem.sliceAsBytes(f32_data), STAGING_BUF_SIZE);
             }
         } else if (components) |comps| {
             const first_t = ctx.tensors.get(comps[0]).?;
             if (isNativeQuantType(first_t.type)) {
-                var offset: u64 = 0;
-                const mapped = try vk_ctx.vkd.mapMemory(vk_ctx.device, weight_staging.memory, 0, upload_size, .{});
+                const host_buf = try allocator.alloc(u8, upload_size);
+                defer allocator.free(host_buf);
+                var off: u64 = 0;
                 for (comps) |c| {
                     const t = ctx.tensors.get(c).?;
                     const raw_size = t.size();
-                    const raw = if (ctx.mmap_file != null)
-                        try ctx.getTensorSlice(t)
-                    else blk: {
-                        const temp = try allocator.alloc(u8, raw_size);
-                        try ctx.readTensorData(t, temp);
-                        break :blk temp;
-                    };
-                    defer if (ctx.mmap_file == null) allocator.free(raw);
-
-                    @memcpy(@as([*]u8, @ptrCast(mapped))[offset .. offset + raw_size], raw);
-                    offset += raw_size;
+                    try ctx.readTensorData(t, host_buf[off .. off + raw_size]);
+                    off += raw_size;
                 }
-                vk_ctx.vkd.unmapMemory(vk_ctx.device, weight_staging.memory);
-                try vk_ctx.copyBuffer(weight_staging, buf, upload_size);
-            } else {
-                var offset: u64 = 0;
-                const mapped = try vk_ctx.vkd.mapMemory(vk_ctx.device, weight_staging.memory, 0, upload_size, .{});
+                try uploadBufferChunked(&vk_ctx, weight_staging, buf, host_buf, STAGING_BUF_SIZE);
+            } else if (first_t.type == .bf16) {
+                const host_buf = try allocator.alloc(u16, upload_size / 2);
+                defer allocator.free(host_buf);
+                var off: u64 = 0;
                 for (comps) |c| {
                     const t = ctx.tensors.get(c).?;
                     const n = t.ne[0] * t.ne[1] * t.ne[2] * t.ne[3];
-                    const f32_data = try allocator.alloc(f32, n);
-                    defer allocator.free(f32_data);
-                    weights.dequantToF32(&ctx, t, f32_data) catch |err| {
-                        vk_ctx.vkd.unmapMemory(vk_ctx.device, weight_staging.memory);
-                        return err;
-                    };
-
-                    const comp_size = n * 4;
-                    @memcpy(@as([*]u8, @ptrCast(mapped))[offset .. offset + comp_size], std.mem.sliceAsBytes(f32_data));
-                    offset += comp_size;
+                    try weights.dequantToF16(&ctx, t, host_buf[off .. off + n]);
+                    off += n;
                 }
-                vk_ctx.vkd.unmapMemory(vk_ctx.device, weight_staging.memory);
-                try vk_ctx.copyBuffer(weight_staging, buf, upload_size);
+                try uploadBufferChunked(&vk_ctx, weight_staging, buf, std.mem.sliceAsBytes(host_buf), STAGING_BUF_SIZE);
+            } else {
+                const host_buf = try allocator.alloc(f32, upload_size / 4);
+                defer allocator.free(host_buf);
+                var off: u64 = 0;
+                for (comps) |c| {
+                    const t = ctx.tensors.get(c).?;
+                    const n = t.ne[0] * t.ne[1] * t.ne[2] * t.ne[3];
+                    try weights.dequantToF32(&ctx, t, host_buf[off .. off + n]);
+                    off += n;
+                }
+                try uploadBufferChunked(&vk_ctx, weight_staging, buf, std.mem.sliceAsBytes(host_buf), STAGING_BUF_SIZE);
             }
         }
     }
@@ -462,6 +581,7 @@ pub fn main(init: std.process.Init) !void {
                     try weight_buffers.append(allocator, buf);
                 }
                 gt_entry.size = upload_size;
+                const buf = gt_entry.buffer.?.*;
                 if (isNativeQuantType(t.type)) {
                     const raw_size = t.size();
                     const raw = if (ctx.mmap_file != null)
@@ -472,45 +592,83 @@ pub fn main(init: std.process.Init) !void {
                         break :blk temp;
                     };
                     defer if (ctx.mmap_file == null) allocator.free(raw);
-
-                    const mapped = try vk_ctx.vkd.mapMemory(vk_ctx.device, weight_staging.memory, 0, raw_size, .{});
-                    @memcpy(@as([*]u8, @ptrCast(mapped))[0..raw_size], raw);
-                    vk_ctx.vkd.unmapMemory(vk_ctx.device, weight_staging.memory);
-                    try vk_ctx.copyBuffer(weight_staging, gt_entry.buffer.?.*, raw_size);
+                    try uploadBufferChunked(&vk_ctx, weight_staging, buf, raw, STAGING_BUF_SIZE);
+                } else if (t.type == .bf16) {
+                    const n = t.ne[0] * t.ne[1] * t.ne[2] * t.ne[3];
+                    const f16_data = try allocator.alloc(u16, n);
+                    defer allocator.free(f16_data);
+                    try weights.dequantToF16(&ctx, t, f16_data);
+                    try uploadBufferChunked(&vk_ctx, weight_staging, buf, std.mem.sliceAsBytes(f16_data), STAGING_BUF_SIZE);
                 } else {
                     const n = t.ne[0] * t.ne[1] * t.ne[2] * t.ne[3];
                     const f32_data = try allocator.alloc(f32, n);
                     defer allocator.free(f32_data);
                     try weights.dequantToF32(&ctx, t, f32_data);
-                    const f32_size = model.weightF32Size(t);
-                    const mapped = try vk_ctx.vkd.mapMemory(vk_ctx.device, weight_staging.memory, 0, f32_size, .{});
-                    @memcpy(@as([*]u8, @ptrCast(mapped))[0..f32_size], std.mem.sliceAsBytes(f32_data));
-                    vk_ctx.vkd.unmapMemory(vk_ctx.device, weight_staging.memory);
-                    try vk_ctx.copyBuffer(weight_staging, gt_entry.buffer.?.*, f32_size);
+                    try uploadBufferChunked(&vk_ctx, weight_staging, buf, std.mem.sliceAsBytes(f32_data), STAGING_BUF_SIZE);
                 }
             }
         }
     }
 
     ctx.discardMmap();
+    {
+        var ts_buf: [64]u8 = undefined;
+        const ts = std.fmt.bufPrint(&ts_buf, "[phase] weight upload done t={d:.1}s\n", .{
+            @as(f64, @floatFromInt(nowNs() - t_load_start)) / 1e9,
+        }) catch "";
+        try writer.print("{s}", .{ts});
+        try writer_streaming.interface.flush();
+    }
 
-    var scratchpad = try vulkan.Buffer.init(&vk_ctx, graph.scratchpad_size, .{ .storage_buffer_bit = true, .shader_device_address_bit = true, .transfer_src_bit = true, .transfer_dst_bit = true }, .{ .device_local_bit = true });
+    if (verbose) {
+        try writer.print("[verbose] Scratchpad size: {d} MB\n", .{graph.scratchpad_size / 1024 / 1024});
+        try writer_streaming.interface.flush();
+    }
+    const scratch_props: vk.MemoryPropertyFlags = if (cfg.arch == .qwen35)
+        .{ .device_local_bit = true, .host_visible_bit = true, .host_coherent_bit = true }
+    else
+        .{ .device_local_bit = true };
+
+    var scratchpad = try vulkan.Buffer.init(&vk_ctx, graph.scratchpad_size, .{ .storage_buffer_bit = true, .shader_device_address_bit = true, .transfer_src_bit = true, .transfer_dst_bit = true }, scratch_props);
     defer scratchpad.deinit(&vk_ctx);
 
     const kv_props: vk.MemoryPropertyFlags = .{ .device_local_bit = true };
     var kv_cache = try vulkan.Buffer.init(&vk_ctx, graph.kv_cache_size, .{ .storage_buffer_bit = true, .shader_device_address_bit = true }, kv_props);
     defer kv_cache.deinit(&vk_ctx);
 
-    // SSM cache buffers (Qwen 3.5 Gated Delta Net). Sized to graph.ssm_cache_size
-    // which is 0 for non-hybrid architectures. Host-visible because the per-decode
+    // SSM cache buffers (Qwen 3.5 Gated Delta Net). Host-visible because the per-decode
     // CPU step (Phase 6) reads/writes the recurrent state. For now we allocate
     // a minimum-size buffer so the Dispatcher has valid placeholders.
     const ssm_props: vk.MemoryPropertyFlags = .{ .host_visible_bit = true, .host_coherent_bit = true };
-    const ssm_alloc_size: u64 = if (graph.ssm_cache_size > 0) graph.ssm_cache_size / 2 else 4096;
-    var ssm_conv_cache = try vulkan.Buffer.init(&vk_ctx, ssm_alloc_size, .{ .storage_buffer_bit = true, .shader_device_address_bit = true }, ssm_props);
+    var ssm_conv_size: u64 = 0;
+    var ssm_state_size: u64 = 0;
+    var ssm_it = graph.tensors.iterator();
+    while (ssm_it.next()) |entry| {
+        if (entry.value_ptr.role == .ssm_cache) {
+            if (std.mem.startsWith(u8, entry.key_ptr.*, "ssm_conv")) {
+                ssm_conv_size += entry.value_ptr.size;
+            } else if (std.mem.startsWith(u8, entry.key_ptr.*, "ssm_state")) {
+                ssm_state_size += entry.value_ptr.size;
+            }
+        }
+    }
+    const ssm_conv_alloc = if (ssm_conv_size > 0) ssm_conv_size else 4096;
+    const ssm_state_alloc = if (ssm_state_size > 0) ssm_state_size else 4096;
+    var ssm_conv_cache = try vulkan.Buffer.init(&vk_ctx, ssm_conv_alloc, .{ .storage_buffer_bit = true, .shader_device_address_bit = true }, ssm_props);
     defer ssm_conv_cache.deinit(&vk_ctx);
-    var ssm_state_cache = try vulkan.Buffer.init(&vk_ctx, ssm_alloc_size, .{ .storage_buffer_bit = true, .shader_device_address_bit = true }, ssm_props);
+    var ssm_state_cache = try vulkan.Buffer.init(&vk_ctx, ssm_state_alloc, .{ .storage_buffer_bit = true, .shader_device_address_bit = true }, ssm_props);
     defer ssm_state_cache.deinit(&vk_ctx);
+
+    if (ssm_conv_size > 0) {
+        const mapped_conv = try vk_ctx.vkd.mapMemory(vk_ctx.device, ssm_conv_cache.memory, 0, ssm_conv_size, .{});
+        @memset(@as([*]u8, @ptrCast(mapped_conv))[0..ssm_conv_size], 0);
+        vk_ctx.vkd.unmapMemory(vk_ctx.device, ssm_conv_cache.memory);
+    }
+    if (ssm_state_size > 0) {
+        const mapped_state = try vk_ctx.vkd.mapMemory(vk_ctx.device, ssm_state_cache.memory, 0, ssm_state_size, .{});
+        @memset(@as([*]u8, @ptrCast(mapped_state))[0..ssm_state_size], 0);
+        vk_ctx.vkd.unmapMemory(vk_ctx.device, ssm_state_cache.memory);
+    }
 
     var input_staging = try vulkan.Buffer.init(&vk_ctx, model.f32Bytes(cfg.n_embd), .{ .transfer_src_bit = true }, .{ .host_visible_bit = true, .host_coherent_bit = true });
     defer input_staging.deinit(&vk_ctx);
@@ -529,9 +687,22 @@ pub fn main(init: std.process.Init) !void {
     const logits_mapped_ptr = try vk_ctx.vkd.mapMemory(vk_ctx.device, logits_staging.memory, 0, model.f32Bytes(cfg.vocab_size), .{});
     defer vk_ctx.vkd.unmapMemory(vk_ctx.device, logits_staging.memory);
     const logits_persistent = @as([*]f32, @ptrCast(@alignCast(logits_mapped_ptr)))[0..cfg.vocab_size];
+    {
+        var ts_buf: [64]u8 = undefined;
+        const ts = std.fmt.bufPrint(&ts_buf, "[phase] all buffers allocated t={d:.1}s\n", .{
+            @as(f64, @floatFromInt(nowNs() - t_load_start)) / 1e9,
+        }) catch "";
+        try writer.print("{s}", .{ts});
+        try writer_streaming.interface.flush();
+    }
 
     var dispatcher = try compute_graph.Dispatcher.init(&graph, &vk_ctx, &registry, scratchpad, kv_cache, ssm_conv_cache, ssm_state_cache, &cfg);
     defer dispatcher.deinit();
+    // Set the host-visible staging buffer used by the CPU SSM step. Only used
+    // for qwen35 hybrid SSM models during prefill.
+    if (cfg.arch == .qwen35 and graph.ssm_cache_size > 0) {
+        dispatcher.setSsmStagingBuffer(logits_staging, model.f32Bytes(cfg.vocab_size));
+    }
     if (verbose) {
         try writer.print("[verbose] graph: {} nodes, {} tensors\n", .{ graph.nodes.items.len, graph.tensors.count() });
         try writer_streaming.interface.flush();
@@ -550,6 +721,15 @@ pub fn main(init: std.process.Init) !void {
     defer if (embd_cache_transposed) |buf| allocator.free(buf);
     if (!embd_standard_layout and embd_transposed_layout) {
         const n = embd_tensor.ne[0] * embd_tensor.ne[1] * embd_tensor.ne[2] * embd_tensor.ne[3];
+        {
+            var ts_buf: [96]u8 = undefined;
+            const ts = std.fmt.bufPrint(&ts_buf, " [dequanting embedding n={d} t={d:.1}s]\n", .{
+                n,
+                @as(f64, @floatFromInt(nowNs() - t_load_start)) / 1e9,
+            }) catch " [dequant embd]";
+            try writer.print("{s}", .{ts});
+            try writer_streaming.interface.flush();
+        }
         const cache = try allocator.alloc(f32, n);
         try weights.dequantToF32(&ctx, embd_tensor, cache);
         embd_cache_transposed = cache;
@@ -857,8 +1037,62 @@ pub fn main(init: std.process.Init) !void {
             }
 
             try dispatcher.execute(pos);
+
+            // Debug: verify input embedding actually changed
+            if (verbose) {
+                const inp_t = graph.tensors.get("input").?;
+                const inp_sz = @min(model.f32Bytes(8), inp_t.size);
+                var dbg_staging = try vulkan.Buffer.init(&vk_ctx, inp_sz, .{ .transfer_dst_bit = true }, .{ .host_visible_bit = true, .host_coherent_bit = true });
+                defer dbg_staging.deinit(&vk_ctx);
+                try vk_ctx.copyBufferOffset(scratchpad, inp_t.offset, dbg_staging, 0, inp_sz);
+                const dbg_mapped = try vk_ctx.vkd.mapMemory(vk_ctx.device, dbg_staging.memory, 0, inp_sz, .{});
+                const dbg_vals = @as([*]const f32, @ptrCast(@alignCast(dbg_mapped)))[0..8];
+                try writer.print("[debug] input[0..8] before execute({}): ", .{pos});
+                for (dbg_vals) |v| try writer.print("{d:.4} ", .{v});
+                try writer.print("(token={})\n", .{current_token});
+                vk_ctx.vkd.unmapMemory(vk_ctx.device, dbg_staging.memory);
+                try writer_streaming.interface.flush();
+            }
         }
         pos += 1;
+
+        // Per-decode SSM step: run CPU-side Gated Delta Net for each recurrent layer.
+        // The GPU's ssm_delta_net_decode shader is also dispatched (per-graph) but
+        // its output is overwritten by the CPU step. This is the existing
+        // architecture — see ssm_state.zig and architecture.md.
+        if (cfg.arch == .qwen35 and graph.ssm_cache_size > 0) {
+            const n_main: u32 = cfg.n_layer -| cfg.nextn_predict_layers;
+            const head_v_dim: u32 = cfg.ssm_d_inner / cfg.ssm_dt_rank;
+
+            const conv_bytes = ssm_conv_size;
+            const state_bytes = ssm_state_size;
+            const mapped_conv = try vk_ctx.vkd.mapMemory(vk_ctx.device, ssm_conv_cache.memory, 0, conv_bytes, .{});
+            const mapped_state = try vk_ctx.vkd.mapMemory(vk_ctx.device, ssm_state_cache.memory, 0, state_bytes, .{});
+            defer {
+                vk_ctx.vkd.unmapMemory(vk_ctx.device, ssm_conv_cache.memory);
+                vk_ctx.vkd.unmapMemory(vk_ctx.device, ssm_state_cache.memory);
+            }
+            const conv_f32 = @as([*]f32, @ptrCast(@alignCast(mapped_conv)))[0..conv_bytes / 4];
+            const state_f32 = @as([*]f32, @ptrCast(@alignCast(mapped_state)))[0..state_bytes / 4];
+            var ssm_ctx = ssm.SsmCpuContext.wrap(&cfg, conv_f32, state_f32);
+
+            const staging_size: u64 = model.f32Bytes(cfg.vocab_size);
+            var ssm_layer: u32 = 0;
+            while (ssm_layer < n_main) : (ssm_layer += 1) {
+                if (!cfg.isRecurrent(ssm_layer)) continue;
+                try runCpuSsmDeltaForLayer(
+                    allocator,
+                    &vk_ctx,
+                    scratchpad,
+                    logits_staging,
+                    staging_size,
+                    &ssm_ctx,
+                    &graph,
+                    ssm_layer,
+                    head_v_dim,
+                );
+            }
+        }
     }
     const t_decode_end = nowNs();
 
@@ -880,7 +1114,7 @@ pub fn main(init: std.process.Init) !void {
 
 fn isNativeQuantType(tt: @import("tensor.zig").Type) bool {
     return switch (tt) {
-        .q4_0, .q8_0, .q4_1, .q4_k, .q6_k => true,
+        .q4_0, .q8_0, .q4_1, .q4_k, .q6_k, .f16 => true,
         else => false,
     };
 }
@@ -896,9 +1130,9 @@ fn gpuUploadSize(t: *@import("tensor.zig").Tensor) u64 {
     const n = t.ne[0] * t.ne[1] * t.ne[2] * t.ne[3];
     return switch (t.type) {
         .f32 => n * 4,
-        .f16, .bf16 => n * 2,
+        .bf16 => n * 2,
         // Native quant types: copy GGUF bytes verbatim to the GPU buffer.
-        .q4_0, .q8_0, .q4_1, .q4_k, .q6_k => t.size(),
+        .q4_0, .q8_0, .q4_1, .q4_k, .q6_k, .f16 => t.size(),
     };
 }
 
@@ -924,10 +1158,6 @@ fn validateModelLayout(ctx: *gguf.GGUFContext) !void {
     const required = [_][]const u8{
         "token_embd.weight",
         "blk.0.attn_norm.weight",
-        "blk.0.attn_q.weight",
-        "blk.0.attn_k.weight",
-        "blk.0.attn_v.weight",
-        "blk.0.attn_output.weight",
         "output_norm.weight",
     };
     for (required) |name| {
@@ -977,4 +1207,22 @@ fn loadEmbeddingCached(
     try loadEmbeddingFromTransposedCache(cache, embd, tid, n_embd, dst, scale);
     vk_ctx.vkd.unmapMemory(vk_ctx.device, staging.memory);
     try vk_ctx.copyBufferOffset(staging.*, 0, scratch.*, graph.tensors.get("input").?.offset, model.f32Bytes(n_embd));
+}
+
+fn uploadBufferChunked(
+    vk_ctx: *vulkan.Context,
+    staging: vulkan.Buffer,
+    dst: vulkan.Buffer,
+    data: []const u8,
+    chunk_size_cap: u64,
+) !void {
+    var uploaded: u64 = 0;
+    while (uploaded < data.len) {
+        const chunk_size = @min(data.len - uploaded, chunk_size_cap);
+        const mapped = try vk_ctx.vkd.mapMemory(vk_ctx.device, staging.memory, 0, chunk_size, .{});
+        @memcpy(@as([*]u8, @ptrCast(mapped))[0..chunk_size], data[uploaded .. uploaded + chunk_size]);
+        vk_ctx.vkd.unmapMemory(vk_ctx.device, staging.memory);
+        try vk_ctx.copyBufferOffset(staging, 0, dst, uploaded, chunk_size);
+        uploaded += chunk_size;
+    }
 }

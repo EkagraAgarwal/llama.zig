@@ -25,7 +25,7 @@ layout(local_size_x = 64) in;
 // L2-normalize each row independently: out = x / sqrt(sum(x^2) + eps).
 // Single-thread reduction per row (row_width <= 256 typically).
 void main() {
-    uint row = gl_GlobalInvocationID.x;
+    uint row = gl_WorkGroupID.x;
     if (row >= pc.n_rows) return;
     uint row_width = pc.row_width;
     float eps = uintBitsToFloat(pc.eps_bits);

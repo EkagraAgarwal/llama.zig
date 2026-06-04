@@ -332,7 +332,8 @@ pub const GraphBuilder = struct {
         // the architecture is correct).
         var qkv_buf: [64]u8 = undefined;
         const qkv_name = std.fmt.bufPrint(&qkv_buf, "{s}.attn_qkv.weight", .{layer_prefix}) catch return .synthetic;
-        if (self.hasTensor(qkv_name)) {
+        const qw_name = std.fmt.bufPrint(&qkv_buf, "{s}.attn_q.weight", .{layer_prefix}) catch return .synthetic;
+        if (self.hasTensor(qkv_name) or self.hasTensor(qw_name)) {
             var gate_buf: [64]u8 = undefined;
             const gate_name = std.fmt.bufPrint(&gate_buf, "{s}.attn_gate.weight", .{layer_prefix}) catch return .synthetic;
             if (self.hasTensor(gate_name)) return .fused_gate;
@@ -808,24 +809,124 @@ pub const GraphBuilder = struct {
         const q_n_heads = q_out / q_head_dim;
         const k_n_heads = kv_out / k_head_dim;
         // Push-constant layout for rope_multi:
-        //   p1=n_heads, p2=head_dim, p3=pos, p4=rope_theta, p5=byte_offset, p6=unused, p7=sec0, p8=sec1
-        //   (the dispatcher puts sec2/sec3 into a second set of push constants
-        //   not used here — see shader contract; for simplicity we encode all
-        //   four sections in p5..p8 plus two extra in a placeholder node.)
-        try self.addNodeP8(.rope_multi, &.{q}, q, (q_out + 63) / 64, 1, q_n_heads, q_head_dim, pos, rope_bits, q_offset, 0, sec[0], sec[1]);
-        try self.addNodeP8(.rope_multi, &.{k}, k, (kv_out + 63) / 64, 1, k_n_heads, k_head_dim, pos, rope_bits, k_offset, 0, sec[0], sec[1]);
+        //   p1=n_heads, p2=head_dim, p3=pos, p4=rope_theta, p5=byte_offset, p6=sec0, p7=sec1, p8=sec2
+        try self.addNodeP8(.rope_multi, &.{q}, q, (q_out + 63) / 64, 1, q_n_heads, q_head_dim, pos, rope_bits, q_offset, sec[0], sec[1], sec[2]);
+        try self.addNodeP8(.rope_multi, &.{k}, k, (kv_out + 63) / 64, 1, k_n_heads, k_head_dim, pos, rope_bits, k_offset, sec[0], sec[1], sec[2]);
     }
 
-    pub fn finalize(self: *GraphBuilder) void {
-        var it = self.graph.tensors.iterator();
-        var off: u64 = 0;
-        while (it.next()) |entry| {
-            if (entry.value_ptr.role == .activation or entry.value_ptr.role == .input or entry.value_ptr.role == .output) {
-                entry.value_ptr.offset = off;
-                off += (entry.value_ptr.size + 255) & ~@as(u64, 255);
+    pub fn finalize(self: *GraphBuilder) !void {
+        const allocator = self.graph.allocator;
+        var first_use = std.StringHashMap(usize).init(allocator);
+        defer first_use.deinit();
+        var last_use = std.StringHashMap(usize).init(allocator);
+        defer last_use.deinit();
+
+        // Pass 1: Identify lifetimes of activations, inputs, and outputs.
+        var t_it = self.graph.tensors.iterator();
+        while (t_it.next()) |entry| {
+            const t = entry.value_ptr;
+            if (t.role == .input) {
+                try first_use.put(entry.key_ptr.*, 0);
+                try last_use.put(entry.key_ptr.*, 0);
             }
         }
-        self.graph.scratchpad_size = off;
+
+        for (self.graph.nodes.items, 0..) |node, i| {
+            if (!first_use.contains(node.output_name)) {
+                try first_use.put(node.output_name, i);
+            }
+            try last_use.put(node.output_name, i);
+
+            for (node.input_names) |in_name| {
+                try last_use.put(in_name, i);
+            }
+        }
+
+        // Tensors with role .output must persist until the end of the graph execution.
+        t_it = self.graph.tensors.iterator();
+        while (t_it.next()) |entry| {
+            if (entry.value_ptr.role == .output) {
+                try last_use.put(entry.key_ptr.*, self.graph.nodes.items.len);
+            }
+        }
+
+        // Pass 2: Greedy block allocation based on non-overlapping lifetimes.
+        var to_alloc: std.ArrayListUnmanaged(*GraphTensor) = .empty;
+        defer to_alloc.deinit(allocator);
+        t_it = self.graph.tensors.iterator();
+        while (t_it.next()) |entry| {
+            const t = entry.value_ptr;
+            if (t.role == .activation or t.role == .input or t.role == .output) {
+                try to_alloc.append(allocator, t);
+            }
+        }
+
+        const SortContext = struct {
+            first_use: *std.StringHashMap(usize),
+            pub fn lessThan(ctx: @This(), a: *GraphTensor, b: *GraphTensor) bool {
+                const fa = ctx.first_use.get(a.name) orelse 0;
+                const fb = ctx.first_use.get(b.name) orelse 0;
+                if (fa != fb) return fa < fb;
+                return a.size > b.size; // Larger first for better packing
+            }
+        };
+        std.sort.heap(*GraphTensor, to_alloc.items, SortContext{ .first_use = &first_use }, SortContext.lessThan);
+
+        var free_blocks: std.ArrayListUnmanaged(struct { offset: u64, size: u64 }) = .empty;
+        defer free_blocks.deinit(allocator);
+
+        var current_high_water: u64 = 0;
+        var live: std.ArrayListUnmanaged(*GraphTensor) = .empty;
+        defer live.deinit(allocator);
+
+        for (to_alloc.items) |t| {
+            const t_start = first_use.get(t.name) orelse 0;
+
+            // Retire tensors that are no longer used by the time this tensor is born.
+            var j: usize = 0;
+            while (j < live.items.len) {
+                const lt = live.items[j];
+                const lt_end = last_use.get(lt.name) orelse 0;
+                if (lt_end < t_start) {
+                    try free_blocks.append(allocator, .{ .offset = lt.offset, .size = (lt.size + 255) & ~@as(u64, 255) });
+                    _ = live.swapRemove(j);
+                } else {
+                    j += 1;
+                }
+            }
+
+            const aligned_size = (t.size + 255) & ~@as(u64, 255);
+            var best_idx: ?usize = null;
+            var min_waste: u64 = std.math.maxInt(u64);
+            for (free_blocks.items, 0..) |block, idx| {
+                if (block.size >= aligned_size) {
+                    const waste = block.size - aligned_size;
+                    if (waste < min_waste) {
+                        min_waste = waste;
+                        best_idx = idx;
+                    }
+                }
+            }
+
+            if (best_idx) |idx| {
+                const block = free_blocks.swapRemove(idx);
+                t.offset = block.offset;
+                if (block.size > aligned_size) {
+                    try free_blocks.append(allocator, .{ .offset = block.offset + aligned_size, .size = block.size - aligned_size });
+                }
+            } else {
+                t.offset = current_high_water;
+                current_high_water += aligned_size;
+            }
+
+            try live.append(allocator, t);
+        }
+
+        var max_scratch: u64 = 0;
+        for (to_alloc.items) |t| {
+            max_scratch = @max(max_scratch, t.offset + ((t.size + 255) & ~@as(u64, 255)));
+        }
+        self.graph.scratchpad_size = max_scratch;
     }
 };
 
@@ -835,6 +936,10 @@ pub const Dispatcher = struct {
     registry: *vulkan.PipelineRegistry,
     scratchpad: vulkan.Buffer,
     kv_cache: vulkan.Buffer,
+    /// Host-visible staging buffer used by the per-token CPU SSM step.
+    /// Set by `setSsmStagingBuffer` before prefill/decode.
+    ssm_staging: ?vulkan.Buffer = null,
+    ssm_staging_size: u64 = 0,
     /// SSM conv1d rolling-window buffer (host-visible; CPU reads/writes
     /// per decode step). May be a zero-sized placeholder when not in use.
     ssm_conv_buf: vulkan.Buffer,
@@ -869,6 +974,13 @@ pub const Dispatcher = struct {
         };
         try self.ensureSubmitResources();
         return self;
+    }
+
+    /// Set the host-visible staging buffer used by the per-token CPU SSM
+    /// step. Call this once before prefill/decode.
+    pub fn setSsmStagingBuffer(self: *Dispatcher, staging: vulkan.Buffer, size: u64) void {
+        self.ssm_staging = staging;
+        self.ssm_staging_size = size;
     }
 
     pub fn deinit(self: *Dispatcher) void {
@@ -1004,13 +1116,13 @@ pub const Dispatcher = struct {
 
     fn quantPipelineName(qtype: u32, is_matvec: bool) []const u8 {
         if (qtype == q4_0_f16_fallback_qtype) {
-            return if (is_matvec) "matvec_f16" else "matmul_f16";
+            return "matmul_f16";
         }
         const qt: tensor.Type = @enumFromInt(qtype);
         return if (is_matvec)
-            switch (qt) { .q4_0 => "matvec_q4_0", .q4_1 => "matvec_q4_1", .q4_k => "matvec_q4_k", .q6_k => "matvec_q6_k", else => "matvec_q8_0" }
+            switch (qt) { .q4_0 => "matvec_q4_0", .q4_1 => "matvec_q4_1", .q4_k => "matvec_q4_k", .q6_k => "matvec_q6_k", .f16 => "matvec_f16", else => "matvec_q8_0" }
         else
-            switch (qt) { .q4_0 => "matmul_q4_0", .q4_1 => "matmul_q4_1", .q4_k => "matmul_q4_k", .q6_k => "matmul_q6_k", else => "matmul_q8_0" };
+            switch (qt) { .q4_0 => "matmul_q4_0", .q4_1 => "matmul_q4_1", .q4_k => "matmul_q4_k", .q6_k => "matmul_q6_k", .f16 => "matmul_f16", else => "matmul_q8_0" };
     }
 
     fn dispatchNode(self: *Dispatcher, cmd: vk.CommandBuffer, node: GraphNode, pos: u32) void {
@@ -1106,7 +1218,7 @@ pub const Dispatcher = struct {
 
         var dx = node.dispatch_x;
         var dy = node.dispatch_y;
-        if (node.op_type == .matmul_q and node.p1 <= 1) {
+        if (node.op_type == .matmul_q and node.p1 <= 1 and !std.mem.eql(u8, pipe_name, "matmul_f16")) {
             dx = (node.p2 + 7) / 8;
             dy = 1;
         }
@@ -1166,7 +1278,6 @@ pub const Dispatcher = struct {
                 self.emitComputeBarrier(cmd);
                 last_barrier_idx = i;
             }
-
             self.dispatchNode(cmd, node, pos);
         }
     }
@@ -1191,12 +1302,8 @@ pub const Dispatcher = struct {
     pub fn executePrefillBatch(self: *Dispatcher, pos_start: u32, n_tokens: u32, input_batch: vulkan.Buffer, input_stride: u64) !void {
         const input_tensor = self.graph.tensors.get("input") orelse return error.MissingInputTensor;
         try self.ensureSubmitResources();
-        const reset_flags = if ((self.submit_count & 63) == 63)
-            vk.CommandBufferResetFlags{ .release_resources_bit = true }
-        else
-            vk.CommandBufferResetFlags{};
-        _ = self.ctx.vkd.dispatch.vkResetCommandBuffer.?(self.cmd, reset_flags);
-        _ = self.ctx.vkd.dispatch.vkBeginCommandBuffer.?(self.cmd, &.{ .flags = .{ .one_time_submit_bit = true }, .p_inheritance_info = null });
+
+        const use_cpu_ssm = self.ssm_staging != null and self.cfg.ssm_d_inner > 0;
 
         var i: u32 = 0;
         while (i < n_tokens) : (i += 1) {
@@ -1205,6 +1312,9 @@ pub const Dispatcher = struct {
                 .dst_offset = input_tensor.offset,
                 .size = input_stride,
             };
+
+            _ = self.ctx.vkd.dispatch.vkResetCommandBuffer.?(self.cmd, .{});
+            _ = self.ctx.vkd.dispatch.vkBeginCommandBuffer.?(self.cmd, &.{ .flags = .{ .one_time_submit_bit = true } });
             self.ctx.vkd.dispatch.vkCmdCopyBuffer.?(self.cmd, input_batch.buffer, self.scratchpad.buffer, 1, (&copy_region)[0..1]);
             const copy_barrier = vk.MemoryBarrier{
                 .src_access_mask = .{ .transfer_write_bit = true },
@@ -1222,11 +1332,151 @@ pub const Dispatcher = struct {
                 0,
                 null,
             );
-            self.recordGraph(self.cmd, pos_start + i);
+
+            const nodes = self.graph.nodes.items;
+            var last_barrier_idx: usize = 0;
+            for (nodes, 0..) |node, idx| {
+                var need_barrier = false;
+                if (idx > 0) {
+                    var j = idx - 1;
+                    while (true) {
+                        if (hasDependency(node, nodes[j])) {
+                            need_barrier = true;
+                            break;
+                        }
+                        if (j == last_barrier_idx) break;
+                        j -= 1;
+                    }
+                }
+                if (need_barrier) {
+                    self.emitComputeBarrier(self.cmd);
+                    last_barrier_idx = idx;
+                }
+
+                if (use_cpu_ssm and node.op_type == .ssm_delta_net_decode) {
+                    // End the current command buffer, submit, wait, then run
+                    // the CPU SSM step for this layer. The next command
+                    // buffer (for the rest of the graph) will see the CPU
+                    // output as if it came from a transfer write.
+                    _ = self.ctx.vkd.dispatch.vkEndCommandBuffer.?(self.cmd);
+                    try self.submitAndWait(self.cmd);
+                    try self.runSsmCpuStep(pos_start + i, node);
+
+                    _ = self.ctx.vkd.dispatch.vkResetCommandBuffer.?(self.cmd, .{});
+                    _ = self.ctx.vkd.dispatch.vkBeginCommandBuffer.?(self.cmd, &.{ .flags = .{ .one_time_submit_bit = true } });
+                    // Barrier: transfer_write (from CPU copy) -> shader_read
+                    // for the next GPU segment.
+                    self.ctx.vkd.dispatch.vkCmdPipelineBarrier.?(
+                        self.cmd,
+                        .{ .transfer_bit = true },
+                        .{ .compute_shader_bit = true },
+                        .{},
+                        1,
+                        (&copy_barrier)[0..1],
+                        0,
+                        null,
+                        0,
+                        null,
+                    );
+                    last_barrier_idx = 0; // reset for fresh command buffer
+                } else {
+                    self.dispatchNode(self.cmd, node, pos_start + i);
+                }
+            }
+            _ = self.ctx.vkd.dispatch.vkEndCommandBuffer.?(self.cmd);
+            try self.submitAndWait(self.cmd);
+        }
+    }
+
+    /// Run the CPU-side Gated Delta Net step for a single ssm_delta_net_decode
+    /// node during prefill. Reads Q/K/V/gate/beta from the scratchpad, calls
+    /// the CPU recurrence, and writes the `core` output back to the scratchpad.
+    fn runSsmCpuStep(self: *Dispatcher, pos: u32, node: GraphNode) !void {
+        _ = pos;
+        const staging = self.ssm_staging orelse return;
+        const staging_size = self.ssm_staging_size;
+
+        // Output name is "blk.{layer}.core"; parse the layer index.
+        var layer: u32 = 0;
+        const prefix = "blk.";
+        const suffix = ".core";
+        if (std.mem.startsWith(u8, node.output_name, prefix)) {
+            const rest = node.output_name[prefix.len..];
+            if (std.mem.endsWith(u8, rest, suffix)) {
+                const mid = rest[0 .. rest.len - suffix.len];
+                layer = std.fmt.parseInt(u32, mid, 10) catch return;
+            }
         }
 
-        _ = self.ctx.vkd.dispatch.vkEndCommandBuffer.?(self.cmd);
-        try self.submitAndWait(self.cmd);
+        const head_v_dim: u32 = if (self.cfg.ssm_dt_rank > 0) self.cfg.ssm_d_inner / self.cfg.ssm_dt_rank else return;
+
+        const conv_bytes: u64 = @as(u64, self.cfg.ssm_d_inner + 2 * self.cfg.ssm_n_group * self.cfg.ssm_d_state) *
+            @as(u64, (if (self.cfg.ssm_d_conv > 0) self.cfg.ssm_d_conv else 4) - 1);
+        const rec_bytes: u64 = @as(u64, head_v_dim) * @as(u64, head_v_dim) * @as(u64, self.cfg.ssm_dt_rank);
+        const n_main: u32 = self.cfg.n_layer -| self.cfg.nextn_predict_layers;
+        const mapped_conv = try self.ctx.vkd.mapMemory(self.ctx.device, self.ssm_conv_buf.memory, 0, conv_bytes * n_main, .{});
+        const mapped_state = try self.ctx.vkd.mapMemory(self.ctx.device, self.ssm_state_buf.memory, 0, rec_bytes * n_main, .{});
+        defer {
+            self.ctx.vkd.unmapMemory(self.ctx.device, self.ssm_conv_buf.memory);
+            self.ctx.vkd.unmapMemory(self.ctx.device, self.ssm_state_buf.memory);
+        }
+        const conv_f32 = @as([*]f32, @ptrCast(@alignCast(mapped_conv)))[0..@as(usize, conv_bytes) * @as(usize, n_main)];
+        const state_f32 = @as([*]f32, @ptrCast(@alignCast(mapped_state)))[0..@as(usize, rec_bytes) * @as(usize, n_main)];
+        var ssm_ctx = @import("ssm_state.zig").SsmCpuContext.wrap(self.cfg, conv_f32, state_f32);
+
+        var ln_buf: [32]u8 = undefined;
+        const ln = std.fmt.bufPrint(&ln_buf, "blk.{d}", .{layer}) catch return;
+        var name_buf: [32]u8 = undefined;
+        const qn_name = std.fmt.bufPrint(&name_buf, "{s}.q_norm", .{ln}) catch return;
+        @memset(name_buf[0..qn_name.len], 0);
+        const kn_name = std.fmt.bufPrint(&name_buf, "{s}.k_norm", .{ln}) catch return;
+        @memset(name_buf[0..kn_name.len], 0);
+        const vn_name = std.fmt.bufPrint(&name_buf, "{s}.v_conv", .{ln}) catch return;
+        @memset(name_buf[0..vn_name.len], 0);
+        const gate_name = std.fmt.bufPrint(&name_buf, "{s}.gate", .{ln}) catch return;
+        @memset(name_buf[0..gate_name.len], 0);
+        const beta_name = std.fmt.bufPrint(&name_buf, "{s}.beta", .{ln}) catch return;
+        @memset(name_buf[0..beta_name.len], 0);
+        const core_name = std.fmt.bufPrint(&name_buf, "{s}.core", .{ln}) catch return;
+
+        const qn_t = self.graph.tensors.get(qn_name) orelse return;
+        const kn_t = self.graph.tensors.get(kn_name) orelse return;
+        const vn_t = self.graph.tensors.get(vn_name) orelse return;
+        const gate_t = self.graph.tensors.get(gate_name) orelse return;
+        const beta_t = self.graph.tensors.get(beta_name) orelse return;
+        const core_t = self.graph.tensors.get(core_name) orelse return;
+
+        const total_input: u64 = qn_t.size + kn_t.size + vn_t.size + gate_t.size + beta_t.size;
+        const q_off: u64 = 0;
+        const k_off: u64 = qn_t.size;
+        const v_off: u64 = k_off + kn_t.size;
+        const g_off: u64 = v_off + vn_t.size;
+        const b_off: u64 = g_off + gate_t.size;
+        const core_off: u64 = staging_size - core_t.size;
+        if (core_off < total_input) return; // No room to avoid aliasing.
+
+        try self.ctx.copyBufferOffset(self.scratchpad, qn_t.offset, staging, q_off, qn_t.size);
+        try self.ctx.copyBufferOffset(self.scratchpad, kn_t.offset, staging, k_off, kn_t.size);
+        try self.ctx.copyBufferOffset(self.scratchpad, vn_t.offset, staging, v_off, vn_t.size);
+        try self.ctx.copyBufferOffset(self.scratchpad, gate_t.offset, staging, g_off, gate_t.size);
+        try self.ctx.copyBufferOffset(self.scratchpad, beta_t.offset, staging, b_off, beta_t.size);
+
+        const mapped_ssm = try self.ctx.vkd.mapMemory(self.ctx.device, staging.memory, 0, staging_size, .{});
+        defer self.ctx.vkd.unmapMemory(self.ctx.device, staging.memory);
+
+        const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_v_dim)));
+        try ssm_ctx.stepDeltaNet(
+            layer,
+            @as([*]f32, @ptrCast(@alignCast(mapped_ssm)))[q_off / 4 ..][0 .. @as(usize, qn_t.size) / 4],
+            @as([*]f32, @ptrCast(@alignCast(mapped_ssm)))[k_off / 4 ..][0 .. @as(usize, kn_t.size) / 4],
+            @as([*]f32, @ptrCast(@alignCast(mapped_ssm)))[v_off / 4 ..][0 .. @as(usize, vn_t.size) / 4],
+            @as([*]f32, @ptrCast(@alignCast(mapped_ssm)))[g_off / 4 ..][0 .. @as(usize, gate_t.size) / 4],
+            @as([*]f32, @ptrCast(@alignCast(mapped_ssm)))[b_off / 4 ..][0 .. @as(usize, beta_t.size) / 4],
+            @as([*]f32, @ptrCast(@alignCast(mapped_ssm)))[core_off / 4 ..][0 .. @as(usize, core_t.size) / 4],
+            scale,
+        );
+
+        try self.ctx.copyBufferOffset(staging, core_off, self.scratchpad, core_t.offset, core_t.size);
     }
 
     pub fn executeGetRowsQ(
@@ -1375,7 +1625,7 @@ test "quantized kernel selection is architecture independent" {
     const t = std.testing;
     try t.expectEqualStrings("matvec_q8_0", Dispatcher.quantPipelineName(@intFromEnum(tensor.Type.q8_0), true));
     try t.expectEqualStrings("matmul_q8_0", Dispatcher.quantPipelineName(@intFromEnum(tensor.Type.q8_0), false));
-    try t.expectEqualStrings("matvec_f16", Dispatcher.quantPipelineName(q4_0_f16_fallback_qtype, true));
+    try t.expectEqualStrings("matmul_f16", Dispatcher.quantPipelineName(q4_0_f16_fallback_qtype, true));
     try t.expectEqualStrings("matmul_f16", Dispatcher.quantPipelineName(q4_0_f16_fallback_qtype, false));
 }
 
@@ -1514,6 +1764,10 @@ test "resolveSsmQkvLayout picks fused_gate when both weights present" {
     const qkv = try tensor.Tensor.init(allocator, "blk.0.attn_qkv.weight", .q4_k, &.{ 256, 2560 });
     defer qkv.deinit(allocator);
     try tensors.put("blk.0.attn_qkv.weight", qkv);
+
+    const gate = try tensor.Tensor.init(allocator, "blk.0.attn_gate.weight", .q4_k, &.{ 256, 2560 });
+    defer gate.deinit(allocator);
+    try tensors.put("blk.0.attn_gate.weight", gate);
 
     const cfg = model.ModelConfig{
         .arch = .qwen35, .arch_prefix = "qwen35", .activation = .silu,

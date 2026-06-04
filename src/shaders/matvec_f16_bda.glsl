@@ -21,26 +21,26 @@ layout(push_constant) uniform PC {
 
 layout(local_size_x = 256) in;
 
-uint getByte(UIntBuffer buf, uint idx) {
-    uint w = buf.data[idx >> 2];
-    return (w >> ((idx & 3u) * 8u)) & 0xFFu;
-}
-
-uint getU16(UIntBuffer buf, uint idx) {
-    return getByte(buf, idx) | (getByte(buf, idx + 1u) << 8u);
-}
-
 float f16At(uint row, uint kidx) {
-    uint base = (row * pc.k + kidx) * 2u;
-    return unpackHalf2x16(getU16(pc.b, base)).x;
+    uint element_idx = row * pc.k + kidx;
+    uint w = pc.b.data[element_idx >> 1];
+    uint val = (element_idx & 1u) == 0u ? (w & 0xFFFFu) : (w >> 16u);
+    return unpackHalf2x16(val).x;
 }
 
 void main() {
     uint col = gl_GlobalInvocationID.x;
     if (col >= pc.n) return;
+
     float sum = 0.0;
-    for (uint i = 0u; i < pc.k; i += 1u) {
-        sum += pc.a.data[i] * f16At(col, i);
+    uint nblocks = (pc.k + 31u) / 32u;
+    for (uint bi = 0u; bi < nblocks; ++bi) {
+        uint k0 = bi * 32u;
+        for (uint i = 0u; i < 32u; ++i) {
+            if (k0 + i < pc.k) {
+                sum += pc.a.data[k0 + i] * f16At(col, k0 + i);
+            }
+        }
     }
     pc.c.data[col] = sum;
 }

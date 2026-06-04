@@ -23,24 +23,17 @@ layout(local_size_x = 16, local_size_y = 16) in;
 shared float a_tile[16][16];
 shared float b_tile[16][16];
 
-uint getByte(UIntBuffer buf, uint idx) {
-    uint w = buf.data[idx >> 2];
-    return (w >> ((idx & 3u) * 8u)) & 0xFFu;
-}
-
-uint getU16(UIntBuffer buf, uint idx) {
-    return getByte(buf, idx) | (getByte(buf, idx + 1u) << 8u);
-}
-
 float f16Weight(uint row, uint kidx) {
-    uint base = (row * pc.k + kidx) * 2u;
-    return unpackHalf2x16(getU16(pc.b, base)).x;
+    uint element_idx = row * pc.k + kidx;
+    uint w = pc.b.data[element_idx >> 1];
+    uint val = (element_idx & 1u) == 0u ? (w & 0xFFFFu) : (w >> 16u);
+    return unpackHalf2x16(val).x;
 }
 
 void main() {
     uint row = gl_GlobalInvocationID.y;
     uint col = gl_GlobalInvocationID.x;
-    if (row >= pc.m || col >= pc.n) return;
+
     uint lx = gl_LocalInvocationID.x;
     uint ly = gl_LocalInvocationID.y;
     float sum = 0.0;
@@ -56,5 +49,8 @@ void main() {
         }
         barrier();
     }
-    pc.c.data[row * pc.n + col] = sum;
+
+    if (row < pc.m && col < pc.n) {
+        pc.c.data[row * pc.n + col] = sum;
+    }
 }

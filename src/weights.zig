@@ -83,6 +83,45 @@ pub fn dequantToF32(ctx: *gguf.GGUFContext, t: *tensor.Tensor, dst: []f32) !void
     }
 }
 
+pub fn dequantToF16(ctx: *gguf.GGUFContext, t: *tensor.Tensor, dst: []u16) !void {
+    const n = t.ne[0] * t.ne[1] * t.ne[2] * t.ne[3];
+    if (dst.len < n) return error.BufferTooSmall;
+
+    if (t.type == .f16) {
+        if (ctx.mmap_file) |_| {
+            const raw = try ctx.getTensorSlice(t);
+            @memcpy(std.mem.sliceAsBytes(dst[0..n]), raw[0 .. n * 2]);
+        } else {
+            var raw = try ctx.allocator.alloc(u8, t.size());
+            defer ctx.allocator.free(raw);
+            try ctx.readTensorData(t, raw);
+            @memcpy(std.mem.sliceAsBytes(dst[0..n]), raw[0 .. n * 2]);
+        }
+    } else if (t.type == .bf16) {
+        if (ctx.mmap_file) |_| {
+            const raw = try ctx.getTensorSlice(t);
+            const src = std.mem.bytesAsSlice(u16, raw[0 .. n * 2]);
+            for (src, 0..) |bits, i| {
+                const f32_val = bf16ToF32(bits);
+                const f16_val: f16 = @floatCast(f32_val);
+                dst[i] = @bitCast(f16_val);
+            }
+        } else {
+            var raw = try ctx.allocator.alloc(u8, t.size());
+            defer ctx.allocator.free(raw);
+            try ctx.readTensorData(t, raw);
+            const src = std.mem.bytesAsSlice(u16, raw[0 .. n * 2]);
+            for (src, 0..) |bits, i| {
+                const f32_val = bf16ToF32(bits);
+                const f16_val: f16 = @floatCast(f32_val);
+                dst[i] = @bitCast(f16_val);
+            }
+        }
+    } else {
+        return error.UnsupportedQuantType;
+    }
+}
+
 fn dequantQ80(ctx: *gguf.GGUFContext, t: *tensor.Tensor, dst: []f32) !void {
     const raw = try ctx.allocator.alloc(u8, t.size());
     defer ctx.allocator.free(raw);
