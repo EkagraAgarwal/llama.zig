@@ -7,6 +7,7 @@ pub const Type = enum(u32) {
     q4_1 = 3,
     q8_0 = 8,
     q4_k = 12,
+    q5_k = 13,
     q6_k = 14,
     bf16 = 30,
 
@@ -14,14 +15,14 @@ pub const Type = enum(u32) {
         return switch (self) {
             .f32 => 4,
             .f16, .bf16 => 2,
-            .q4_0, .q4_1, .q4_k, .q8_0, .q6_k => 1,
+            .q4_0, .q4_1, .q4_k, .q5_k, .q8_0, .q6_k => 1,
         };
     }
 
     pub fn blockSize(self: Type) usize {
         return switch (self) {
             .q4_0, .q4_1, .q8_0 => 32,
-            .q4_k, .q6_k => 256,
+            .q4_k, .q5_k, .q6_k => 256,
             else => 1,
         };
     }
@@ -34,6 +35,7 @@ pub const Type = enum(u32) {
             .q4_0 => 18,
             .q4_1 => 20,
             .q4_k => 144,
+            .q5_k => 176,
             .q6_k => 210,
         };
     }

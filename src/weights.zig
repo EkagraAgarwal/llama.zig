@@ -41,6 +41,7 @@ pub fn dequantToF32FromSlice(raw: []const u8, t: *tensor.Tensor, dst: []f32) !vo
         .q4_0 => dequantQ40Raw(raw, dst[0..n]),
         .q4_1 => dequantQ41Raw(raw, dst[0..n]),
         .q4_k => dequantQ4KRaw(raw, dst[0..n]),
+        .q5_k => dequantQ5KRaw(raw, dst[0..n]),
         .q6_k => dequantQ6KRaw(raw, dst[0..n]),
     }
 }
@@ -78,6 +79,7 @@ pub fn dequantToF32(ctx: *gguf.GGUFContext, t: *tensor.Tensor, dst: []f32) !void
             .q4_0 => try dequantQ40(ctx, t, dst[0..n]),
             .q4_1 => try dequantQ41(ctx, t, dst[0..n]),
             .q4_k => try dequantQ4K(ctx, t, dst[0..n]),
+            .q5_k => try dequantQ5K(ctx, t, dst[0..n]),
             .q6_k => try dequantQ6K(ctx, t, dst[0..n]),
         }
     }
@@ -150,11 +152,60 @@ fn dequantQ6K(ctx: *gguf.GGUFContext, t: *tensor.Tensor, dst: []f32) !void {
     dequantQ6KRaw(raw, dst);
 }
 
+fn dequantQ5K(ctx: *gguf.GGUFContext, t: *tensor.Tensor, dst: []f32) !void {
+    const raw = try ctx.allocator.alloc(u8, t.size());
+    defer ctx.allocator.free(raw);
+    try ctx.readTensorData(t, raw);
+    dequantQ5KRaw(raw, dst);
+}
+
 fn dequantQ4K(ctx: *gguf.GGUFContext, t: *tensor.Tensor, dst: []f32) !void {
     const raw = try ctx.allocator.alloc(u8, t.size());
     defer ctx.allocator.free(raw);
     try ctx.readTensorData(t, raw);
     dequantQ4KRaw(raw, dst);
+}
+
+fn dequantQ5KRaw(raw: []const u8, dst: []f32) void {
+    const BS: usize = 176;
+    var out: usize = 0;
+    var ib: usize = 0;
+    while (out < dst.len and ib + BS <= raw.len) {
+        const d = f16ToF32(std.mem.readInt(u16, raw[ib..][0..2], .little));
+        const dmin = f16ToF32(std.mem.readInt(u16, raw[ib + 2 ..][0..2], .little));
+        const scales = raw[ib + 4 .. ib + 16];
+        const qh = raw[ib + 16 .. ib + 48];
+        const ql = raw[ib + 48 .. ib + 176];
+
+        var ql_off: usize = 0;
+        var is: usize = 0;
+        var j: usize = 0;
+        while (j < 256 and out < dst.len) : (j += 64) {
+            var i: usize = 0;
+            while (i < 2) : (i += 1) {
+                const idx = is + i;
+                const sc_raw: u8 = if (idx < 4) scales[idx] & 0x3f else (scales[idx + 4] & 0xF) | ((scales[idx - 4] >> 6) << 4);
+                const mn_raw: u8 = if (idx < 4) scales[idx + 4] & 0x3f else (scales[idx + 4] >> 4) | ((scales[idx] >> 6) << 4);
+                const sc_val = d * @as(f32, @floatFromInt(sc_raw));
+                const mn_val = dmin * @as(f32, @floatFromInt(mn_raw));
+                const qh_bit_pos: u3 = @intCast((j / 64) * 2 + i);
+                const qb_shift: u3 = if (i == 0) @as(u3, 0) else @as(u3, 4);
+
+                var l: usize = 0;
+                while (l < 32) : (l += 1) {
+                    if (out >= dst.len) break;
+                    const qb = (ql[ql_off + l] >> qb_shift) & 0xF;
+                    const qh_bit = (qh[l] >> qh_bit_pos) & 1;
+                    const raw5: u32 = qb | (@as(u32, qh_bit) << 4);
+                    dst[out] = sc_val * @as(f32, @floatFromInt(raw5)) - mn_val;
+                    out += 1;
+                }
+            }
+            ql_off += 32;
+            is += 2;
+        }
+        ib += BS;
+    }
 }
 
 fn dequantQ4KRaw(raw: []const u8, dst: []f32) void {

@@ -177,11 +177,16 @@ pub fn loadModel(allocator: std.mem.Allocator, path: []const u8) !GGUFContext {
             3 => .q4_1,
             8 => .q8_0,
             12 => .q4_k,
+            13 => .q5_k,
             14 => .q6_k,
             30 => .bf16,
             else => {
+                // Unknown type — store with a sentinel type so callers can detect and
+                // decide how to handle it (skip vs error). The tensor is NOT silently dropped.
+                const raw_type = tensor_type_int;
+                _ = raw_type;
                 allocator.free(name);
-                continue;
+                return error.UnsupportedTensorType;
             },
         };
 

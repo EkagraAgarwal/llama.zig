@@ -324,15 +324,10 @@ pub const GraphBuilder = struct {
     };
 
     pub fn resolveSsmQkvLayout(self: *GraphBuilder, layer_prefix: []const u8) SsmQkvzLayout {
-        // The fused_gate path requires BOTH `attn_qkv.weight` (Q+K+V) and
-        // `attn_gate.weight` (Z). Some Qwen 3.5 GGUFs (notably the unsloth
-        // Q4_K_M ones) ship the gate but are missing the QKV — we must
-        // fall through to synthetic in that case so the graph still
-        // compiles (with a zero QKV; the model will produce garbage but
-        // the architecture is correct).
         var qkv_buf: [64]u8 = undefined;
         const qkv_name = std.fmt.bufPrint(&qkv_buf, "{s}.attn_qkv.weight", .{layer_prefix}) catch return .synthetic;
-        const qw_name = std.fmt.bufPrint(&qkv_buf, "{s}.attn_q.weight", .{layer_prefix}) catch return .synthetic;
+        var qw_buf: [64]u8 = undefined;
+        const qw_name = std.fmt.bufPrint(&qw_buf, "{s}.attn_q.weight", .{layer_prefix}) catch return .synthetic;
         if (self.hasTensor(qkv_name) or self.hasTensor(qw_name)) {
             var gate_buf: [64]u8 = undefined;
             const gate_name = std.fmt.bufPrint(&gate_buf, "{s}.attn_gate.weight", .{layer_prefix}) catch return .synthetic;
@@ -951,6 +946,8 @@ pub const Dispatcher = struct {
     flash_attn_threshold: u32 = 1,
     submit_count: u32 = 0,
     reported_graph: bool = false,
+    trace_dispatch: bool = false,
+    check_nans: bool = false,
 
     pub fn init(
         graph: *Graph,
@@ -1079,6 +1076,7 @@ pub const Dispatcher = struct {
                     .q4_0 => "get_rows_q4_0",
                     .q4_1 => "get_rows_q4_1",
                     .q4_k => "get_rows_q4_k",
+                    .q5_k => "get_rows_q5_k",
                     .q6_k => "get_rows_q6_k",
                     else => "get_rows_q",
                 };
@@ -1120,9 +1118,9 @@ pub const Dispatcher = struct {
         }
         const qt: tensor.Type = @enumFromInt(qtype);
         return if (is_matvec)
-            switch (qt) { .q4_0 => "matvec_q4_0", .q4_1 => "matvec_q4_1", .q4_k => "matvec_q4_k", .q6_k => "matvec_q6_k", .f16 => "matvec_f16", else => "matvec_q8_0" }
+            switch (qt) { .q4_0 => "matvec_q4_0", .q4_1 => "matvec_q4_1", .q4_k => "matvec_q4_k", .q5_k => "matvec_q5_k", .q6_k => "matvec_q6_k", .f16 => "matvec_f16", else => "matvec_q8_0" }
         else
-            switch (qt) { .q4_0 => "matmul_q4_0", .q4_1 => "matmul_q4_1", .q4_k => "matmul_q4_k", .q6_k => "matmul_q6_k", .f16 => "matmul_f16", else => "matmul_q8_0" };
+            switch (qt) { .q4_0 => "matmul_q4_0", .q4_1 => "matmul_q4_1", .q4_k => "matmul_q4_k", .q5_k => "matmul_q5_k", .q6_k => "matmul_q6_k", .f16 => "matmul_f16", else => "matmul_q8_0" };
     }
 
     fn dispatchNode(self: *Dispatcher, cmd: vk.CommandBuffer, node: GraphNode, pos: u32) void {
@@ -1245,14 +1243,36 @@ pub const Dispatcher = struct {
         self.submit_count += 1;
     }
 
-    fn hasDependency(node1: GraphNode, node2: GraphNode) bool {
+    fn tensorsAlias(self: *const Dispatcher, name1: []const u8, name2: []const u8) bool {
+        if (std.mem.eql(u8, name1, name2)) return true;
+
+        const s1 = self.graph.slices.get(name1);
+        const s2 = self.graph.slices.get(name2);
+
+        const p1 = if (s1) |s| s.parent else name1;
+        const p2 = if (s2) |s| s.parent else name2;
+
+        if (std.mem.eql(u8, p1, p2)) {
+            const off1 = if (s1) |s| s.offset else 0;
+            const sz1 = if (s1) |s| s.size else (self.graph.tensors.get(name1) orelse return false).size;
+
+            const off2 = if (s2) |s| s.offset else 0;
+            const sz2 = if (s2) |s| s.size else (self.graph.tensors.get(name2) orelse return false).size;
+
+            return (off1 < off2 + sz2) and (off2 < off1 + sz1);
+        }
+
+        return false;
+    }
+
+    fn hasDependency(self: *const Dispatcher, node1: GraphNode, node2: GraphNode) bool {
         for (node1.input_names) |in_name| {
-            if (std.mem.eql(u8, in_name, node2.output_name)) return true;
+            if (self.tensorsAlias(in_name, node2.output_name)) return true;
         }
         for (node2.input_names) |in_name| {
-            if (std.mem.eql(u8, node1.output_name, in_name)) return true;
+            if (self.tensorsAlias(node1.output_name, in_name)) return true;
         }
-        if (std.mem.eql(u8, node1.output_name, node2.output_name)) return true;
+        if (self.tensorsAlias(node1.output_name, node2.output_name)) return true;
         return false;
     }
 
@@ -1265,7 +1285,7 @@ pub const Dispatcher = struct {
             if (i > 0) {
                 var j = i - 1;
                 while (true) {
-                    if (hasDependency(node, nodes[j])) {
+                    if (self.hasDependency(node, nodes[j])) {
                         need_barrier = true;
                         break;
                     }
@@ -1340,7 +1360,7 @@ pub const Dispatcher = struct {
                 if (idx > 0) {
                     var j = idx - 1;
                     while (true) {
-                        if (hasDependency(node, nodes[j])) {
+                        if (self.hasDependency(node, nodes[j])) {
                             need_barrier = true;
                             break;
                         }
@@ -1353,7 +1373,7 @@ pub const Dispatcher = struct {
                     last_barrier_idx = idx;
                 }
 
-                if (use_cpu_ssm and node.op_type == .ssm_delta_net_decode) {
+                if (false and use_cpu_ssm and node.op_type == .ssm_delta_net_decode) {
                     // End the current command buffer, submit, wait, then run
                     // the CPU SSM step for this layer. The next command
                     // buffer (for the rest of the graph) will see the CPU
