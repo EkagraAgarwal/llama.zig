@@ -226,7 +226,7 @@ pub const Context = struct {
         return self.transfer_cmd;
     }
 
-    pub fn copyBufferOffset(self: *Context, src: Buffer, src_off: u64, dst: Buffer, dst_off: u64, size: u64) !void {
+    pub fn clearBuffer(self: *Context, buffer: Buffer) !void {
         const cmd = try self.ensureTransferCmd();
         const reset_flags = if ((self.transfer_submit_count & 63) == 63)
             vk.CommandBufferResetFlags{ .release_resources_bit = true }
@@ -234,7 +234,24 @@ pub const Context = struct {
             vk.CommandBufferResetFlags{};
         _ = self.vkd.dispatch.vkResetCommandBuffer.?(cmd, reset_flags);
         _ = self.vkd.dispatch.vkBeginCommandBuffer.?(cmd, &.{ .flags = .{ .one_time_submit_bit = true }, .p_inheritance_info = null });
-        self.vkd.dispatch.vkCmdCopyBuffer.?(cmd, src.buffer, dst.buffer, 1, &[_]vk.BufferCopy{.{ .src_offset = src_off, .dst_offset = dst_off, .size = size }});
+        self.vkd.dispatch.vkCmdFillBuffer.?(cmd, buffer.buffer, 0, vk.WHOLE_SIZE, 0);
+        _ = self.vkd.dispatch.vkEndCommandBuffer.?(cmd);
+        const fence = try self.ensureTransferFence();
+        _ = self.vkd.dispatch.vkResetFences.?(self.device, 1, (&fence)[0..1]);
+        _ = self.vkd.dispatch.vkQueueSubmit.?(self.compute_queue, 1, &[_]vk.SubmitInfo{.{ .wait_semaphore_count = 0, .p_wait_semaphores = null, .p_wait_dst_stage_mask = null, .command_buffer_count = 1, .p_command_buffers = (&cmd)[0..1], .signal_semaphore_count = 0, .p_signal_semaphores = null }}, fence);
+        _ = self.vkd.dispatch.vkWaitForFences.?(self.device, 1, (&fence)[0..1], @enumFromInt(1), std.math.maxInt(u64));
+        self.transfer_submit_count += 1;
+    }
+
+    pub fn copyBufferOffset(self: *Context, src: Buffer, src_offset: u64, dst: Buffer, dst_offset: u64, size: u64) !void {
+        const cmd = try self.ensureTransferCmd();
+        const reset_flags = if ((self.transfer_submit_count & 63) == 63)
+            vk.CommandBufferResetFlags{ .release_resources_bit = true }
+        else
+            vk.CommandBufferResetFlags{};
+        _ = self.vkd.dispatch.vkResetCommandBuffer.?(cmd, reset_flags);
+        _ = self.vkd.dispatch.vkBeginCommandBuffer.?(cmd, &.{ .flags = .{ .one_time_submit_bit = true }, .p_inheritance_info = null });
+        self.vkd.dispatch.vkCmdCopyBuffer.?(cmd, src.buffer, dst.buffer, 1, &[_]vk.BufferCopy{.{ .src_offset = src_offset, .dst_offset = dst_offset, .size = size }});
         _ = self.vkd.dispatch.vkEndCommandBuffer.?(cmd);
         const fence = try self.ensureTransferFence();
         _ = self.vkd.dispatch.vkResetFences.?(self.device, 1, (&fence)[0..1]);

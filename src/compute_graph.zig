@@ -288,6 +288,7 @@ pub const GraphBuilder = struct {
     /// The weight upload loop in main.zig will check graph.synthetic_weights
     /// and upload zeros instead of reading from the GGUF.
     pub fn addSyntheticWeight(self: *GraphBuilder, name: []const u8, f32_count: u32) !void {
+        std.debug.print("WARNING: Using synthetic (zero) weight for {s}\n", .{name});
         try self.addTensor(name, f32Size(f32_count), .weight);
         if (self.graph.synthetic_weights.contains(name)) return;
         const owned = try self.graph.allocator.dupe(u8, name);
@@ -298,8 +299,25 @@ pub const GraphBuilder = struct {
     /// given byte offset. The Dispatcher resolves `tensorAddr(slice_name)` to
     /// `parent_addr + offset` (no separate storage).
     pub fn addSlice(self: *GraphBuilder, name: []const u8, parent_name: []const u8, byte_offset: u64, size_bytes: u64) ![]const u8 {
+        if (self.graph.slices.getEntry(name)) |entry| {
+            if (std.mem.eql(u8, entry.value_ptr.parent, parent_name) and entry.value_ptr.offset == byte_offset and entry.value_ptr.size == size_bytes) {
+                return entry.key_ptr.*;
+            }
+            // Redefinition: free old parent and dupe new one.
+            const new_parent = try self.graph.allocator.dupe(u8, parent_name);
+            self.graph.allocator.free(entry.value_ptr.parent);
+            entry.value_ptr.* = .{
+                .parent = new_parent,
+                .offset = byte_offset,
+                .size = size_bytes,
+            };
+            return entry.key_ptr.*;
+        }
         const owned_name = try self.graph.allocator.dupe(u8, name);
+        errdefer self.graph.allocator.free(owned_name);
         const owned_parent = try self.graph.allocator.dupe(u8, parent_name);
+        errdefer self.graph.allocator.free(owned_parent);
+
         try self.graph.slices.put(owned_name, .{
             .parent = owned_parent,
             .offset = byte_offset,
@@ -1278,13 +1296,13 @@ pub const Dispatcher = struct {
     }
 
     pub fn recordGraph(self: *Dispatcher, cmd: vk.CommandBuffer, pos: u32) void {
-        const use_cpu_ssm = self.ssm_staging != null and self.cfg.ssm_d_inner > 0;
+        // const use_cpu_ssm = self.ssm_staging != null and self.cfg.ssm_d_inner > 0;
         var last_barrier_idx: usize = 0;
         const nodes = self.graph.nodes.items;
 
         for (nodes, 0..) |node, i| {
             // Skip SSM delta-net dispatch when using CPU path
-            if (use_cpu_ssm and node.op_type == .ssm_delta_net_decode) continue;
+            // if (use_cpu_ssm and node.op_type == .ssm_delta_net_decode) continue;
 
             var need_barrier = false;
             if (i > 0) {
@@ -1329,7 +1347,7 @@ pub const Dispatcher = struct {
         const input_tensor = self.graph.tensors.get("input") orelse return error.MissingInputTensor;
         try self.ensureSubmitResources();
 
-        const use_cpu_ssm = self.ssm_staging != null and self.cfg.ssm_d_inner > 0;
+        // const use_cpu_ssm = self.ssm_staging != null and self.cfg.ssm_d_inner > 0;
 
         var i: u32 = 0;
         while (i < n_tokens) : (i += 1) {
@@ -1379,7 +1397,7 @@ pub const Dispatcher = struct {
                     last_barrier_idx = idx;
                 }
 
-                if (false and use_cpu_ssm and node.op_type == .ssm_delta_net_decode) {
+                if (false and node.op_type == .ssm_delta_net_decode) {
                     // End the current command buffer, submit, wait, then run
                     // the CPU SSM step for this layer. The next command
                     // buffer (for the rest of the graph) will see the CPU

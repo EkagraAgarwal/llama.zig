@@ -47,7 +47,7 @@ void main() {
     bool kda = pc.kda_flag != 0u;
 
     float scale = uintBitsToFloat(pc.scale_bits);
-    float g_val = (kda ? pc.e.data[h * H_v + v] : pc.e.data[0]);
+    float g_val = (kda ? pc.e.data[h * H_v + v] : pc.e.data[h]);
     float decay = exp(clamp(g_val, -30.0, 30.0));
 
     // a. Decay and b. sk[v]

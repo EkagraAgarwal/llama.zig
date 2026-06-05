@@ -502,6 +502,13 @@ pub fn main(init: std.process.Init) !void {
                 }
                 try uploadBufferChunked(&vk_ctx, weight_staging, buf, std.mem.sliceAsBytes(host_buf), STAGING_BUF_SIZE);
             }
+        } else if (graph.synthetic_weights.contains(name)) {
+            const host_buf = try allocator.alloc(u8, we.upload_size);
+            defer allocator.free(host_buf);
+            @memset(host_buf, 0);
+            try uploadBufferChunked(&vk_ctx, weight_staging, buf, host_buf, STAGING_BUF_SIZE);
+        } else {
+            std.log.warn("WARNING: Weight tensor {s} not found in GGUF and not synthetic! Uploading uninitialized memory.", .{name});
         }
     }
 
@@ -515,12 +522,12 @@ pub fn main(init: std.process.Init) !void {
     var scratchpad = try vulkan.Buffer.init(&vk_ctx, graph.scratchpad_size, .{ .storage_buffer_bit = true, .shader_device_address_bit = true, .transfer_src_bit = true, .transfer_dst_bit = true }, scratch_props);
     defer scratchpad.deinit(&vk_ctx);
 
-    const scratch_mapped_ptr = if (cfg.arch == .qwen35)
-        try vk_ctx.vkd.mapMemory(vk_ctx.device, scratchpad.memory, 0, graph.scratchpad_size, .{})
-    else
-        null;
-    defer if (scratch_mapped_ptr != null) vk_ctx.vkd.unmapMemory(vk_ctx.device, scratchpad.memory);
-    const scratch_ptr = if (scratch_mapped_ptr) |p| @as([*]f32, @ptrCast(@alignCast(p))) else null;
+    // const scratch_mapped_ptr = if (cfg.arch == .qwen35)
+    //     try vk_ctx.vkd.mapMemory(vk_ctx.device, scratchpad.memory, 0, graph.scratchpad_size, .{})
+    // else
+    //     null;
+    // defer if (scratch_mapped_ptr != null) vk_ctx.vkd.unmapMemory(vk_ctx.device, scratchpad.memory);
+    // const scratch_ptr = if (scratch_mapped_ptr) |p| @as([*]f32, @ptrCast(@alignCast(p))) else null;
 
     var kv_cache = try vulkan.Buffer.init(&vk_ctx, graph.kv_cache_size, .{ .storage_buffer_bit = true, .shader_device_address_bit = true }, .{ .device_local_bit = true });
     defer kv_cache.deinit(&vk_ctx);
@@ -535,10 +542,12 @@ pub fn main(init: std.process.Init) !void {
             else if (std.mem.startsWith(u8, entry.key_ptr.*, "ssm_state")) ssm_state_size += entry.value_ptr.size;
         }
     }
-    var ssm_conv_cache = try vulkan.Buffer.init(&vk_ctx, if (ssm_conv_size > 0) ssm_conv_size else 4096, .{ .storage_buffer_bit = true, .shader_device_address_bit = true }, ssm_props);
+    var ssm_conv_cache = try vulkan.Buffer.init(&vk_ctx, if (ssm_conv_size > 0) ssm_conv_size else 4096, .{ .storage_buffer_bit = true, .shader_device_address_bit = true, .transfer_dst_bit = true }, ssm_props);
     defer ssm_conv_cache.deinit(&vk_ctx);
-    var ssm_state_cache = try vulkan.Buffer.init(&vk_ctx, if (ssm_state_size > 0) ssm_state_size else 4096, .{ .storage_buffer_bit = true, .shader_device_address_bit = true }, ssm_props);
+    try vk_ctx.clearBuffer(ssm_conv_cache);
+    var ssm_state_cache = try vulkan.Buffer.init(&vk_ctx, if (ssm_state_size > 0) ssm_state_size else 4096, .{ .storage_buffer_bit = true, .shader_device_address_bit = true, .transfer_dst_bit = true }, ssm_props);
     defer ssm_state_cache.deinit(&vk_ctx);
+    try vk_ctx.clearBuffer(ssm_state_cache);
 
     var input_staging = try vulkan.Buffer.init(&vk_ctx, model.f32Bytes(cfg.n_embd), .{ .transfer_src_bit = true }, .{ .host_visible_bit = true, .host_coherent_bit = true });
     defer input_staging.deinit(&vk_ctx);
@@ -693,17 +702,17 @@ pub fn main(init: std.process.Init) !void {
         pos += 1;
 
         if (cfg.arch == .qwen35 and graph.ssm_cache_size > 0) {
-            if (verbose) try writer.print("  [decode] running CPU SSM step...\n", .{});
-            if (verbose) try writer_streaming.interface.flush();
-            const head_v_dim = cfg.ssm_d_inner / cfg.ssm_dt_rank;
-            const m_conv = try vk_ctx.vkd.mapMemory(vk_ctx.device, ssm_conv_cache.memory, 0, ssm_conv_size, .{});
-            const m_state = try vk_ctx.vkd.mapMemory(vk_ctx.device, ssm_state_cache.memory, 0, ssm_state_size, .{});
-            defer { vk_ctx.vkd.unmapMemory(vk_ctx.device, ssm_conv_cache.memory); vk_ctx.vkd.unmapMemory(vk_ctx.device, ssm_state_cache.memory); }
-            var ssm_ctx = ssm.SsmCpuContext.wrap(&cfg, @as([*]f32, @ptrCast(@alignCast(m_conv)))[0..ssm_conv_size/4], @as([*]f32, @ptrCast(@alignCast(m_state)))[0..ssm_state_size/4]);
-            var sl: u32 = 0;
-            while (sl < cfg.n_layer) : (sl += 1) {
-                if (cfg.isRecurrent(sl)) try runCpuSsmDeltaForLayer(allocator, scratch_ptr, logits_persistent, &ssm_ctx, &graph, sl, head_v_dim);
-            }
+            // if (verbose) try writer.print("  [decode] running CPU SSM step...\n", .{});
+            // if (verbose) try writer_streaming.interface.flush();
+            // const head_v_dim = cfg.ssm_d_inner / cfg.ssm_dt_rank;
+            // const m_conv = try vk_ctx.vkd.mapMemory(vk_ctx.device, ssm_conv_cache.memory, 0, ssm_conv_size, .{});
+            // const m_state = try vk_ctx.vkd.mapMemory(vk_ctx.device, ssm_state_cache.memory, 0, ssm_state_size, .{});
+            // defer { vk_ctx.vkd.unmapMemory(vk_ctx.device, ssm_conv_cache.memory); vk_ctx.vkd.unmapMemory(vk_ctx.device, ssm_state_cache.memory); }
+            // var ssm_ctx = ssm.SsmCpuContext.wrap(&cfg, @as([*]f32, @ptrCast(@alignCast(m_conv)))[0..ssm_conv_size/4], @as([*]f32, @ptrCast(@alignCast(m_state)))[0..ssm_state_size/4]);
+            // var sl: u32 = 0;
+            // while (sl < cfg.n_layer) : (sl += 1) {
+            //     if (cfg.isRecurrent(sl)) try runCpuSsmDeltaForLayer(allocator, scratch_ptr, logits_persistent, &ssm_ctx, &graph, sl, head_v_dim);
+            // }
         }
         if (verbose) try writer.print("  [decode] step done\n", .{});
         if (verbose) try writer_streaming.interface.flush();

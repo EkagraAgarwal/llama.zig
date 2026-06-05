@@ -46,7 +46,7 @@ void main() {
     for (uint i = 0u; i < row_width; ++i) {
         float z = pc.b.data[row_offset + i];
         float silu_z = z / (1.0 + exp(-z));
-        float x_norm = pc.a.data[row_offset + i] * inv_rms;
+        float x_norm = pc.a.data[row_offset + i] * inv_rms * pc.c.data[i];
         pc.d.data[row_offset + i] = silu_z * x_norm;
     }
 }
