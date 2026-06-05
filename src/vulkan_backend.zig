@@ -248,11 +248,35 @@ pub const Context = struct {
     }
 };
 
+pub const Memory = struct {
+    memory: vk.DeviceMemory,
+    size: u64,
+    type_index: u32,
+
+    pub fn allocate(ctx: *const Context, size: u64, type_index: u32, is_bda: bool) !Memory {
+        var flags = vk.MemoryAllocateFlagsInfo{ .flags = .{ .device_address_bit = true }, .device_mask = 0 };
+        const alloc_info = vk.MemoryAllocateInfo{
+            .p_next = if (is_bda) &flags else null,
+            .allocation_size = size,
+            .memory_type_index = type_index,
+        };
+        var memory: vk.DeviceMemory = undefined;
+        const res = ctx.vkd.dispatch.vkAllocateMemory.?(ctx.device, &alloc_info, null, &memory);
+        if (res != .success) return error.MemoryAllocationFailed;
+        return Memory{ .memory = memory, .size = size, .type_index = type_index };
+    }
+
+    pub fn deinit(self: Memory, ctx: *const Context) void {
+        ctx.vkd.dispatch.vkFreeMemory.?(ctx.device, self.memory, null);
+    }
+};
+
 pub const Buffer = struct {
     buffer: vk.Buffer,
     memory: vk.DeviceMemory,
     size: u64,
     address: u64 = 0,
+    is_pooled: bool = false,
 
     pub fn init(ctx: *const Context, size: u64, usage: vk.BufferUsageFlags, props: vk.MemoryPropertyFlags) !Buffer {
         var b: vk.Buffer = undefined;
@@ -280,9 +304,27 @@ pub const Buffer = struct {
         return Buffer{ .buffer = b, .memory = memory, .size = size, .address = address };
     }
 
+    pub fn initFromMemory(ctx: *const Context, memory: vk.DeviceMemory, offset: u64, size: u64, usage: vk.BufferUsageFlags) !Buffer {
+        var b: vk.Buffer = undefined;
+        const res1 = ctx.vkd.dispatch.vkCreateBuffer.?(ctx.device, &.{ .flags = .{}, .size = size, .usage = usage, .sharing_mode = .exclusive, .queue_family_index_count = 0, .p_queue_family_indices = null }, null, &b);
+        if (res1 != .success) return error.BufferCreationFailed;
+
+        const res2 = ctx.vkd.dispatch.vkBindBufferMemory.?(ctx.device, b, memory, offset);
+        if (res2 != .success) return error.MemoryBindingFailed;
+
+        var address: u64 = 0;
+        if (usage.shader_device_address_bit) {
+            address = ctx.vkd.dispatch.vkGetBufferDeviceAddress.?(ctx.device, &.{ .buffer = b });
+        }
+
+        return Buffer{ .buffer = b, .memory = memory, .size = size, .address = address, .is_pooled = true };
+    }
+
     pub fn deinit(self: Buffer, ctx: *const Context) void {
         ctx.vkd.dispatch.vkDestroyBuffer.?(ctx.device, self.buffer, null);
-        ctx.vkd.dispatch.vkFreeMemory.?(ctx.device, self.memory, null);
+        if (!self.is_pooled) {
+            ctx.vkd.dispatch.vkFreeMemory.?(ctx.device, self.memory, null);
+        }
     }
 };
 

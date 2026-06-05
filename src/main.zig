@@ -283,8 +283,21 @@ pub fn main(init: std.process.Init) !void {
         const w_type: ?@import("tensor.zig").Type = blk: {
             if (ctx.tensors.get(w_name)) |t| break :blk t.type;
             if (getFusedComponentNames(allocator, w_name)) |comps| {
-                defer { for (comps) |c| allocator.free(c); allocator.free(comps); }
-                if (comps.len > 0) if (ctx.tensors.get(comps[0])) |t| break :blk t.type;
+                defer {
+                    for (comps) |c| allocator.free(c);
+                    allocator.free(comps);
+                }
+                if (comps.len > 0) {
+                    const first_t = ctx.tensors.get(comps[0]) orelse break :blk null;
+                    var same_type = true;
+                    for (comps[1..]) |c| {
+                        if (ctx.tensors.get(c).?.type != first_t.type) {
+                            same_type = false;
+                            break;
+                        }
+                    }
+                    if (same_type) break :blk first_t.type;
+                }
             }
             break :blk null;
         };
@@ -299,46 +312,136 @@ pub fn main(init: std.process.Init) !void {
     }
 
     var weight_buffers: std.ArrayListUnmanaged(vulkan.Buffer) = .empty;
-    defer { for (weight_buffers.items) |b| b.deinit(&vk_ctx); weight_buffers.deinit(allocator); }
+    defer {
+        for (weight_buffers.items) |b| b.deinit(&vk_ctx);
+        weight_buffers.deinit(allocator);
+    }
 
     const STAGING_BUF_SIZE = 128 * 1024 * 1024;
     var staging_alloc_size: u64 = 0;
+
+    // Pass 1: Identify all weights and create buffer handles to collect requirements
+    const WeightEntry = struct {
+        name: []const u8,
+        upload_size: u64,
+        buffer: vk.Buffer = .null_handle,
+        offset: u64 = 0,
+        reqs: vk.MemoryRequirements = undefined,
+    };
+    var weight_entries: std.ArrayListUnmanaged(WeightEntry) = .empty;
+    defer {
+        for (weight_entries.items) |we| allocator.free(we.name);
+        weight_entries.deinit(allocator);
+    }
+
+    // 1a. Weights from graph
     var t_it = graph.tensors.iterator();
     while (t_it.next()) |entry| {
-        if (entry.value_ptr.role == .weight) {
-            if (ctx.tensors.get(entry.key_ptr.*)) |gt| {
-                staging_alloc_size = @max(staging_alloc_size, gpuUploadSize(gt));
-            } else {
-                staging_alloc_size = @max(staging_alloc_size, entry.value_ptr.size);
-            }
-        }
-    }
-    staging_alloc_size = @min(staging_alloc_size, STAGING_BUF_SIZE);
-
-    var weight_staging = try vulkan.Buffer.init(&vk_ctx, staging_alloc_size, .{ .transfer_src_bit = true }, .{ .host_visible_bit = true, .host_coherent_bit = true });
-    defer weight_staging.deinit(&vk_ctx);
-
-    t_it = graph.tensors.iterator();
-    while (t_it.next()) |entry| {
         if (entry.value_ptr.role != .weight) continue;
-        const gt = ctx.tensors.get(entry.key_ptr.*);
-        const components = getFusedComponentNames(allocator, entry.key_ptr.*);
-        defer if (components) |comps| { for (comps) |c| allocator.free(c); allocator.free(comps); };
+        const name = entry.key_ptr.*;
+        const gt = ctx.tensors.get(name);
+        const components = getFusedComponentNames(allocator, name);
+        defer if (components) |comps| {
+            for (comps) |c| allocator.free(c);
+            allocator.free(comps);
+        };
 
         const upload_size = blk: {
             if (gt) |t| break :blk gpuUploadSize(t);
             if (components) |comps| {
                 var size: u64 = 0;
-                for (comps) |c| { if (ctx.tensors.get(c)) |t| size += gpuUploadSize(t); }
+                for (comps) |c| {
+                    if (ctx.tensors.get(c)) |t| size += gpuUploadSize(t);
+                }
                 break :blk size;
             }
             break :blk entry.value_ptr.size;
         };
 
-        const buf = try vulkan.Buffer.init(&vk_ctx, upload_size, .{ .storage_buffer_bit = true, .shader_device_address_bit = true, .transfer_dst_bit = true }, .{ .device_local_bit = true });
-        entry.value_ptr.buffer = try allocator.create(vulkan.Buffer);
-        entry.value_ptr.buffer.?.* = buf;
+        var b: vk.Buffer = undefined;
+        const res = vk_ctx.vkd.dispatch.vkCreateBuffer.?(vk_ctx.device, &.{
+            .flags = .{},
+            .size = upload_size,
+            .usage = .{ .storage_buffer_bit = true, .shader_device_address_bit = true, .transfer_dst_bit = true },
+            .sharing_mode = .exclusive,
+            .queue_family_index_count = 0,
+            .p_queue_family_indices = null,
+        }, null, &b);
+        if (res != .success) return error.BufferCreationFailed;
+
+        var reqs: vk.MemoryRequirements = undefined;
+        vk_ctx.vkd.dispatch.vkGetBufferMemoryRequirements.?(vk_ctx.device, b, &reqs);
+
+        try weight_entries.append(allocator, .{ .name = try allocator.dupe(u8, name), .upload_size = upload_size, .buffer = b, .reqs = reqs });
+        staging_alloc_size = @max(staging_alloc_size, upload_size);
+    }
+
+    // 1b. token_embd.weight (if not already in graph, e.g. when has_output is true)
+    if (gpu_embed and graph.tensors.get("token_embd.weight") == null) {
+        if (ctx.tensors.get("token_embd.weight")) |t| {
+            const upload_size = gpuUploadSize(t);
+            var b: vk.Buffer = undefined;
+            const res = vk_ctx.vkd.dispatch.vkCreateBuffer.?(vk_ctx.device, &.{
+                .flags = .{},
+                .size = upload_size,
+                .usage = .{ .storage_buffer_bit = true, .shader_device_address_bit = true, .transfer_dst_bit = true },
+                .sharing_mode = .exclusive,
+                .queue_family_index_count = 0,
+                .p_queue_family_indices = null,
+            }, null, &b);
+            if (res != .success) return error.BufferCreationFailed;
+            var reqs: vk.MemoryRequirements = undefined;
+            vk_ctx.vkd.dispatch.vkGetBufferMemoryRequirements.?(vk_ctx.device, b, &reqs);
+            try weight_entries.append(allocator, .{ .name = try allocator.dupe(u8, "token_embd.weight"), .upload_size = upload_size, .buffer = b, .reqs = reqs });
+            staging_alloc_size = @max(staging_alloc_size, upload_size);
+        }
+    }
+
+    // Pass 2: Layout pooling memory
+    var pool_size: u64 = 0;
+    var weight_type_bits: u32 = 0xFFFFFFFF;
+    for (weight_entries.items) |*we| {
+        weight_type_bits &= we.reqs.memory_type_bits;
+        we.offset = (pool_size + we.reqs.alignment - 1) & ~(we.reqs.alignment - 1);
+        pool_size = we.offset + we.reqs.size;
+    }
+
+    const weight_mem_type = try vk_ctx.findMemoryType(weight_type_bits, .{ .device_local_bit = true });
+    var weight_memory = try vulkan.Memory.allocate(&vk_ctx, pool_size, weight_mem_type, true);
+    defer weight_memory.deinit(&vk_ctx);
+
+    // Pass 3: Bind memory and create vulkan.Buffer objects
+    for (weight_entries.items) |we| {
+        const res = vk_ctx.vkd.dispatch.vkBindBufferMemory.?(vk_ctx.device, we.buffer, weight_memory.memory, we.offset);
+        if (res != .success) return error.MemoryBindingFailed;
+
+        var address: u64 = 0;
+        address = vk_ctx.vkd.dispatch.vkGetBufferDeviceAddress.?(vk_ctx.device, &.{ .buffer = we.buffer });
+
+        const buf = vulkan.Buffer{ .buffer = we.buffer, .memory = weight_memory.memory, .size = we.upload_size, .address = address, .is_pooled = true };
         try weight_buffers.append(allocator, buf);
+
+        if (graph.tensors.getPtr(we.name)) |gt_entry| {
+            gt_entry.buffer = try allocator.create(vulkan.Buffer);
+            gt_entry.buffer.?.* = buf;
+            gt_entry.size = we.upload_size;
+        }
+    }
+
+    staging_alloc_size = @min(staging_alloc_size, STAGING_BUF_SIZE);
+    var weight_staging = try vulkan.Buffer.init(&vk_ctx, staging_alloc_size, .{ .transfer_src_bit = true }, .{ .host_visible_bit = true, .host_coherent_bit = true });
+    defer weight_staging.deinit(&vk_ctx);
+
+    // Pass 4: Upload data to pooled buffers
+    for (weight_entries.items, 0..) |we, entry_idx| {
+        const buf = weight_buffers.items[entry_idx];
+        const name = we.name;
+        const gt = ctx.tensors.get(name);
+        const components = getFusedComponentNames(allocator, name);
+        defer if (components) |comps| {
+            for (comps) |c| allocator.free(c);
+            allocator.free(comps);
+        };
 
         if (gt) |t| {
             if (isNativeQuantType(t.type)) {
@@ -364,8 +467,16 @@ pub fn main(init: std.process.Init) !void {
             }
         } else if (components) |comps| {
             const first_t = ctx.tensors.get(comps[0]).?;
-            if (isNativeQuantType(first_t.type)) {
-                const host_buf = try allocator.alloc(u8, upload_size);
+            var same_type = true;
+            for (comps[1..]) |c| {
+                if (ctx.tensors.get(c).?.type != first_t.type) {
+                    same_type = false;
+                    break;
+                }
+            }
+
+            if (same_type and isNativeQuantType(first_t.type)) {
+                const host_buf = try allocator.alloc(u8, we.upload_size);
                 defer allocator.free(host_buf);
                 var off: u64 = 0;
                 for (comps) |c| {
@@ -390,30 +501,6 @@ pub fn main(init: std.process.Init) !void {
                     off += tn;
                 }
                 try uploadBufferChunked(&vk_ctx, weight_staging, buf, std.mem.sliceAsBytes(host_buf), STAGING_BUF_SIZE);
-            }
-        }
-    }
-
-    if (!has_output) {
-        if (graph.tensors.getPtr("token_embd.weight")) |gt_entry| {
-            if (ctx.tensors.get("token_embd.weight")) |t| {
-                const upload_size = gpuUploadSize(t);
-                if (gt_entry.buffer == null) {
-                    const buf = try vulkan.Buffer.init(&vk_ctx, upload_size, .{ .storage_buffer_bit = true, .shader_device_address_bit = true, .transfer_dst_bit = true }, .{ .device_local_bit = true });
-                    gt_entry.buffer = try allocator.create(vulkan.Buffer);
-                    gt_entry.buffer.?.* = buf;
-                    try weight_buffers.append(allocator, buf);
-                }
-                gt_entry.size = upload_size;
-                if (isNativeQuantType(t.type)) {
-                    const raw = if (ctx.mmap_file != null) try ctx.getTensorSlice(t) else blk: {
-                        const temp = try allocator.alloc(u8, t.size());
-                        try ctx.readTensorData(t, temp);
-                        break :blk temp;
-                    };
-                    defer if (ctx.mmap_file == null) allocator.free(raw);
-                    try uploadBufferChunked(&vk_ctx, weight_staging, gt_entry.buffer.?.*, raw, STAGING_BUF_SIZE);
-                }
             }
         }
     }
@@ -504,7 +591,18 @@ pub fn main(init: std.process.Init) !void {
 
     const embd_quant_gpu = gpu_embed and embd_standard_layout and isNativeQuantType(embd_tensor.type);
     var embd_gpu_buf: ?*vulkan.Buffer = null;
-    if (embd_quant_gpu) if (graph.tensors.getPtr("token_embd.weight")) |gt| if (gt.buffer) |buf| { embd_gpu_buf = buf; };
+    if (embd_quant_gpu) {
+        if (graph.tensors.getPtr("token_embd.weight")) |gt| {
+            if (gt.buffer) |buf| embd_gpu_buf = buf;
+        } else {
+            for (weight_entries.items, 0..) |we, i| {
+                if (std.mem.eql(u8, we.name, "token_embd.weight")) {
+                    embd_gpu_buf = &weight_buffers.items[i];
+                    break;
+                }
+            }
+        }
+    }
     const embd_scale_bits: u32 = @bitCast(cfg.embedding_scale);
     const input_offset = graph.tensors.get("input").?.offset;
 
