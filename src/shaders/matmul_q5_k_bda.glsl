@@ -84,15 +84,15 @@ float q5kWeight(uint row, uint kidx) {
         mn = ((sw2 >> 28u) & 0x0Fu) | ((sw1 >> 26u) & 0x30u);
     }
 
-    uint qs_word = pc.b.data[w_base + 12u + (sb >> 1u) * 8u + (is >> 2u)];
+    uint qs_word = pc.b.data[w_base + 12u + ((sb >> 1) * 8u) + ((is >> 2) & 7u)];
     uint qs_byte = (qs_word >> ((is & 3u) * 8u)) & 0xFFu;
 
-    uint qh_word = pc.b.data[w_base + 4u + (is >> 2u)];
+    uint qh_word = pc.b.data[w_base + 4u + ((sb >> 1) * 8u) + ((is >> 2) & 7u)];
     uint qh_byte = (qh_word >> ((is & 3u) * 8u)) & 0xFFu;
 
     uint qs_shift = (sb & 1u) * 4u;
     uint qb = (qs_byte >> qs_shift) & 0xFu;
-    uint qh_bit = (qh_byte >> sb) & 1u;
+    uint qh_bit = (qh_byte >> ((sb & 6u) | (sb & 1u))) & 1u;
 
     uint raw5 = qb | (qh_bit << 4u);
 

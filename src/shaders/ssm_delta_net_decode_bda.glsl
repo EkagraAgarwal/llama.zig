@@ -51,13 +51,15 @@ void main() {
     float decay = exp(clamp(g_val, -30.0, 30.0));
 
     // a. Decay and b. sk[v]
+    // Store decayed state locally — do NOT re-read from global memory in the second loop.
+    // CUDA reference: s_shard[r] = g_val * s_shard[r] (decay applied once, kept in registers)
     float sk = 0.0;
+    float s_snap[128]; // S_v == 128 max for Qwen 3.5
     for (uint k = 0u; k < H_v; ++k) {
         float s_val = pc.a.data[state_off + k * H_v + v] * decay;
-        pc.a.data[state_off + k * H_v + v] = s_val;
-        if (k < H_k) {
-            sk += s_val * pc.c.data[hk * H_k + k];
-        }
+        pc.a.data[state_off + k * H_v + v] = s_val; // write decayed state to global memory
+        s_snap[k] = s_val; // keep locally for second loop
+        sk += s_val * pc.c.data[hk * H_k + k];
     }
 
     // c. d[v]
@@ -66,14 +68,13 @@ void main() {
     float delta_val = (vv - sk) * beta;
 
     // d. S[k,v] update and e. o[v]
+    // Use LOCAL s_snap[] (decayed state) — matches CUDA s_shard[] approach.
+    // CUDA reference: s_shard[r] = g_val * s_shard[r] + k_reg[r] * delta_col
     float ov = 0.0;
     for (uint k = 0u; k < H_v; ++k) {
-        float s_val = pc.a.data[state_off + k * H_v + v];
-        if (k < H_k) {
-            s_val += pc.c.data[hk * H_k + k] * delta_val;
-            pc.a.data[state_off + k * H_v + v] = s_val;
-            ov += s_val * pc.b.data[hk * H_k + k];
-        }
+        float s_val = s_snap[k] + pc.c.data[hk * H_k + k] * delta_val;
+        pc.a.data[state_off + k * H_v + v] = s_val;
+        ov += s_val * pc.b.data[hk * H_k + k];
     }
     pc.g.data[h * H_v + v] = ov * scale;
 }

@@ -1223,6 +1223,7 @@ pub const Dispatcher = struct {
 
         self.ctx.vkd.dispatch.vkCmdBindPipeline.?(cmd, .compute, pipe.pipeline);
         self.ctx.vkd.dispatch.vkCmdPushConstants.?(cmd, pipe.layout, .{ .compute_bit = true }, 0, @sizeOf(vulkan.PushConstants), @ptrCast(&pc));
+        if (self.trace_dispatch) std.debug.print("[dispatch] n={} i={} op={s} dx={} dy={} dz={}\n", .{ self.submit_count, pos, @tagName(node.op_type), dx, dy, node.dispatch_z });
         self.ctx.vkd.dispatch.vkCmdDispatch.?(cmd, dx, dy, node.dispatch_z);
     }
 
@@ -1277,10 +1278,14 @@ pub const Dispatcher = struct {
     }
 
     pub fn recordGraph(self: *Dispatcher, cmd: vk.CommandBuffer, pos: u32) void {
+        const use_cpu_ssm = self.ssm_staging != null and self.cfg.ssm_d_inner > 0;
         var last_barrier_idx: usize = 0;
         const nodes = self.graph.nodes.items;
 
         for (nodes, 0..) |node, i| {
+            // Skip SSM delta-net dispatch when using CPU path
+            if (use_cpu_ssm and node.op_type == .ssm_delta_net_decode) continue;
+
             var need_barrier = false;
             if (i > 0) {
                 var j = i - 1;
@@ -1304,6 +1309,7 @@ pub const Dispatcher = struct {
 
     pub fn execute(self: *Dispatcher, pos: u32) !void {
         try self.ensureSubmitResources();
+        if (self.trace_dispatch) std.debug.print("[execute] pos={} use_cpu_ssm={} ssm_staging_set={} d_inner={}\n", .{ pos, self.ssm_staging != null and self.cfg.ssm_d_inner > 0, self.ssm_staging != null, self.cfg.ssm_d_inner });
         const reset_flags = if ((self.submit_count & 63) == 63)
             vk.CommandBufferResetFlags{ .release_resources_bit = true }
         else
@@ -1473,7 +1479,10 @@ pub const Dispatcher = struct {
         const g_off: u64 = v_off + vn_t.size;
         const b_off: u64 = g_off + gate_t.size;
         const core_off: u64 = staging_size - core_t.size;
-        if (core_off < total_input) return; // No room to avoid aliasing.
+        if (core_off < total_input) {
+            if (self.trace_dispatch) std.debug.print("[ssm-cpu] FATAL: staging overflow layer={} total_input={} core_off={} staging={}\n", .{ layer, total_input, core_off, staging_size });
+            return error.SsmStagingOverflow;
+        }
 
         try self.ctx.copyBufferOffset(self.scratchpad, qn_t.offset, staging, q_off, qn_t.size);
         try self.ctx.copyBufferOffset(self.scratchpad, kn_t.offset, staging, k_off, kn_t.size);

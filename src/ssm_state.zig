@@ -195,13 +195,16 @@ pub const SsmCpuContext = struct {
             const S = s.rec[s_head_off..][0..head_v_sq];
 
             // a. Decay: S *= exp(g) — scalar or per-element.
+            //    In KDA mode, g has length head_v_dim and scales each column c by exp(g[c]).
+            //    In scalar mode, g[0] scales all elements uniformly.
             if (kda) {
-                const g_head = g[h * head_v_dim ..][0..head_v_dim];
-                var r: u32 = 0;
-                while (r < head_v_dim) : (r += 1) {
-                    const decay = @exp(std.math.clamp(g_head[r], -30.0, 30.0));
-                    var c: u32 = 0;
-                    while (c < head_v_dim) : (c += 1) {
+                // KDA: column-wise scaling. For each column c, apply exp(g[c]) to all rows.
+                //     This corresponds to S[:, c] *= exp(g[c]).
+                var c: u32 = 0;
+                while (c < head_v_dim) : (c += 1) {
+                    const decay = @exp(std.math.clamp(g[c], -30.0, 30.0));
+                    var r: u32 = 0;
+                    while (r < head_v_dim) : (r += 1) {
                         S[r * head_v_dim + c] *= decay;
                     }
                 }

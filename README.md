@@ -57,6 +57,7 @@ Shaders are compiled automatically when `glslangValidator` is on `PATH`; prebuil
 | `--prefill-chunk` | Chunk size for batched prefill (0 = full batch) |
 | `--no-gpu-embed` | Disable GPU embedding lookup (fallback to CPU path) |
 | `--report-json` | Output inference metrics as JSON |
+| `--debug-trace` | Enable debug trace printing (gated; off by default) |
 
 **Note**: Chat template mode is enabled by default for instruct-tuned models. Base models are automatically detected (based on the absence of GGUF chat template metadata and instruct-specific control tokens) and execute in raw text autocomplete mode.
 
@@ -120,7 +121,7 @@ Other quantization types (`q5_0`, `q2_k`, `q3_k`, `q8_k`) are not supported.
 | `granite` | Supported | BOS metadata + Granite role token handling |
 | `gemma` | Supported | Gemma 4 E2B and variants |
 | `qwen` | Supported | Qwen 2/2.5 series |
-| `qwen35` | Supported | Qwen 3.5 with hybrid SSM architecture (M-RoPE, gated delta nets) |
+| `qwen35` | Supported | Qwen 3.5 with hybrid SSM architecture (M-RoPE, gated delta nets). Requires ≥10GB VRAM for 4B Q4_K. |
 
 ### Features
 
@@ -128,7 +129,7 @@ Other quantization types (`q5_0`, `q2_k`, `q3_k`, `q8_k`) are not supported.
 |-----------|--------|-------|
 | Chat template detection (Llama 3, Granite, Gemma, Qwen, Llama 2) | Supported | Auto-detected from GGUF metadata or architecture |
 | Qwen 3.5 M-RoPE | Supported | 4-dimension rotary position embedding |
-| Qwen 3.5 SSM (conv1d, delta_net, gated_norm) | Supported | CPU step for decode, GPU for prefill |
+| Qwen 3.5 SSM (conv1d, delta_net, gated_norm) | Supported | GPU delta-net shader + CPU step fallback for prefill |
 | Special token passthrough (`<|...|>`) | Supported | Encoder preserves known special tokens |
 | Sampler: `top_k`, `top_p`, `min_p`, `typical_p` | Supported | Stateful deterministic RNG across decode steps |
 | Memory-mapped model loading | Supported | `loadModelMmap` for fast startup |

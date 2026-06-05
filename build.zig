@@ -32,16 +32,6 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
-    const inspect_exe = b.addExecutable(.{
-        .name = "inspect_gguf",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("inspect_gguf.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    b.installArtifact(inspect_exe);
-
     if (compileShaders(b)) |shader_step| {
         exe.step.dependOn(shader_step);
     }

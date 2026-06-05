@@ -108,6 +108,7 @@ pub fn main(init: std.process.Init) !void {
     var prefill_chunk: u32 = 0;
     var gpu_embed: bool = true;
     var report_json: bool = false;
+    var debug_trace: bool = false;
 
     while (args_it.next()) |arg| {
         if (std.mem.eql(u8, arg, "--model")) {
@@ -144,6 +145,8 @@ pub fn main(init: std.process.Init) !void {
             gpu_embed = false;
         } else if (std.mem.eql(u8, arg, "--report-json")) {
             report_json = true;
+        } else if (std.mem.eql(u8, arg, "--debug-trace")) {
+            debug_trace = true;
         }
     }
 
@@ -464,7 +467,26 @@ pub fn main(init: std.process.Init) !void {
     const logits_persistent = @as([*]f32, @ptrCast(@alignCast(logits_mapped_ptr)))[0..cfg.vocab_size];
 
     var dispatcher = try compute_graph.Dispatcher.init(&graph, &vk_ctx, &registry, scratchpad, kv_cache, ssm_conv_cache, ssm_state_cache, &cfg);
+    dispatcher.trace_dispatch = debug_trace;
     defer dispatcher.deinit();
+
+    // NOTE: ssm_staging must be freed AFTER the dispatcher (LIFO defers).
+    // We declare it here but deinit it via a separate defer below the prefill/decode.
+
+    // Allocate a host-visible staging buffer for the per-layer CPU SSM step.
+    // Size must fit: (q + k + v + gate + beta + core) per layer, summed across all SSM layers.
+    // For Qwen 3.5-4B: head_v_dim=32, num_v_heads=16, num_k_heads=4, d_state=128.
+    // Per layer: q(32*4*4) + k(32*4*4) + v(32*16*4) + gate(16*4) + beta(16*4) + core(32*16*4) ~= 5KB
+    // Total for 8 SSM layers: ~40KB minimum.
+    const ssm_staging_size: u64 = if (cfg.ssm_d_inner > 0) 64 * 1024 else 0;
+    var ssm_staging: vulkan.Buffer = undefined;
+    if (ssm_staging_size > 0) {
+        ssm_staging = try vulkan.Buffer.init(&vk_ctx, ssm_staging_size, .{ .transfer_src_bit = true, .transfer_dst_bit = true }, .{ .host_visible_bit = true, .host_coherent_bit = true });
+        dispatcher.setSsmStagingBuffer(ssm_staging, ssm_staging_size);
+        if (debug_trace) std.debug.print("[main] ssm_staging set: size={} d_inner={} d_state={} dt_rank={} n_group={}\n", .{ ssm_staging_size, cfg.ssm_d_inner, cfg.ssm_d_state, cfg.ssm_dt_rank, cfg.ssm_n_group });
+    } else {
+        if (debug_trace) std.debug.print("[main] NO SSM: d_inner={}\n", .{cfg.ssm_d_inner});
+    }
 
     const format = chat.detectChatFormat(tok.chat_template, cfg.arch, &tok.special);
     const token_ids = try chat.buildChatPrompt(&tok, format, prompt_text.?, allocator);
@@ -502,8 +524,11 @@ pub fn main(init: std.process.Init) !void {
             if (embd_quant_gpu and embd_gpu_buf != null) {
                 var ti: u32 = 0;
                 while (ti < chunk_len) : (ti += 1) {
+                    if (debug_trace) std.debug.print("[prefill-gpu] token {}/{} starting\n", .{ ti, chunk_len });
                     try dispatcher.executeGetRowsQ(embed_indices, embd_gpu_buf.?.*, input_offset, token_ids[chunk_start + ti], cfg.n_embd, @intFromEnum(embd_tensor.type), @intCast(weights.quantRowBytes(embd_tensor.type, embd_tensor.ne[0]) orelse 0), embd_scale_bits);
+                    if (debug_trace) std.debug.print("[prefill-gpu] token {}/{} get_rows done\n", .{ ti, chunk_len });
                     try dispatcher.execute(pos); pos += 1;
+                    if (debug_trace) std.debug.print("[prefill-gpu] token {}/{} execute done\n", .{ ti, chunk_len });
                 }
             } else {
                 const prefill_bytes = model.f32Bytes(cfg.n_embd) * chunk_len;
@@ -587,6 +612,11 @@ pub fn main(init: std.process.Init) !void {
     }
     try writer.print("\n\n[Inference Complete]\n", .{});
     try writer_streaming.interface.flush();
+
+    // NOTE: ssm_staging must be freed BEFORE the dispatcher (LIFO defers).
+    // ssm_staging was registered with the dispatcher above, so freeing it here
+    // (after main returns) is safe because the dispatcher is also still alive.
+    if (ssm_staging_size > 0) ssm_staging.deinit(&vk_ctx);
 }
 
 fn isNativeQuantType(tt: @import("tensor.zig").Type) bool {

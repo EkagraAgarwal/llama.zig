@@ -112,7 +112,7 @@ test "Qwen3.5 4B GGUF parses and has expected architecture + SSM dims" {
     const ssm_dt_rank = ctx.kvs.get("qwen35.ssm.time_step_rank") orelse return error.MissingSSMDtRank;
     try t.expectEqual(@as(u32, 32), ssm_dt_rank.u32);
     const ssm_n_group = ctx.kvs.get("qwen35.ssm.group_count") orelse return error.MissingSSMGroup;
-    try t.expectEqual(@as(u32, 4), ssm_n_group.u32);
+    try t.expectEqual(@as(u32, 16), ssm_n_group.u32);
 
     // Dense 4B has no NextN
     if (ctx.kvs.get("qwen35.nextn_predict_layers")) |nextn| {
@@ -134,7 +134,7 @@ test "Qwen3.5 4B GGUF parses and has expected architecture + SSM dims" {
     const n_layer_kv = ctx.kvs.get("qwen35.block_count") orelse return error.MissingBlockCount;
     try t.expectEqual(@as(u32, 32), n_layer_kv.u32);
     const head_dim_kv = ctx.kvs.get("qwen35.attention.key_length") orelse return error.MissingKeyLength;
-    try t.expectEqual(@as(u32, 160), head_dim_kv.u32);
+    try t.expectEqual(@as(u32, 256), head_dim_kv.u32);
 }
 
 test "Qwen3.5 9B GGUF parses and has expected architecture + SSM dims" {
@@ -159,21 +159,19 @@ test "Qwen3.5 9B GGUF parses and has expected architecture + SSM dims" {
     const arch_val = ctx.kvs.get("general.architecture") orelse return error.MissingArchitecture;
     try t.expectEqualStrings("qwen35", arch_val.string);
 
-    // 9B has 3584 hidden_dim (vs 4B's 2560)
+    // 9B has 4096 hidden_dim
     const n_embd_kv = ctx.kvs.get("qwen35.embedding_length") orelse return error.MissingEmbDim;
-    try t.expectEqual(@as(u32, 3584), n_embd_kv.u32);
+    try t.expectEqual(@as(u32, 4096), n_embd_kv.u32);
     const n_layer_kv = ctx.kvs.get("qwen35.block_count") orelse return error.MissingBlockCount;
     try t.expectEqual(@as(u32, 32), n_layer_kv.u32);
 
-    // 9B has a larger head_dim (224 vs 160)
+    // 9B has a larger head_dim (256 vs 160)
     const head_dim_kv = ctx.kvs.get("qwen35.attention.key_length") orelse return error.MissingKeyLength;
-    try t.expectEqual(@as(u32, 224), head_dim_kv.u32);
+    try t.expectEqual(@as(u32, 256), head_dim_kv.u32);
 
     // SSM parameters consistent with 4B
     const ssm_d_conv = ctx.kvs.get("qwen35.ssm.conv_kernel") orelse return error.MissingSSMConv;
     try t.expectEqual(@as(u32, 4), ssm_d_conv.u32);
     const ssm_d_state = ctx.kvs.get("qwen35.ssm.state_size") orelse return error.MissingSSMState;
     try t.expectEqual(@as(u32, 128), ssm_d_state.u32);
-}
-    }
 }
