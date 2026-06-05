@@ -15,20 +15,20 @@ layout(push_constant) uniform PC {
     uint kda_flag;      // p6: 0 = scalar g, 1 = per-element g (KDA)
     uint p7;            // reserved
     uint p8;            // reserved
-    FloatBuffer a;      // ssm_state (read+write) [head_v_dim, head_v_dim, n_v_heads]
-    FloatBuffer b;      // q_in  [head_k_dim, n_k_heads]
-    FloatBuffer c;      // k_in  [head_k_dim, n_k_heads]
-    FloatBuffer d;      // v_in  [head_v_dim, n_v_heads]
-    FloatBuffer e;      // g_in  [1] scalar OR [head_v_dim, n_v_heads] (KDA)
+    FloatBuffer a;      // ssm_state (read+write) [n_v_heads, head_k_dim, head_v_dim]
+    FloatBuffer b;      // q_in  [n_k_heads, head_k_dim]
+    FloatBuffer c;      // k_in  [n_k_heads, head_k_dim]
+    FloatBuffer d;      // v_in  [n_v_heads, head_v_dim]
+    FloatBuffer e;      // g_in  [n_v_heads] scalar OR [n_v_heads, head_v_dim] (KDA)
     FloatBuffer f;      // beta_in [n_v_heads] per-head scalar
-    FloatBuffer g;      // e_out [head_v_dim, n_v_heads] — output
+    FloatBuffer g;      // e_out [n_v_heads, head_v_dim] — output
 } pc;
 
-layout(local_size_x = 128) in;
+layout(local_size_x = 32) in;
 
-// GPU reference implementation of the Gated Delta Net recurrence for PREFILL.
+// GPU implementation of the Gated Delta Net recurrence for DECODE (N=1).
 // Algorithm (per head h):
-//   a. S = S * exp(g)                 (decay)
+//   a. S = S * exp(g)             (decay)
 //   b. sk[v] = sum_k S[k,v] * k[k]
 //   c. d[v] = (v[v] - sk[v]) * beta
 //   d. S[k,v] = S[k,v] + k[k] * d[v]
@@ -43,7 +43,7 @@ void main() {
     uint H_k = pc.head_k_dim;
     uint n_rep = max(pc.n_v_heads / max(pc.n_k_heads, 1u), 1u);
     uint hk = h / n_rep;
-    uint state_off = h * H_v * H_v;
+    uint state_off = h * H_k * H_v;
     bool kda = pc.kda_flag != 0u;
 
     float scale = uintBitsToFloat(pc.scale_bits);
@@ -51,14 +51,11 @@ void main() {
     float decay = exp(clamp(g_val, -30.0, 30.0));
 
     // a. Decay and b. sk[v]
-    // Store decayed state locally — do NOT re-read from global memory in the second loop.
-    // CUDA reference: s_shard[r] = g_val * s_shard[r] (decay applied once, kept in registers)
     float sk = 0.0;
-    float s_snap[128]; // S_v == 128 max for Qwen 3.5
-    for (uint k = 0u; k < H_v; ++k) {
+    // S is row-major [H_k, H_v], so column v is at indices: state_off + k*H_v + v
+    for (uint k = 0u; k < H_k; ++k) {
         float s_val = pc.a.data[state_off + k * H_v + v] * decay;
-        pc.a.data[state_off + k * H_v + v] = s_val; // write decayed state to global memory
-        s_snap[k] = s_val; // keep locally for second loop
+        pc.a.data[state_off + k * H_v + v] = s_val;
         sk += s_val * pc.c.data[hk * H_k + k];
     }
 
@@ -68,11 +65,9 @@ void main() {
     float delta_val = (vv - sk) * beta;
 
     // d. S[k,v] update and e. o[v]
-    // Use LOCAL s_snap[] (decayed state) — matches CUDA s_shard[] approach.
-    // CUDA reference: s_shard[r] = g_val * s_shard[r] + k_reg[r] * delta_col
     float ov = 0.0;
-    for (uint k = 0u; k < H_v; ++k) {
-        float s_val = s_snap[k] + pc.c.data[hk * H_k + k] * delta_val;
+    for (uint k = 0u; k < H_k; ++k) {
+        float s_val = pc.a.data[state_off + k * H_v + v] + pc.c.data[hk * H_k + k] * delta_val;
         pc.a.data[state_off + k * H_v + v] = s_val;
         ov += s_val * pc.b.data[hk * H_k + k];
     }

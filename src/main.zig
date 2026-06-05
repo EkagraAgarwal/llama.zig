@@ -86,7 +86,7 @@ pub fn main(init: std.process.Init) !void {
     var writer_streaming = stdout_file.writerStreaming(init.io, &buffer);
     const writer = &writer_streaming.interface;
 
-    try writer.print("llama.zig: High-Performance Vulkan Inference\n", .{});
+    try writer.print("llama.zig: High-Performance Vulkan Inference (v1.0.1-fix)\n", .{});
 
     var args_it = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
     defer args_it.deinit();
@@ -671,6 +671,41 @@ pub fn main(init: std.process.Init) !void {
         
         if (verbose) try writer.print("  [decode] sampling...\n", .{});
         if (verbose) try writer_streaming.interface.flush();
+        
+        if (debug_logits > 0) {
+            try writer.print("\n  [debug] Top {} logits:\n", .{debug_logits});
+            var top_indices = try allocator.alloc(usize, debug_logits);
+            defer allocator.free(top_indices);
+            var top_values = try allocator.alloc(f32, debug_logits);
+            defer allocator.free(top_values);
+            @memset(top_values, -std.math.inf(f32));
+            @memset(top_indices, 0);
+
+            for (logits_persistent, 0..) |v, i| {
+                var val = v;
+                if (std.math.isNan(val)) val = -std.math.inf(f32); // Treat NaN as -inf for sorting
+                var idx = i;
+                for (0..debug_logits) |j| {
+                    if (val > top_values[j]) {
+                        const tmp_v = top_values[j];
+                        const tmp_i = top_indices[j];
+                        top_values[j] = val;
+                        top_indices[j] = idx;
+                        val = tmp_v;
+                        idx = tmp_i;
+                    }
+                }
+            }
+
+            for (0..debug_logits) |j| {
+                const id = top_indices[j];
+                const t_str = if (id < tok.id_to_token.len) tok.id_to_token[id] else "??";
+                try writer.print("    {d:4}: {d:8.4}  '{s}'\n", .{ id, top_values[j], t_str });
+            }
+            try writer.print("\n", .{});
+            try writer_streaming.interface.flush();
+        }
+
         current_token = try token_sampler.sample(allocator, logits_persistent, gen_history[0..gen_history_len]);
 
         if (tok.eos_token_id) |eos| if (current_token == eos) break;

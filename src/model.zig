@@ -127,7 +127,7 @@ pub const ModelConfig = struct {
             (try getMetaF32Any(ctx, arch_prefix, arch_alt_prefix, "embedding_multiplier")) orelse default_embedding_scale;
         const attention_scale = (try getMetaF32Any(ctx, arch_prefix, arch_alt_prefix, "attention.scale")) orelse
             (try getMetaF32Any(ctx, arch_prefix, arch_alt_prefix, "attention_scale")) orelse
-            (try getMetaF32Any(ctx, arch_prefix, arch_alt_prefix, "attention_multiplier")) orelse 0.0;
+            (try getMetaF32Any(ctx, arch_prefix, arch_alt_prefix, "attention_multiplier")) orelse (1.0 / @sqrt(@as(f32, @floatFromInt(head_dim))));
         const residual_scale = (try getMetaF32Any(ctx, arch_prefix, arch_alt_prefix, "residual_scale")) orelse
             (try getMetaF32Any(ctx, arch_prefix, arch_alt_prefix, "residual_multiplier")) orelse 1.0;
         const logit_scale = (try getMetaF32Any(ctx, arch_prefix, arch_alt_prefix, "logit_scale")) orelse

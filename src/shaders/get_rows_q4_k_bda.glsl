@@ -50,34 +50,34 @@ float q4kAt(uint row_base, uint kidx) {
     float d = f16ToF32(d_dmin & 0xFFFFu);
     float min = f16ToF32(d_dmin >> 16u);
 
-    uint s_word_idx = 1u + (i / 128u);
-    uint s_word = pc.weights.data[w_base + s_word_idx];
-    uint m_word = pc.weights.data[w_base + s_word_idx + 1u];
-    
-    uint is = (i / 64u);
+    uint sw0 = pc.weights.data[w_base + 1u];
+    uint sw1 = pc.weights.data[w_base + 2u];
+    uint sw2 = pc.weights.data[w_base + 3u];
+
+    uint sb = i / 64u;
+    uint base_lane = i % 32u;
+    bool is_hi = (i & 32u) != 0u;
+
     uint sc, m;
-    if (is == 0u) {
-        sc = s_word & 0x3Fu;
-        m  = m_word & 0x3Fu;
-    } else if (is == 1u) {
-        sc = (s_word >> 8u) & 0x3Fu;
-        m  = (m_word >> 8u) & 0x3Fu;
-    } else if (is == 2u) {
-        sc = (pc.weights.data[w_base + 3u] & 0xFu) | ((s_word >> 2u) & 0x30u);
-        m  = ((pc.weights.data[w_base + 3u] >> 4u) & 0xFu) | ((m_word >> 2u) & 0x30u);
+    if (sb == 0u) {
+        sc = is_hi ? ((sw0 >> 8u) & 0x3Fu) : (sw0 & 0x3Fu);
+        m  = is_hi ? ((sw1 >> 8u) & 0x3Fu) : (sw1 & 0x3Fu);
+    } else if (sb == 1u) {
+        sc = is_hi ? ((sw0 >> 24u) & 0x3Fu) : ((sw0 >> 16u) & 0x3Fu);
+        m  = is_hi ? ((sw1 >> 24u) & 0x3Fu) : ((sw1 >> 16u) & 0x3Fu);
+    } else if (sb == 2u) {
+        sc = is_hi ? (((sw2 >> 8u) & 0xFu) | ((sw0 >> 10u) & 0x30u)) : ((sw2 & 0xFu) | ((sw0 >> 2u) & 0x30u));
+        m  = is_hi ? (((sw2 >> 12u) & 0xFu) | ((sw1 >> 10u) & 0x30u)) : (((sw2 >> 4u) & 0xFu) | ((sw1 >> 2u) & 0x30u));
     } else {
-        sc = ((pc.weights.data[w_base + 3u] >> 16u) & 0xFu) | ((s_word >> 18u) & 0x30u);
-        m  = ((pc.weights.data[w_base + 3u] >> 20u) & 0xFu) | ((m_word >> 18u) & 0x30u);
+        sc = is_hi ? (((sw2 >> 24u) & 0xFu) | ((sw0 >> 26u) & 0x30u)) : (((sw2 >> 16u) & 0xFu) | ((sw0 >> 18u) & 0x30u));
+        m  = is_hi ? (((sw2 >> 28u) & 0xFu) | ((sw1 >> 26u) & 0x30u)) : (((sw2 >> 20u) & 0xFu) | ((sw1 >> 18u) & 0x30u));
     }
 
-    uint q_byte_idx = 16u + (i / 64u) * 32u + (i & 31u);
-    uint qb = (pc.weights.data[w_base + q_byte_idx / 4u] >> ((q_byte_idx & 3u) * 8u)) & 0xFFu;
+    uint q_word = pc.weights.data[w_base + 4u + sb * 8u + (base_lane / 4u)];
+    uint qb = (q_word >> ((base_lane & 3u) * 8u)) & 0xFFu;
+    uint nibble = is_hi ? (qb >> 4u) : (qb & 0xFu);
 
-    if ((i & 32u) == 0u) {
-        return (d * float(sc)) * float(qb & 0xFu) - (min * float(m));
-    } else {
-        return (d * float(sc)) * float(qb >> 4u) - (min * float(m));
-    }
+    return (d * float(sc)) * float(nibble) - (min * float(m));
 }
 
 void main() {

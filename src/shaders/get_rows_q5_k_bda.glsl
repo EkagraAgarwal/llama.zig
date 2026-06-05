@@ -57,47 +57,55 @@ float q5kAt(uint row_base, uint kidx) {
 
     uint sb = i / 32u;
     uint is = i % 32u;
+    bool is_hi = (i & 16u) != 0u;
 
     uint sc, mn;
     if (sb == 0u) {
-        sc = sw0 & 0x3Fu;
-        mn = sw1 & 0x3Fu;
+        sc = is_hi ? ((sw0 >> 8u) & 0x3Fu) : (sw0 & 0x3Fu);
+        mn = is_hi ? ((sw1 >> 8u) & 0x3Fu) : (sw1 & 0x3Fu);
     } else if (sb == 1u) {
-        sc = (sw0 >> 8u) & 0x3Fu;
-        mn = (sw1 >> 8u) & 0x3Fu;
+        sc = is_hi ? ((sw0 >> 24u) & 0x3Fu) : ((sw0 >> 16u) & 0x3Fu);
+        mn = is_hi ? ((sw1 >> 24u) & 0x3Fu) : ((sw1 >> 16u) & 0x3Fu);
     } else if (sb == 2u) {
-        sc = (sw0 >> 16u) & 0x3Fu;
-        mn = (sw1 >> 16u) & 0x3Fu;
+        sc = is_hi ? (((sw2 >> 8u) & 0xFu) | ((sw0 >> 10u) & 0x30u)) : ((sw2 & 0xFu) | ((sw0 >> 2u) & 0x30u));
+        mn = is_hi ? (((sw2 >> 12u) & 0xFu) | ((sw1 >> 10u) & 0x30u)) : (((sw2 >> 4u) & 0xFu) | ((sw1 >> 2u) & 0x30u));
     } else if (sb == 3u) {
-        sc = (sw0 >> 24u) & 0x3Fu;
-        mn = (sw1 >> 24u) & 0x3Fu;
+        sc = is_hi ? (((sw2 >> 24u) & 0xFu) | ((sw0 >> 26u) & 0x30u)) : (((sw2 >> 16u) & 0xFu) | ((sw0 >> 18u) & 0x30u));
+        mn = is_hi ? (((sw2 >> 28u) & 0xFu) | ((sw1 >> 26u) & 0x30u)) : (((sw2 >> 20u) & 0xFu) | ((sw1 >> 18u) & 0x30u));
     } else if (sb == 4u) {
-        sc = (sw2 & 0x0Fu) | ((sw0 >> 2u) & 0x30u);
-        mn = ((sw2 >> 4u) & 0x0Fu) | ((sw1 >> 2u) & 0x30u);
-    } else if (sb == 5u) {
-        sc = ((sw2 >> 8u) & 0x0Fu) | ((sw0 >> 10u) & 0x30u);
-        mn = ((sw2 >> 12u) & 0x0Fu) | ((sw1 >> 10u) & 0x30u);
-    } else if (sb == 6u) {
-        sc = ((sw2 >> 16u) & 0x0Fu) | ((sw0 >> 18u) & 0x30u);
-        mn = ((sw2 >> 20u) & 0x0Fu) | ((sw1 >> 18u) & 0x30u);
+        // Wait! Q5_K superblock logic for is >= 4... 
+        // Actually I'll use the logic from weights.zig
+        uint idx = (i / 16u);
+        sc = (idx < 4u) ? ((sw0 >> (idx * 8u)) & 0x3Fu) : 
+             (idx < 8u) ? (((sw0 >> ((idx-4u)*8u+16u)) & 0x3Fu)) : 
+             (idx < 12u) ? (((sw2 >> ((idx-8u)*8u)) & 0xFu) | ((sw0 >> ((idx-8u)*8u+2u)) & 0x30u)) :
+             (((sw2 >> ((idx-12u)*8u+16u)) & 0xFu) | ((sw0 >> ((idx-12u)*8u+18u)) & 0x30u));
+        mn = (idx < 4u) ? ((sw1 >> (idx * 8u)) & 0x3Fu) : 
+             (idx < 8u) ? (((sw1 >> ((idx-4u)*8u+16u)) & 0x3Fu)) : 
+             (idx < 12u) ? (((sw2 >> ((idx-8u)*8u+4u)) & 0xFu) | ((sw1 >> ((idx-8u)*8u+2u)) & 0x30u)) :
+             (((sw2 >> ((idx-12u)*8u+20u)) & 0xFu) | ((sw1 >> ((idx-12u)*8u+18u)) & 0x30u));
     } else {
-        sc = ((sw2 >> 24u) & 0x0Fu) | ((sw0 >> 26u) & 0x30u);
-        mn = ((sw2 >> 28u) & 0x0Fu) | ((sw1 >> 26u) & 0x30u);
+        // Reuse the logic above
+        uint idx = (i / 16u);
+        sc = (idx < 4u) ? ((sw0 >> (idx * 8u)) & 0x3Fu) : 
+             (idx < 8u) ? (((sw0 >> ((idx-4u)*8u+16u)) & 0x3Fu)) : 
+             (idx < 12u) ? (((sw2 >> ((idx-8u)*8u)) & 0xFu) | ((sw0 >> ((idx-8u)*8u+2u)) & 0x30u)) :
+             (((sw2 >> ((idx-12u)*8u+16u)) & 0xFu) | ((sw0 >> ((idx-12u)*8u+18u)) & 0x30u));
+        mn = (idx < 4u) ? ((sw1 >> (idx * 8u)) & 0x3Fu) : 
+             (idx < 8u) ? (((sw1 >> ((idx-4u)*8u+16u)) & 0x3Fu)) : 
+             (idx < 12u) ? (((sw2 >> ((idx-8u)*8u+4u)) & 0xFu) | ((sw1 >> ((idx-8u)*8u+2u)) & 0x30u)) :
+             (((sw2 >> ((idx-12u)*8u+20u)) & 0xFu) | ((sw1 >> ((idx-12u)*8u+18u)) & 0x30u));
     }
 
-    uint qs_word = pc.weights.data[w_base + 12u + ((sb >> 1) * 8u) + ((is >> 2) & 7u)];
-    uint qs_byte = (qs_word >> ((is & 3u) * 8u)) & 0xFFu;
+    uint qh_bit_pos = i / 32u;
+    uint qh_byte = getByte(pc.weights, base + 16u + (i % 32u));
+    uint qh_bit = (qh_byte >> qh_bit_pos) & 1u;
 
-    uint qh_word = pc.weights.data[w_base + 4u + ((sb >> 1) * 8u) + ((is >> 2) & 7u)];
-    uint qh_byte = (qh_word >> ((is & 3u) * 8u)) & 0xFFu;
-
-    uint qs_shift = (sb & 1u) * 4u;
-    uint qb = (qs_byte >> qs_shift) & 0xFu;
-    uint qh_bit = (qh_byte >> ((sb & 6u) | (sb & 1u))) & 1u;
-
+    uint qs_byte = getByte(pc.weights, base + 48u + i / 2u);
+    uint qb = (i & 1u) != 0u ? (qs_byte >> 4u) : (qs_byte & 0xFu);
     uint raw5 = qb | (qh_bit << 4u);
 
-    return d * float(sc) * float(uint(raw5)) - dmin * float(mn);
+    return d * float(sc) * float(raw5) - dmin * float(mn);
 }
 
 void main() {

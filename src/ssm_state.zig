@@ -26,7 +26,7 @@ const model = @import("model.zig");
 ///
 /// `conv` is a rolling window of the previous (d_conv - 1) chunks of the
 /// conv1d output, channel-major. `rec` is the per-head recurrent state
-/// matrix, head-major, shape (num_v_heads, head_v_dim, head_v_dim).
+/// matrix, head-major, shape (num_v_heads, head_k_dim, head_v_dim).
 pub const SsmLayerState = struct {
     conv: []f32,
     rec: []f32,
@@ -52,10 +52,11 @@ pub const SsmCpuContext = struct {
     pub fn init(allocator: std.mem.Allocator, cfg: *const model.ModelConfig) !SsmCpuContext {
         const n_main = cfg.n_layer -| cfg.nextn_predict_layers;
         const head_v_dim: u32 = if (cfg.ssm_dt_rank > 0) cfg.ssm_d_inner / cfg.ssm_dt_rank else 0;
+        const head_k_dim: u32 = cfg.ssm_d_state;
         const d_conv: u32 = if (cfg.ssm_d_conv > 0) cfg.ssm_d_conv else 4;
         const conv_channels: u32 = cfg.ssm_d_inner + 2 * cfg.ssm_n_group * cfg.ssm_d_state;
         const conv_per_layer: u32 = (d_conv - 1) * conv_channels;
-        const rec_per_layer: u32 = head_v_dim * head_v_dim * cfg.ssm_dt_rank;
+        const rec_per_layer: u32 = head_v_dim * head_k_dim * cfg.ssm_dt_rank;
         const conv_total: u32 = conv_per_layer * n_main;
         const rec_total: u32 = rec_per_layer * n_main;
 
@@ -86,12 +87,13 @@ pub const SsmCpuContext = struct {
     ) SsmCpuContext {
         const n_main = cfg.n_layer -| cfg.nextn_predict_layers;
         const head_v_dim: u32 = if (cfg.ssm_dt_rank > 0) cfg.ssm_d_inner / cfg.ssm_dt_rank else 0;
+        const head_k_dim: u32 = cfg.ssm_d_state;
         const d_conv: u32 = if (cfg.ssm_d_conv > 0) cfg.ssm_d_conv else 4;
         const conv_channels: u32 = cfg.ssm_d_inner + 2 * cfg.ssm_n_group * cfg.ssm_d_state;
         return .{
             .cfg = cfg,
             .conv_per_layer = (d_conv - 1) * conv_channels,
-            .rec_per_layer = head_v_dim * head_v_dim * cfg.ssm_dt_rank,
+            .rec_per_layer = head_v_dim * head_k_dim * cfg.ssm_dt_rank,
             .n_main = n_main,
             .conv_buf = conv_buf,
             .rec_buf = rec_buf,
@@ -149,8 +151,8 @@ pub const SsmCpuContext = struct {
     ///
     /// Inputs (all length `head_v_dim * num_v_heads`; the first `head_v_dim`
     /// elements are head 0, the next are head 1, etc.):
-    ///   - `q`: query vector (head_v_dim * num_v_heads)
-    ///   - `k`: key vector (head_v_dim * num_v_heads)
+    ///   - `q`: query vector (head_k_dim * num_k_heads)
+    ///   - `k`: key vector (head_k_dim * num_k_heads)
     ///   - `v`: value vector (head_v_dim * num_v_heads)
     ///   - `g`: gate — scalar (gated delta net proper) or per-element (KDA)
     ///   - `beta`: per-head scalar
@@ -174,95 +176,71 @@ pub const SsmCpuContext = struct {
         const head_k_dim: u32 = cfg.ssm_d_state;
         const num_k_heads: u32 = cfg.ssm_n_group;
         const rep: u32 = if (num_k_heads > 0) num_v_heads / num_k_heads else 1;
-        const head_v_sq: u32 = head_v_dim * head_v_dim;
-        const total_per_layer: u32 = head_v_sq * num_v_heads;
+        
+        const rec_per_head = head_k_dim * head_v_dim;
+        const total_per_layer: u32 = rec_per_head * num_v_heads;
         std.debug.assert(s.rec.len >= total_per_layer);
-        std.debug.assert(q.len == head_v_dim * num_v_heads);
-        std.debug.assert(k.len == head_v_dim * num_k_heads);
+        std.debug.assert(q.len == head_k_dim * num_k_heads);
+        std.debug.assert(k.len == head_k_dim * num_k_heads);
         std.debug.assert(v.len == head_v_dim * num_v_heads);
         std.debug.assert(out.len == head_v_dim * num_v_heads);
         std.debug.assert(beta.len == num_v_heads);
 
         const kda = g.len == head_v_dim * num_v_heads;
 
-        var scratch = try self.allocator.alloc(f32, head_v_dim);
-        defer self.allocator.free(scratch);
+        var sk = try self.allocator.alloc(f32, head_v_dim);
+        defer self.allocator.free(sk);
 
         var h: u32 = 0;
         while (h < num_v_heads) : (h += 1) {
-            const hk: u32 = h / if (rep > 0) rep else 1;
-            const s_head_off = h * head_v_sq;
-            const S = s.rec[s_head_off..][0..head_v_sq];
+            const hk: u32 = h / rep;
+            const s_head_off = h * rec_per_head;
+            const S = s.rec[s_head_off..][0..rec_per_head];
 
             // a. Decay: S *= exp(g) — scalar or per-element.
-            //    In KDA mode, g has length head_v_dim and scales each column c by exp(g[c]).
-            //    In scalar mode, g[0] scales all elements uniformly.
+            //    S shape (H_k, H_v), row-major. S[k, v].
             if (kda) {
-                // KDA: column-wise scaling. For each column c, apply exp(g[c]) to all rows.
-                //     This corresponds to S[:, c] *= exp(g[c]).
-                var c: u32 = 0;
-                while (c < head_v_dim) : (c += 1) {
-                    const decay = @exp(std.math.clamp(g[c], -30.0, 30.0));
-                    var r: u32 = 0;
-                    while (r < head_v_dim) : (r += 1) {
-                        S[r * head_v_dim + c] *= decay;
+                // KDA: column-wise scaling. S[:, c] *= exp(g[c]).
+                const g_h = g[h * head_v_dim ..][0..head_v_dim];
+                for (0..head_v_dim) |vi| {
+                    const decay = @exp(std.math.clamp(g_h[vi], -30.0, 30.0));
+                    for (0..head_k_dim) |ki| {
+                        S[ki * head_v_dim + vi] *= decay;
                     }
                 }
             } else {
-                const decay = @exp(std.math.clamp(g[0], -30.0, 30.0));
-                var i: u32 = 0;
-                while (i < head_v_sq) : (i += 1) S[i] *= decay;
+                const decay = @exp(std.math.clamp(g[h], -30.0, 30.0));
+                for (0..rec_per_head) |i| S[i] *= decay;
             }
 
-            // b. s_k[v] = sum_k S[k,v] * k[k]. Note: S is row-major (S[k,v]),
-            //    so row k of S is S[k*head_v_dim .. k*head_v_dim+head_v_dim].
-            //    k_h is the k vector for this head: k[hk*head_k_dim ..].
+            // b. s_k[v] = sum_k S[k,v] * k[k].
             const k_h = k[hk * head_k_dim ..][0..head_k_dim];
-            @memset(scratch, 0.0);
-            var v_idx: u32 = 0;
-            while (v_idx < head_v_dim) : (v_idx += 1) {
-                var acc: f32 = 0.0;
-                var kk: u32 = 0;
-                while (kk < head_k_dim) : (kk += 1) {
-                    // S is over (head_v_dim x head_v_dim), so v index is within
-                    // the row. head_v_dim >= head_k_dim for the model; for any
-                    // out-of-range kk we treat the S value as zero.
-                    if (kk < head_v_dim) {
-                        acc += S[kk * head_v_dim + v_idx] * k_h[kk];
-                    }
+            @memset(sk, 0.0);
+            for (0..head_k_dim) |ki| {
+                const kv = k_h[ki];
+                for (0..head_v_dim) |vi| {
+                    sk[vi] += S[ki * head_v_dim + vi] * kv;
                 }
-                scratch[v_idx] = acc;
             }
 
             // c. d[v] = (v[v] - s_k[v]) * beta_h
             const v_h = v[h * head_v_dim ..][0..head_v_dim];
             const b_h = beta[h];
-            var d_h = try self.allocator.alloc(f32, head_v_dim);
-            defer self.allocator.free(d_h);
-            for (v_h, scratch[0..head_v_dim], 0..) |vv, sk, vi| {
-                d_h[vi] = (vv - sk) * b_h;
-            }
-
-            // d. S[k,v] += k[k] * d[v]
-            var kk2: u32 = 0;
-            while (kk2 < head_k_dim) : (kk2 += 1) {
-                if (kk2 < head_v_dim) {
-                    const row = S[kk2 * head_v_dim ..][0..head_v_dim];
-                    for (d_h, 0..) |dv, vi| {
-                        row[vi] += k_h[kk2] * dv;
-                    }
+            // S[k,v] += k[k] * d[v]
+            for (0..head_v_dim) |vi| {
+                const dv = (v_h[vi] - sk[vi]) * b_h;
+                for (0..head_k_dim) |ki| {
+                    S[ki * head_v_dim + vi] += k_h[ki] * dv;
                 }
             }
 
-            // e. o[v] = sum_k S[k,v] * q[k] * scale
-            const q_h = q[h * head_v_dim ..][0..head_v_dim];
+            // e. o[v] = sum_k S[k,v] * q[k] * scale.
+            const q_h = q[hk * head_k_dim ..][0..head_k_dim];
             const out_h = out[h * head_v_dim ..][0..head_v_dim];
             for (0..head_v_dim) |vi| {
                 var acc: f32 = 0.0;
-                for (q_h, 0..) |qv, kk3| {
-                    if (kk3 < head_v_dim) {
-                        acc += S[kk3 * head_v_dim + vi] * qv;
-                    }
+                for (0..head_k_dim) |ki| {
+                    acc += S[ki * head_v_dim + vi] * q_h[ki];
                 }
                 out_h[vi] = acc * scale;
             }
