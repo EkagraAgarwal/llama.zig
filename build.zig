@@ -179,6 +179,7 @@ fn compileShaders(b: *std.Build) ?*std.Build.Step {
         .{ .src = "src/shaders/ssm_conv1d_bda.glsl", .out = "ssm_conv1d_bda.spv" },
         .{ .src = "src/shaders/ssm_delta_net_decode_bda.glsl", .out = "ssm_delta_net_decode_bda.spv" },
         .{ .src = "src/shaders/ssm_gated_norm_bda.glsl", .out = "ssm_gated_norm_bda.spv" },
+        .{ .src = "src/shaders/qwen_deinterleave_bda.glsl", .out = "qwen_deinterleave_bda.spv" },
     };
 
     const step = b.step("shaders", "Compile GLSL compute shaders to SPIR-V");

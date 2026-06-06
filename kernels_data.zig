@@ -41,3 +41,5 @@ pub const kernels_attn_gate_mul_spv = @embedFile("attn_gate_mul_bda.spv");
 pub const kernels_ssm_conv1d_spv = @embedFile("ssm_conv1d_bda.spv");
 pub const kernels_ssm_delta_net_decode_spv = @embedFile("ssm_delta_net_decode_bda.spv");
 pub const kernels_ssm_gated_norm_spv = @embedFile("ssm_gated_norm_bda.spv");
+pub const kernels_qwen_deinterleave_spv = @embedFile("qwen_deinterleave_bda.spv");
+

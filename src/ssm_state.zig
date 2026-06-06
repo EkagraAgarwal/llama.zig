@@ -37,7 +37,7 @@ pub const SsmLayerState = struct {
 /// Two big host-visible f32 buffers (one for conv state, one for recurrent
 /// state) cover all main layers. The CPU step operates on slices of these
 /// buffers per layer. The GPU dispatch path maps the same buffers via
-/// Vulkan BDA in `compute_graph.Dispatcher.ssmCacheLayerOffset`.
+/// Vulkan BDA in `compute_graph.Dispatcher.ssm_cache_layer_offset`.
 pub const SsmCpuContext = struct {
     cfg: *const model.ModelConfig,
     /// Per-layer view into `conv_buf`. The slice is non-owning.
@@ -84,6 +84,7 @@ pub const SsmCpuContext = struct {
         cfg: *const model.ModelConfig,
         conv_buf: []f32,
         rec_buf: []f32,
+        allocator: std.mem.Allocator,
     ) SsmCpuContext {
         const n_main = cfg.n_layer -| cfg.nextn_predict_layers;
         const head_v_dim: u32 = if (cfg.ssm_dt_rank > 0) cfg.ssm_d_inner / cfg.ssm_dt_rank else 0;
@@ -97,7 +98,7 @@ pub const SsmCpuContext = struct {
             .n_main = n_main,
             .conv_buf = conv_buf,
             .rec_buf = rec_buf,
-            .allocator = undefined,
+            .allocator = allocator,
             .owns_storage = false,
         };
     }
@@ -175,12 +176,12 @@ pub const SsmCpuContext = struct {
         const num_v_heads: u32 = cfg.ssm_dt_rank;
         const head_k_dim: u32 = cfg.ssm_d_state;
         const num_k_heads: u32 = cfg.ssm_n_group;
-        const rep: u32 = if (num_k_heads > 0) num_v_heads / num_k_heads else 1;
+        const rep: u32 = @max(1, if (num_k_heads > 0) num_v_heads / num_k_heads else 1);
         
         const rec_per_head = head_k_dim * head_v_dim;
         const total_per_layer: u32 = rec_per_head * num_v_heads;
         std.debug.assert(s.rec.len >= total_per_layer);
-        std.debug.assert(q.len == head_k_dim * num_k_heads);
+        std.debug.assert(q.len == head_k_dim * num_v_heads);
         std.debug.assert(k.len == head_k_dim * num_k_heads);
         std.debug.assert(v.len == head_v_dim * num_v_heads);
         std.debug.assert(out.len == head_v_dim * num_v_heads);
@@ -199,18 +200,17 @@ pub const SsmCpuContext = struct {
 
             // a. Decay: S *= exp(g) — scalar or per-element.
             //    S shape (H_k, H_v), row-major. S[k, v].
-            if (kda) {
-                // KDA: column-wise scaling. S[:, c] *= exp(g[c]).
+            const g_val = if (g.len > h) g[h] else g[0];
+            const decay = if (kda) 1.0 else @exp(std.math.clamp(g_val, -30.0, 30.0));
+            if (!kda) {
+                if (std.math.isNan(decay)) std.log.err("SSM: NaN decay! head={} g={}", .{ h, g_val });
+                for (0..rec_per_head) |i| S[i] *= decay;
+            } else {
                 const g_h = g[h * head_v_dim ..][0..head_v_dim];
                 for (0..head_v_dim) |vi| {
-                    const decay = @exp(std.math.clamp(g_h[vi], -30.0, 30.0));
-                    for (0..head_k_dim) |ki| {
-                        S[ki * head_v_dim + vi] *= decay;
-                    }
+                    const d_val = @exp(std.math.clamp(g_h[vi], -30.0, 30.0));
+                    for (0..head_k_dim) |ki| S[ki * head_v_dim + vi] *= d_val;
                 }
-            } else {
-                const decay = @exp(std.math.clamp(g[h], -30.0, 30.0));
-                for (0..rec_per_head) |i| S[i] *= decay;
             }
 
             // b. s_k[v] = sum_k S[k,v] * k[k].
@@ -235,7 +235,7 @@ pub const SsmCpuContext = struct {
             }
 
             // e. o[v] = sum_k S[k,v] * q[k] * scale.
-            const q_h = q[hk * head_k_dim ..][0..head_k_dim];
+            const q_h = q[h * head_k_dim ..][0..head_k_dim];
             const out_h = out[h * head_v_dim ..][0..head_v_dim];
             for (0..head_v_dim) |vi| {
                 var acc: f32 = 0.0;

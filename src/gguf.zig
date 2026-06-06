@@ -94,7 +94,7 @@ pub const GGUFContext = struct {
 
     pub fn readTensorData(self: *GGUFContext, t: *Tensor, buffer: []u8) !void {
         if (self.mmap_file) |*mf| {
-            const src = mf.slice(self.data_offset + t.offset, buffer.len);
+            const src = try mf.slice(self.data_offset + t.offset, buffer.len);
             @memcpy(buffer, src);
         } else {
             const io = std.Io.Threaded.global_single_threaded.io();
@@ -104,7 +104,7 @@ pub const GGUFContext = struct {
 
     pub fn getTensorSlice(self: *const GGUFContext, t: *const Tensor) ![]const u8 {
         if (self.mmap_file) |*mf| {
-            return mf.slice(self.data_offset + t.offset, t.size());
+            return try mf.slice(self.data_offset + t.offset, t.size());
         }
         return error.MmapNotAvailable;
     }

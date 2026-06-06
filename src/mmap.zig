@@ -104,8 +104,10 @@ pub const MappedFile = struct {
         }
     }
 
-    pub fn slice(self: *const MappedFile, offset: u64, len: u64) []const u8 {
-        return self.data[offset .. offset + len];
+    pub fn slice(self: *const MappedFile, offset: u64, len: u64) ![]const u8 {
+        const end = std.math.add(u64, offset, len) catch return error.OutOfBounds;
+        if (end > self.data.len) return error.OutOfBounds;
+        return self.data[offset..end];
     }
 };
 

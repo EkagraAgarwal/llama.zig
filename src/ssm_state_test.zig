@@ -174,7 +174,7 @@ test "stepDeltaNet: multi-head 2-head routing via num_k_heads" {
     var q = [_]f32{ 1.0, 0.0, 1.0, 0.0 }; // 2 heads * head_v_dim=2
     var k = [_]f32{ 0.5, 0.5 };            // 1 k_head * head_k_dim=2
     var v = [_]f32{ 1.0, 1.0, 2.0, 2.0 };
-    var g = [_]f32{0.0};
+    var g = [_]f32{ 0.0, 0.0 };
     var beta = [_]f32{ 1.0, 1.0 };
     var out = [_]f32{ 0.0, 0.0, 0.0, 0.0 };
 

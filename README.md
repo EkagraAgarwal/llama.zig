@@ -53,11 +53,11 @@ Shaders are compiled automatically when `glslangValidator` is on `PATH`; prebuil
 | `--no-chat` | Disable chat mode (raw completion) |
 | `--verbose` | Enable verbose debug output |
 | `--debug-logits` | Dump top-N logits each decode step |
-| `--inspect-block` | Inspect compute graph block structure |
 | `--prefill-chunk` | Chunk size for batched prefill (0 = full batch) |
 | `--no-gpu-embed` | Disable GPU embedding lookup (fallback to CPU path) |
 | `--report-json` | Output inference metrics as JSON |
 | `--debug-trace` | Enable debug trace printing (gated; off by default) |
+| `--staging-size` | Size of the Vulkan staging buffer for weight uploads (default 128MB) |
 
 **Note**: Chat template mode is enabled by default for instruct-tuned models. Base models are automatically detected (based on the absence of GGUF chat template metadata and instruct-specific control tokens) and execute in raw text autocomplete mode.
 
@@ -65,15 +65,23 @@ Shaders are compiled automatically when `glslangValidator` is on `PATH`; prebuil
 
 ```
 main.zig
-  ├── model.zig        (GGUF metadata + model config)
-  ├── chat.zig         (chat template detection + formatting)
-  ├── sampler.zig      (temperature / top-p sampling)
-  ├── tokenizer.zig    (BPE encode/decode, special token detection)
-  ├── weights.zig      (dequant + upload to GPU)
-  ├── vulkan_backend.zig (BDA buffers, pipelines)
-  ├── compute_graph.zig (DAG + dispatcher)
-  ├── ssm_state.zig    (SSM state management for Qwen 3.5)
-  └── root.zig         (root comptime struct for all ops)
+  ├── cli.zig             (command-line argument parsing and validation)
+  ├── model.zig           (GGUF metadata + model config)
+  ├── chat.zig            (chat template detection + formatting)
+  ├── sampler.zig         (temperature / top-p sampling)
+  ├── tokenizer.zig       (BPE encode/decode, special token detection)
+  ├── weight_uploader.zig (vulkan weight handling, buffer pooling, fusion)
+  ├── weights.zig         (dequantization + host-side formatting)
+  ├── vulkan_backend.zig  (BDA buffers, device context, memory management)
+  ├── compute_graph.zig   (DAG construction, layer builders)
+  ├── graph_data.zig      (graph structures, tensor roles, cost estimation)
+  ├── dispatcher.zig      (vulkan node dispatcher, push constant packing)
+  ├── inference.zig       (prefill and decode execution loops)
+  ├── ssm_cpu.zig         (CPU-side SSM recurrence logic)
+  ├── ssm_state.zig       (SSM state management for Qwen 3.5)
+  ├── transformer_block.zig (reusable llama-style transformer layer builder)
+  ├── qwen35.zig          (Qwen 3.5 specific graph construction)
+  └── root.zig            (root comptime struct for all ops)
 ```
 
 ## Optimizations

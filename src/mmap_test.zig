@@ -40,7 +40,7 @@ test "mmap slice returns correct subrange" {
     var mapped = try mmap.MappedFile.init(test_filename);
     defer mapped.deinit();
 
-    const sub = mapped.slice(4, 6);
+    const sub = try mapped.slice(4, 6);
     try testing.expectEqualStrings("456789", sub);
 }
 

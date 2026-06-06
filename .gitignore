@@ -44,5 +44,10 @@ output.txt
 *_DEBUG_LOG.md
 *_DEBUG_DUMP.md
 
+# Scripts and temporary files
+*.py
+replace_script.zig
+dispatcher_extracted.zig
+
 # Editor temp files
 *.tmp

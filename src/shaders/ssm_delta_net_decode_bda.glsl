@@ -24,7 +24,7 @@ layout(push_constant) uniform PC {
     FloatBuffer g;      // e_out [n_v_heads, head_v_dim] — output
 } pc;
 
-layout(local_size_x = 32) in;
+layout(local_size_x = 256) in;
 
 // GPU implementation of the Gated Delta Net recurrence for DECODE (N=1).
 // Algorithm (per head h):

@@ -58,7 +58,7 @@ fn sampleWithRandom(
 
     if (cfg.repetition_penalty != 1.0 and prev_tokens.len > 0) {
         const window = @min(prev_tokens.len, @as(usize, cfg.repetition_window));
-        const start = prev_tokens.len - window;
+        const start = if (prev_tokens.len == 0) 0 else prev_tokens.len - window;
         var i: usize = 0;
         while (i < n) : (i += 1) {
             for (prev_tokens[start..]) |pt| {

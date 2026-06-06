@@ -75,12 +75,12 @@ pub fn dequantToF32(ctx: *gguf.GGUFContext, t: *tensor.Tensor, dst: []f32) !void
                 const src = std.mem.bytesAsSlice(u16, raw[0 .. n * 2]);
                 for (src, 0..) |bits, i| dst[i] = bf16ToF32(bits);
             },
-            .q8_0 => try dequantQ80(ctx, t, dst[0..n]),
-            .q4_0 => try dequantQ40(ctx, t, dst[0..n]),
-            .q4_1 => try dequantQ41(ctx, t, dst[0..n]),
-            .q4_k => try dequantQ4K(ctx, t, dst[0..n]),
-            .q5_k => try dequantQ5K(ctx, t, dst[0..n]),
-            .q6_k => try dequantQ6K(ctx, t, dst[0..n]),
+            .q8_0 => try dequantFromCtx(dequantQ80Raw, ctx, t, dst[0..n]),
+            .q4_0 => try dequantFromCtx(dequantQ40Raw, ctx, t, dst[0..n]),
+            .q4_1 => try dequantFromCtx(dequantQ41Raw, ctx, t, dst[0..n]),
+            .q4_k => try dequantFromCtx(dequantQ4KRaw, ctx, t, dst[0..n]),
+            .q5_k => try dequantFromCtx(dequantQ5KRaw, ctx, t, dst[0..n]),
+            .q6_k => try dequantFromCtx(dequantQ6KRaw, ctx, t, dst[0..n]),
         }
     }
 }
@@ -124,46 +124,11 @@ pub fn dequantToF16(ctx: *gguf.GGUFContext, t: *tensor.Tensor, dst: []u16) !void
     }
 }
 
-fn dequantQ80(ctx: *gguf.GGUFContext, t: *tensor.Tensor, dst: []f32) !void {
+fn dequantFromCtx(comptime dequantRaw: anytype, ctx: *gguf.GGUFContext, t: *tensor.Tensor, dst: []f32) !void {
     const raw = try ctx.allocator.alloc(u8, t.size());
     defer ctx.allocator.free(raw);
     try ctx.readTensorData(t, raw);
-    dequantQ80Raw(raw, dst);
-}
-
-fn dequantQ40(ctx: *gguf.GGUFContext, t: *tensor.Tensor, dst: []f32) !void {
-    const raw = try ctx.allocator.alloc(u8, t.size());
-    defer ctx.allocator.free(raw);
-    try ctx.readTensorData(t, raw);
-    dequantQ40Raw(raw, dst);
-}
-
-fn dequantQ41(ctx: *gguf.GGUFContext, t: *tensor.Tensor, dst: []f32) !void {
-    const raw = try ctx.allocator.alloc(u8, t.size());
-    defer ctx.allocator.free(raw);
-    try ctx.readTensorData(t, raw);
-    dequantQ41Raw(raw, dst);
-}
-
-fn dequantQ6K(ctx: *gguf.GGUFContext, t: *tensor.Tensor, dst: []f32) !void {
-    const raw = try ctx.allocator.alloc(u8, t.size());
-    defer ctx.allocator.free(raw);
-    try ctx.readTensorData(t, raw);
-    dequantQ6KRaw(raw, dst);
-}
-
-fn dequantQ5K(ctx: *gguf.GGUFContext, t: *tensor.Tensor, dst: []f32) !void {
-    const raw = try ctx.allocator.alloc(u8, t.size());
-    defer ctx.allocator.free(raw);
-    try ctx.readTensorData(t, raw);
-    dequantQ5KRaw(raw, dst);
-}
-
-fn dequantQ4K(ctx: *gguf.GGUFContext, t: *tensor.Tensor, dst: []f32) !void {
-    const raw = try ctx.allocator.alloc(u8, t.size());
-    defer ctx.allocator.free(raw);
-    try ctx.readTensorData(t, raw);
-    dequantQ4KRaw(raw, dst);
+    dequantRaw(raw, dst);
 }
 
 fn dequantQ5KRaw(raw: []const u8, dst: []f32) void {

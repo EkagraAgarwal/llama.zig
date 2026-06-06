@@ -34,8 +34,6 @@ void main() {
     if (i >= pc.n_heads * (pc.head_dim / 2u)) return;
 
     float rope_base = uintBitsToFloat(pc.rope_theta_bits);
-    uint byte_off = pc.p5_byte_off;
-    uint float_off = byte_off / 4u;
     uint head_idx = i / (pc.head_dim / 2u);
     uint pair_idx = i % (pc.head_dim / 2u);
 
@@ -43,26 +41,29 @@ void main() {
     uint s1 = s0 + pc.sec1;
     uint s2 = s1 + pc.sec2;
     uint section_size;
-    uint within;
-    if (pair_idx < s0) {
+    uint within_pair;
+    uint dim_idx = 2u * pair_idx;
+    if (dim_idx < s0) {
         section_size = pc.sec0;
-        within = pair_idx;
-    } else if (pair_idx < s1) {
+        within_pair = pair_idx;
+    } else if (dim_idx < s1) {
         section_size = pc.sec1;
-        within = pair_idx - s0;
-    } else if (pair_idx < s2) {
+        within_pair = pair_idx - s0 / 2u;
+    } else if (dim_idx < s2) {
         section_size = pc.sec2;
-        within = pair_idx - s1;
+        within_pair = pair_idx - s1 / 2u;
     } else {
-        section_size = (pc.head_dim / 2u) - pc.sec0 - pc.sec1 - pc.sec2;
-        within = pair_idx - s2;
+        section_size = pc.head_dim - pc.sec0 - pc.sec1 - pc.sec2;
+        within_pair = pair_idx - s2 / 2u;
     }
     if (section_size == 0u) return;
 
-    uint idx0 = float_off + head_idx * pc.head_dim + 2u * pair_idx;
-    uint idx1 = idx0 + 1u;
+    // NeoX-style (split-half) indexing: (pair_idx, pair_idx + head_dim/2)
+    uint idx0 = head_idx * pc.head_dim + pair_idx;
+    uint idx1 = idx0 + (pc.head_dim / 2u);
 
-    float inv_freq = pow(rope_base, -2.0 * float(within) / float(section_size));
+    // Frequencies are relative to section start, but divisor is full head_dim
+    float inv_freq = pow(rope_base, -2.0 * float(within_pair) / float(pc.head_dim));
     float theta = float(pc.pos) * inv_freq;
     float cos_theta = cos(theta);
     float sin_theta = sin(theta);
